@@ -1,0 +1,405 @@
+<script setup lang="ts">
+import { ref, onMounted } from 'vue';
+import type { Account } from '../types';
+
+const props = defineProps<{
+  account?: Account | null;
+}>();
+
+const emit = defineEmits<{
+  save: [data: { name: string; activationDate: string; jsonInfo: string }];
+  close: [];
+}>();
+
+const name = ref('');
+const activationDate = ref('');
+const jsonInfo = ref('');
+const jsonError = ref('');
+const jsonValid = ref(false);
+const saving = ref(false);
+const isEdit = !!props.account;
+
+onMounted(() => {
+  if (props.account) {
+    name.value = props.account.name;
+    activationDate.value = props.account.activation_date || '';
+    jsonInfo.value = props.account.json_info || '';
+    validateJson();
+  }
+});
+
+function validateJson(): boolean {
+  jsonError.value = '';
+  jsonValid.value = false;
+  if (!jsonInfo.value.trim()) return true;
+  try {
+    JSON.parse(jsonInfo.value);
+    jsonValid.value = true;
+    return true;
+  } catch {
+    jsonError.value = 'JSON 格式错误';
+    return false;
+  }
+}
+
+function handleSave() {
+  if (!name.value.trim()) return;
+  if (!validateJson()) return;
+  saving.value = true;
+  emit('save', {
+    name: name.value.trim(),
+    activationDate: activationDate.value,
+    jsonInfo: jsonInfo.value.trim(),
+  });
+  saving.value = false;
+}
+
+function handleBackdrop(e: MouseEvent) {
+  if (e.target === e.currentTarget) emit('close');
+}
+
+function formatJson() {
+  if (!jsonInfo.value.trim()) return;
+  try {
+    jsonInfo.value = JSON.stringify(JSON.parse(jsonInfo.value), null, 2);
+    jsonError.value = '';
+    jsonValid.value = true;
+  } catch { /* skip */ }
+}
+</script>
+
+<template>
+  <div class="backdrop" @click="handleBackdrop">
+    <div class="dialog">
+      <!-- Header -->
+      <div class="dialog-header">
+        <div class="dialog-title">
+          <div class="dialog-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+              <circle cx="9" cy="7" r="4"/>
+              <line x1="19" y1="8" x2="19" y2="14"/>
+              <line x1="22" y1="11" x2="16" y2="11"/>
+            </svg>
+          </div>
+          <h2>{{ isEdit ? '编辑账号' : '添加账号' }}</h2>
+        </div>
+        <button class="close-btn" @click="emit('close')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- Body -->
+      <div class="dialog-body">
+        <div class="field">
+          <label>账号名称 <span class="req">*</span></label>
+          <input v-model="name" type="text" placeholder="例如: My Account" @keyup.enter="handleSave" />
+        </div>
+
+        <div class="field">
+          <label>开通时间</label>
+          <input v-model="activationDate" type="date" />
+        </div>
+
+        <div class="field">
+          <div class="field-top">
+            <label>Auth JSON</label>
+            <button class="fmt-btn" @click="formatJson" :disabled="!jsonInfo.trim()">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+              </svg>
+              格式化
+            </button>
+          </div>
+          <textarea
+            v-model="jsonInfo"
+            rows="10"
+            placeholder='粘贴 auth.json 完整内容...'
+            @input="validateJson()"
+          ></textarea>
+          <div class="field-msg">
+            <span v-if="jsonError" class="msg-err">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+              </svg>
+              {{ jsonError }}
+            </span>
+            <span v-else-if="jsonValid" class="msg-ok">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+              格式正确
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div class="dialog-footer">
+        <button class="btn-cancel" @click="emit('close')">取消</button>
+        <button class="btn-save" :disabled="!name.trim() || saving" @click="handleSave">
+          <svg v-if="saving" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+          </svg>
+          {{ saving ? '保存中...' : (isEdit ? '保存' : '添加') }}
+        </button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.dialog {
+  background: var(--surface);
+  border-radius: var(--radius-xl);
+  width: 520px;
+  max-width: 92vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-xl), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  animation: dialog-enter 0.3s var(--ease-out);
+}
+
+@keyframes dialog-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(10px);
+  }
+}
+
+/* ── Header ───────────────────────────── */
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.dialog-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.dialog-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--primary-light), #e0e7ff);
+  color: var(--primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog-header h2 {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+
+.close-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+}
+
+.close-btn:hover {
+  background: var(--border-light);
+  color: var(--text);
+}
+
+/* ── Body ─────────────────────────────── */
+.dialog-body {
+  padding: 24px;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.field label {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.req { color: var(--danger); }
+
+.field-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.field-top label { margin-bottom: 0; }
+
+.fmt-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 3px 8px;
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+
+.fmt-btn:hover:not(:disabled) { background: var(--primary-light); }
+.fmt-btn:disabled { color: var(--text-tertiary); cursor: not-allowed; }
+
+input[type="text"],
+input[type="date"] {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--surface);
+  transition: all 0.2s var(--ease-out);
+}
+
+input:hover { border-color: #cbd5e1; }
+
+input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+textarea {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  color: var(--text);
+  background: var(--surface);
+  resize: vertical;
+  line-height: 1.6;
+  transition: all 0.2s var(--ease-out);
+}
+
+textarea:hover { border-color: #cbd5e1; }
+
+textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+textarea::placeholder {
+  color: var(--text-tertiary);
+  font-family: inherit;
+}
+
+.field-msg {
+  min-height: 20px;
+  margin-top: 4px;
+}
+
+.msg-err,
+.msg-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.msg-err { color: var(--danger); }
+.msg-ok { color: var(--success); }
+
+/* ── Footer ───────────────────────────── */
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--border-light);
+  background: linear-gradient(180deg, transparent 0%, rgba(248, 250, 252, 0.5) 100%);
+}
+
+.btn-cancel,
+.btn-save {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 22px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s var(--ease-out);
+}
+
+.btn-cancel {
+  background: var(--border-light);
+  color: var(--text-secondary);
+}
+
+.btn-cancel:hover { background: var(--border); }
+
+.btn-save {
+  background: linear-gradient(135deg, var(--primary), var(--primary-hover));
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(99, 102, 241, 0.2);
+}
+
+.btn-save:hover:not(:disabled) {
+  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+  transform: translateY(-1px);
+}
+
+.btn-save:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.btn-save:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+</style>
