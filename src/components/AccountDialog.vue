@@ -31,17 +31,25 @@ function validateJson(): boolean {
   jsonValid.value = false;
   if (!jsonInfo.value.trim()) return true;
   try {
-    const parsed = JSON.parse(jsonInfo.value);
-    const missing = [
-      ['tokens.access_token', parsed?.tokens?.access_token],
-      ['tokens.refresh_token', parsed?.tokens?.refresh_token],
-      ['tokens.account_id', parsed?.tokens?.account_id],
-    ]
-      .filter(([, value]) => typeof value !== 'string' || !value.trim())
-      .map(([label]) => label);
+    const trimmed = jsonInfo.value.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+      jsonValid.value = true;
+      return true;
+    }
 
-    if (missing.length > 0) {
-      jsonError.value = `缺少必要字段：${missing.join('、')}`;
+    const parsed = JSON.parse(trimmed);
+    const hasAnyToken =
+      typeof parsed?.tokens?.access_token === 'string' ||
+      typeof parsed?.tokens?.refresh_token === 'string' ||
+      typeof parsed?.tokens?.refreshToken === 'string' ||
+      typeof parsed?.access_token === 'string' ||
+      typeof parsed?.accessToken === 'string' ||
+      typeof parsed?.refresh_token === 'string' ||
+      typeof parsed?.refreshToken === 'string' ||
+      typeof parsed?.token === 'string';
+
+    if (!hasAnyToken) {
+      jsonError.value = '未找到可导入的 token 或 auth.json 字段';
       return false;
     }
 
@@ -124,7 +132,7 @@ function formatJson() {
           <textarea
             v-model="jsonInfo"
             rows="10"
-            :placeholder="isEdit ? '留空则不修改已保存的 auth.json；粘贴新内容可替换...' : '粘贴 auth.json 完整内容...'"
+            :placeholder="isEdit ? '留空则不修改；可粘贴 auth.json、access_token 或 refresh_token...' : '粘贴 auth.json、access_token 或 refresh_token...'"
             @input="validateJson()"
           ></textarea>
           <div class="field-msg">

@@ -31,9 +31,11 @@ const oauthUrl = ref('');
 const oauthCallbackUrl = ref('');
 const oauthError = ref('');
 const oauthUrlCopied = ref(false);
+const oauthTimedOut = ref(false);
 const importInput = ref<HTMLInputElement | null>(null);
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 let unlistenOauth: UnlistenFn | null = null;
+let unlistenOauthTimeout: UnlistenFn | null = null;
 
 const intervalOptions = [
   { label: '关闭', value: 0 },
@@ -49,6 +51,13 @@ onMounted(async () => {
     if (event.payload.loginId !== oauthLoginId.value) return;
     await completeOauthLogin(true);
   });
+  unlistenOauthTimeout = await listen<{ loginId?: string; timeoutSeconds?: number }>('codex-oauth-login-timeout', async (event) => {
+    if (!showOauthDialog.value || !event.payload?.loginId) return;
+    if (event.payload.loginId !== oauthLoginId.value) return;
+    oauthTimedOut.value = true;
+    oauthAdding.value = false;
+    oauthError.value = `授权已超时，请刷新授权链接后重试。`;
+  });
   await loadAccounts();
   await loadCurrentAccount();
   await loadStoragePaths();
@@ -61,6 +70,10 @@ onUnmounted(() => {
   if (unlistenOauth) {
     unlistenOauth();
     unlistenOauth = null;
+  }
+  if (unlistenOauthTimeout) {
+    unlistenOauthTimeout();
+    unlistenOauthTimeout = null;
   }
 });
 
@@ -86,9 +99,15 @@ async function addAccountWithOAuth() {
     oauthCallbackUrl.value = '';
     oauthError.value = '';
     oauthUrlCopied.value = false;
+    oauthTimedOut.value = false;
     showOauthDialog.value = true;
   } catch (e) {
-    showMessage(`OAuth 添加失败: ${e}`, 'error');
+    const message = String(e).replace(/^Error:\s*/, '');
+    if (message.includes('CODEX_OAUTH_PORT_IN_USE')) {
+      showMessage('OAuth 回调端口 1455 被占用，请关闭占用程序后重试', 'error');
+    } else {
+      showMessage(`OAuth 添加失败: ${message}`, 'error');
+    }
   } finally {
     oauthAdding.value = false;
   }
@@ -102,6 +121,12 @@ function closeOauthDialog() {
   oauthCallbackUrl.value = '';
   oauthError.value = '';
   oauthUrlCopied.value = false;
+  oauthTimedOut.value = false;
+}
+
+async function retryOauthLogin() {
+  closeOauthDialog();
+  await addAccountWithOAuth();
 }
 
 async function copyOauthUrl() {
@@ -514,6 +539,9 @@ async function handleRestartToggle(e: Event) {
                 <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
               </svg>
               在浏览器中打开
+            </button>
+            <button v-if="oauthTimedOut" class="oauth-secondary" @click="retryOauthLogin">
+              刷新授权链接
             </button>
 
             <div class="oauth-field">
@@ -979,7 +1007,8 @@ async function handleRestartToggle(e: Event) {
 
 .oauth-url-box button,
 .oauth-callback-row button,
-.oauth-primary {
+.oauth-primary,
+.oauth-secondary {
   border: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -1015,6 +1044,18 @@ async function handleRestartToggle(e: Event) {
 .oauth-primary:hover {
   transform: translateY(-1px);
   box-shadow: 0 4px 14px rgba(99, 102, 241, 0.3);
+}
+
+.oauth-secondary {
+  width: 100%;
+  min-height: 40px;
+  background: var(--border-light);
+  color: var(--text-secondary);
+}
+
+.oauth-secondary:hover {
+  background: var(--border);
+  color: var(--text);
 }
 
 .oauth-callback-row button {
