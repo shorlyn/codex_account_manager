@@ -13,6 +13,7 @@ const emit = defineEmits<{
   edit: [account: Account];
   delete: [id: number];
   refresh: [id: number];
+  profile: [id: number];
   reauth: [account: Account];
 }>();
 
@@ -186,6 +187,12 @@ function isCurrent(account: Account): boolean {
             <button class="btn-icon btn-refresh" title="刷新额度" @click="emit('refresh', account.id)">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+              </svg>
+            </button>
+            <button class="btn-icon btn-profile" title="刷新资料" @click="emit('profile', account.id)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="8" r="4"/>
+                <path d="M4 21a8 8 0 0 1 16 0"/>
               </svg>
             </button>
             <button class="btn-icon btn-reauth" title="重新授权" @click="emit('reauth', account)">
@@ -497,6 +504,13 @@ function isCurrent(account: Account): boolean {
   background: var(--primary-light);
   border-color: #c7d2fe;
   color: var(--primary-hover);
+}
+
+.btn-profile { color: #0f766e; }
+.btn-profile:hover:not(:disabled) {
+  background: #ccfbf1;
+  border-color: #99f6e4;
+  color: #0d9488;
 }
 
 .btn-reauth { color: var(--success); }

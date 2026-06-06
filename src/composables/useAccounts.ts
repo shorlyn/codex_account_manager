@@ -92,6 +92,11 @@ async function refreshQuota(accountId: number): Promise<void> {
   await loadAccounts();
 }
 
+async function refreshProfile(accountId: number): Promise<void> {
+  await invoke<Account>('refresh_account_profile', { id: accountId });
+  await loadAccounts();
+}
+
 async function refreshAllQuotas(): Promise<void> {
   for (const account of accounts.value) {
     if (!account.has_json_info) continue;
@@ -201,6 +206,7 @@ export function useAccounts() {
     updateAccount,
     deleteAccount,
     refreshQuota,
+    refreshProfile,
     refreshAllQuotas,
     switchAccount,
     loadRefreshInterval,

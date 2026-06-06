@@ -1113,10 +1113,11 @@ fn account_secret_key(conn: &Connection, id: i64) -> Result<String, String> {
 }
 
 fn mark_quota_error(conn: &Connection, id: i64, error: &str) -> Result<(), String> {
-    let message = if error.chars().count() > 500 {
-        format!("{}...", error.chars().take(500).collect::<String>())
+    let friendly = friendly_account_error(error);
+    let message = if friendly.chars().count() > 500 {
+        format!("{}...", friendly.chars().take(500).collect::<String>())
     } else {
-        error.to_string()
+        friendly
     };
     conn.execute(
         "
@@ -1129,6 +1130,36 @@ fn mark_quota_error(conn: &Connection, id: i64, error: &str) -> Result<(), Strin
     )
     .map_err(|e| format!("Failed to update quota error: {}", e))?;
     Ok(())
+}
+
+fn friendly_account_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("refresh_token") && lower.contains("missing") {
+        return "该账号没有 refresh_token，access_token 过期后无法自动刷新，请重新 OAuth 授权。"
+            .to_string();
+    }
+    if lower.contains("token refresh failed")
+        || lower.contains("invalid_grant")
+        || lower.contains("refresh_token")
+    {
+        return format!("登录凭据刷新失败，请重新授权。详情：{}", error);
+    }
+    if lower.contains("timed out") || lower.contains("operation timed out") {
+        return format!("请求超时，请检查网络或代理后重试。详情：{}", error);
+    }
+    if lower.contains("proxy") || lower.contains("dns") || lower.contains("connect") {
+        return format!(
+            "网络连接失败，请检查代理、DNS 或网络连通性。详情：{}",
+            error
+        );
+    }
+    if lower.contains("401") || lower.contains("unauthorized") {
+        return "登录已失效，请重新 OAuth 授权。".to_string();
+    }
+    if lower.contains("403") || lower.contains("forbidden") {
+        return format!("接口拒绝访问，请确认账号权限或重新授权。详情：{}", error);
+    }
+    error.to_string()
 }
 
 fn error_chain(error: &dyn Error) -> String {
@@ -1706,6 +1737,85 @@ fn list_accounts(app: AppHandle) -> Result<Vec<Account>, String> {
 }
 
 #[command]
+async fn refresh_account_profile(app: AppHandle, id: i64) -> Result<Account, String> {
+    let conn = open_accounts_db(&app)?;
+    let key = account_secret_key(&conn, id)?;
+    let json_info = read_account_secret(&key)?;
+    let (json_info, changed) = refresh_auth_json_if_needed(&json_info, false).await?;
+    if changed {
+        save_account_secret(&key, &json_info)?;
+    }
+
+    let mut value = parse_auth_json(&json_info)?;
+    let access_token = require_json_string(&value, "/tokens/access_token", "tokens.access_token")?;
+    let local_identity = extract_identity_from_tokens(
+        value
+            .pointer("/tokens/id_token")
+            .and_then(|item| item.as_str())
+            .unwrap_or_default(),
+        &access_token,
+    );
+    let remote_identity =
+        fetch_remote_account_identity(&access_token, local_identity.account_id.as_deref())
+            .await
+            .unwrap_or(local_identity);
+
+    if let Some(account_id) = remote_identity.account_id.as_deref() {
+        if let Some(tokens) = value
+            .get_mut("tokens")
+            .and_then(|item| item.as_object_mut())
+        {
+            tokens.insert(
+                "account_id".to_string(),
+                serde_json::Value::String(account_id.to_string()),
+            );
+        }
+    }
+
+    let updated_json = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("Failed to serialize refreshed account profile: {}", e))?;
+    save_account_secret(&key, &updated_json)?;
+
+    let plan_type = remote_identity
+        .plan_type
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown");
+    let account_stub = account_stub_from_json(&updated_json);
+    conn.execute(
+        "
+        UPDATE accounts
+        SET json_info = ?1,
+            plan_type = CASE WHEN ?2 != 'unknown' THEN ?2 ELSE plan_type END,
+            last_quota_error = '',
+            updated_at = datetime('now')
+        WHERE id = ?3
+        ",
+        params![account_stub, plan_type, id],
+    )
+    .map_err(|e| format!("Failed to update account profile: {}", e))?;
+
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, name, activation_date,
+                   CASE WHEN credential_key IS NOT NULL AND credential_key != '' THEN 1 ELSE 0 END AS has_json_info,
+                   plan_type,
+                   primary_used_percent, primary_reset_at,
+                   secondary_used_percent, secondary_reset_at,
+                   last_quota_checked_at, last_quota_error,
+                   created_at, updated_at,
+                   COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+            FROM accounts
+            WHERE id = ?1
+            ",
+        )
+        .map_err(|e| format!("Failed to prepare account query: {}", e))?;
+    stmt.query_row(params![id], account_from_row)
+        .map_err(|e| format!("Failed to read refreshed account: {}", e))
+}
+
+#[command]
 fn get_migration_status(app: AppHandle) -> Result<MigrationStatus, String> {
     let conn = open_accounts_db(&app)?;
     Ok(MigrationStatus {
@@ -2009,7 +2119,7 @@ fn export_encrypted_backup(app: AppHandle, password: String) -> Result<String, S
 }
 
 #[command]
-fn import_encrypted_backup(
+async fn import_encrypted_backup(
     app: AppHandle,
     backup_text: String,
     password: String,
@@ -2019,16 +2129,21 @@ fn import_encrypted_backup(
         return Err("Unsupported backup payload version".to_string());
     }
 
-    for account in &payload.accounts {
+    let mut normalized_accounts = Vec::new();
+    for mut account in payload.accounts {
+        account.json_info = normalize_auth_input(&account.json_info)
+            .await
+            .map_err(|e| format!("Invalid account JSON in backup: {}", e))?;
         parse_auth_json(&account.json_info)
             .map_err(|e| format!("Invalid account JSON in backup: {}", e))?;
+        normalized_accounts.push(account);
     }
 
     let conn = open_accounts_db(&app)?;
     let mut imported = 0usize;
     let mut imported_credentials: Vec<(i64, String)> = Vec::new();
 
-    for account in payload.accounts {
+    for account in normalized_accounts {
         if let Err(e) = conn.execute(
             "
             INSERT INTO accounts (
@@ -2391,6 +2506,7 @@ pub fn run() {
             cancel_codex_oauth_login,
             complete_codex_oauth_login,
             list_accounts,
+            refresh_account_profile,
             add_account,
             update_account,
             delete_account,

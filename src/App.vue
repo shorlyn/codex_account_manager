@@ -11,7 +11,7 @@ const {
   accounts, loading, switchingId, currentAccountId, refreshInterval,
   restartCodexOnSwitch,
   loadAccounts, loadCurrentAccount, addAccount, updateAccount, deleteAccount,
-  refreshQuota, switchAccount, loadRefreshInterval, setRefreshInterval,
+  refreshQuota, refreshProfile, switchAccount, loadRefreshInterval, setRefreshInterval,
   loadRestartCodexOnSwitch, setRestartCodexOnSwitch,
 } = useAccounts();
 
@@ -350,6 +350,11 @@ async function handleRefresh(id: number) {
   catch (e) { showMessage(`刷新失败: ${e}`, 'error'); }
 }
 
+async function handleRefreshProfile(id: number) {
+  try { await refreshProfile(id); showMessage('账号资料已刷新'); }
+  catch (e) { showMessage(`资料刷新失败: ${e}`, 'error'); }
+}
+
 async function handleIntervalChange(e: Event) {
   await setRefreshInterval(Number((e.target as HTMLSelectElement).value));
 }
@@ -505,6 +510,7 @@ async function handleRestartToggle(e: Event) {
         @edit="openEditDialog"
         @delete="handleDelete"
         @refresh="handleRefresh"
+        @profile="handleRefreshProfile"
         @reauth="reauthorizeAccount"
       />
     </main>
