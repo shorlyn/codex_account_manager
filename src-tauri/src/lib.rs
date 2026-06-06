@@ -5,8 +5,10 @@ use aes_gcm::{
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand_core::{OsRng, RngCore};
+use reqwest::header::{HeaderValue, AUTHORIZATION};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::error::Error;
 use tauri::{
     command,
     menu::{Menu, MenuItem},
@@ -105,7 +107,18 @@ struct EncryptedBackup {
     ciphertext: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct CredentialManifest {
+    format: String,
+    version: u32,
+    part_prefix: String,
+    parts: usize,
+}
+
 // ── Helper functions ──────────────────────────────────────────────────
+
+const CREDENTIAL_CHUNK_CHARS: usize = 500;
+const CREDENTIAL_MANIFEST_FORMAT: &str = "codex-account-manager-secret-chunks";
 
 fn get_home_dir() -> Result<String, String> {
     if cfg!(target_os = "windows") {
@@ -239,24 +252,128 @@ fn credential_entry(key: &str) -> Result<keyring::Entry, String> {
         .map_err(|e| format!("Failed to open credential store: {}", e))
 }
 
-fn save_account_secret(key: &str, json_info: &str) -> Result<(), String> {
-    credential_entry(key)?
-        .set_password(json_info)
-        .map_err(|e| format!("Failed to save account credential: {}", e))
+fn credential_manifest(text: &str) -> Option<CredentialManifest> {
+    let manifest = serde_json::from_str::<CredentialManifest>(text).ok()?;
+    if manifest.format == CREDENTIAL_MANIFEST_FORMAT && manifest.version == 1 {
+        Some(manifest)
+    } else {
+        None
+    }
 }
 
-fn read_account_secret(key: &str) -> Result<String, String> {
-    credential_entry(key)?
-        .get_password()
-        .map_err(|e| format!("Failed to read account credential: {}", e))
+fn chunk_secret(secret: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for ch in secret.chars() {
+        if current.chars().count() >= CREDENTIAL_CHUNK_CHARS {
+            chunks.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() || secret.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
-fn delete_account_secret(key: &str) {
+fn cleanup_secret_parts(prefix: &str, parts: usize) {
+    for index in 0..parts {
+        delete_account_secret_entry(&format!("{}.{}", prefix, index));
+    }
+}
+
+fn delete_account_secret_entry(key: &str) {
     let _ = credential_entry(key).and_then(|entry| {
         entry
             .delete_credential()
             .map_err(|e| format!("Failed to delete account credential: {}", e))
     });
+}
+
+fn save_account_secret(key: &str, json_info: &str) -> Result<(), String> {
+    let previous_manifest = credential_entry(key)
+        .and_then(|entry| {
+            entry
+                .get_password()
+                .map_err(|e| format!("Failed to read account credential: {}", e))
+        })
+        .ok()
+        .and_then(|text| credential_manifest(&text));
+
+    let generation = {
+        let mut bytes = [0u8; 8];
+        OsRng.fill_bytes(&mut bytes);
+        BASE64.encode(bytes).replace(['/', '+', '='], "")
+    };
+    let part_prefix = format!("{}.part.{}", key, generation);
+    let chunks = chunk_secret(json_info);
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        if let Err(e) = credential_entry(&format!("{}.{}", part_prefix, index)).and_then(|entry| {
+            entry
+                .set_password(chunk)
+                .map_err(|e| format!("Failed to save account credential: {}", e))
+        }) {
+            cleanup_secret_parts(&part_prefix, index);
+            return Err(e);
+        }
+    }
+
+    let manifest = CredentialManifest {
+        format: CREDENTIAL_MANIFEST_FORMAT.to_string(),
+        version: 1,
+        part_prefix: part_prefix.clone(),
+        parts: chunks.len(),
+    };
+    let manifest_text = serde_json::to_string(&manifest)
+        .map_err(|e| format!("Failed to serialize credential manifest: {}", e))?;
+
+    if let Err(e) = credential_entry(key)?.set_password(&manifest_text) {
+        cleanup_secret_parts(&part_prefix, chunks.len());
+        return Err(format!("Failed to save account credential: {}", e));
+    }
+
+    if let Some(previous_manifest) = previous_manifest {
+        cleanup_secret_parts(&previous_manifest.part_prefix, previous_manifest.parts);
+    }
+
+    Ok(())
+}
+
+fn read_account_secret(key: &str) -> Result<String, String> {
+    let stored = credential_entry(key)?
+        .get_password()
+        .map_err(|e| format!("Failed to read account credential: {}", e))?;
+
+    let Some(manifest) = credential_manifest(&stored) else {
+        return Ok(stored);
+    };
+
+    let mut secret = String::new();
+    for index in 0..manifest.parts {
+        let chunk = credential_entry(&format!("{}.{}", manifest.part_prefix, index))?
+            .get_password()
+            .map_err(|e| format!("Failed to read account credential part: {}", e))?;
+        secret.push_str(&chunk);
+    }
+    Ok(secret)
+}
+
+fn delete_account_secret(key: &str) {
+    if let Ok(stored) = credential_entry(key).and_then(|entry| {
+        entry
+            .get_password()
+            .map_err(|e| format!("Failed to read account credential: {}", e))
+    }) {
+        if let Some(manifest) = credential_manifest(&stored) {
+            cleanup_secret_parts(&manifest.part_prefix, manifest.parts);
+        }
+    }
+    delete_account_secret_entry(key);
 }
 
 fn extract_account_id(json_info: &str) -> Option<String> {
@@ -335,6 +452,19 @@ fn mark_quota_error(conn: &Connection, id: i64, error: &str) -> Result<(), Strin
     )
     .map_err(|e| format!("Failed to update quota error: {}", e))?;
     Ok(())
+}
+
+fn error_chain(error: &dyn Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+
+    while let Some(err) = source {
+        message.push_str(": ");
+        message.push_str(&err.to_string());
+        source = err.source();
+    }
+
+    message
 }
 
 fn derive_backup_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
@@ -533,13 +663,23 @@ fn restart_codex_process() -> Result<(), String> {
 
 #[command]
 async fn fetch_quota(access_token: String) -> Result<QuotaInfo, String> {
-    let client = reqwest::Client::new();
+    let token = access_token.trim();
+    if token.is_empty() {
+        return Err("Access token is empty".to_string());
+    }
+    let auth_header = HeaderValue::from_str(&format!("Bearer {}", token))
+        .map_err(|e| format!("Invalid access token for Authorization header: {}", e))?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", error_chain(&e)))?;
     let response = client
         .get("https://chatgpt.com/backend-api/wham/usage")
-        .header("Authorization", format!("Bearer {}", access_token))
+        .header(AUTHORIZATION, auth_header)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Request failed: {}", error_chain(&e)))?;
 
     if !response.status().is_success() {
         return Err(format!("API returned status: {}", response.status()));
@@ -1354,5 +1494,17 @@ mod tests {
 
         assert!(encrypt_backup_payload(&payload, "short").is_err());
         assert!(decrypt_backup_payload("{}", "short").is_err());
+    }
+
+    #[test]
+    fn long_secret_is_split_into_safe_chunks() {
+        let secret = "a".repeat(CREDENTIAL_CHUNK_CHARS * 2 + 17);
+        let chunks = chunk_secret(&secret);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.chars().count() <= CREDENTIAL_CHUNK_CHARS));
+        assert_eq!(chunks.concat(), secret);
     }
 }
