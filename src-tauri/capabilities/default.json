@@ -3,10 +3,6 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "sql:default",
-    "sql:allow-execute",
-    "sql:allow-select",
-    "sql:allow-load"
+    "core:default"
   ]
 }

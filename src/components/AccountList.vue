@@ -22,6 +22,11 @@ function formatResetTime(timestamp: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+function formatCheckedTime(value: string): string {
+  if (!value) return '尚未检查';
+  return value.replace('T', ' ');
+}
+
 function remaining(used: number): number {
   return Math.max(0, 100 - used);
 }
@@ -48,13 +53,7 @@ function getPlanClass(t: string): string {
 }
 
 function isCurrent(account: Account): boolean {
-  if (!props.currentAccountId) return false;
-  try {
-    const parsed = JSON.parse(account.json_info);
-    return parsed.tokens?.account_id === props.currentAccountId;
-  } catch {
-    return false;
-  }
+  return Boolean(props.currentAccountId && account.account_id === props.currentAccountId);
 }
 </script>
 
@@ -157,14 +156,21 @@ function isCurrent(account: Account): boolean {
             </div>
             <span class="quota-reset">刷新 {{ formatResetTime(account.secondary_reset_at) }}</span>
           </div>
+
+          <div :class="['quota-status', { 'quota-status-error': account.last_quota_error }]">
+            <span>上次检查 {{ formatCheckedTime(account.last_quota_checked_at) }}</span>
+            <span v-if="account.last_quota_error" class="quota-error" :title="account.last_quota_error">
+              {{ account.last_quota_error }}
+            </span>
+          </div>
         </div>
 
         <!-- Footer -->
         <div class="card-footer">
           <button
             class="btn-run"
-            :disabled="switchingId === account.id || !account.json_info"
-            :title="!account.json_info ? 'JSON 为空' : '切换账号'"
+            :disabled="switchingId === account.id || !account.has_json_info"
+            :title="!account.has_json_info ? 'JSON 为空' : '切换账号'"
             @click="emit('run', account.id)"
           >
             <svg v-if="switchingId === account.id" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
@@ -388,6 +394,30 @@ function isCurrent(account: Account): boolean {
   font-size: 11px;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
+}
+
+.quota-status {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--border-light);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.quota-status-error {
+  background: var(--danger-light);
+  color: var(--danger);
+}
+
+.quota-error {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
 }
 
 /* ── Card footer ──────────────────────── */

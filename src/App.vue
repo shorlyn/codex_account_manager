@@ -4,12 +4,14 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAccounts } from './composables/useAccounts';
 import AccountList from './components/AccountList.vue';
 import AccountDialog from './components/AccountDialog.vue';
-import type { Account, StoragePaths } from './types';
+import type { Account, MigrationStatus, StoragePaths } from './types';
 
 const {
   accounts, loading, switchingId, currentAccountId, refreshInterval,
+  restartCodexOnSwitch,
   loadAccounts, loadCurrentAccount, addAccount, updateAccount, deleteAccount,
-  refreshQuota, switchAccount, startAutoRefresh,
+  refreshQuota, switchAccount, loadRefreshInterval, setRefreshInterval,
+  loadRestartCodexOnSwitch, setRestartCodexOnSwitch,
 } = useAccounts();
 
 const showDialog = ref(false);
@@ -17,7 +19,11 @@ const editingAccount = ref<Account | null>(null);
 const message = ref('');
 const messageType = ref<'success' | 'error'>('success');
 const storagePaths = ref<StoragePaths | null>(null);
+const migrationStatus = ref<MigrationStatus | null>(null);
 const showStorageDetails = ref(false);
+const savingAccount = ref(false);
+const migratingAccounts = ref(false);
+const importInput = ref<HTMLInputElement | null>(null);
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 
 const intervalOptions = [
@@ -32,7 +38,9 @@ onMounted(async () => {
   await loadAccounts();
   await loadCurrentAccount();
   await loadStoragePaths();
-  startAutoRefresh(10);
+  await loadMigrationStatus();
+  await loadRefreshInterval(10);
+  await loadRestartCodexOnSwitch(true);
 });
 
 function showMessage(text: string, type: 'success' | 'error' = 'success') {
@@ -90,6 +98,7 @@ async function openAuthFolder() {
 }
 
 async function handleSave(data: { name: string; activationDate: string; jsonInfo: string }) {
+  savingAccount.value = true;
   try {
     if (editingAccount.value) {
       await updateAccount(editingAccount.value.id, data.name, data.activationDate, data.jsonInfo);
@@ -100,11 +109,105 @@ async function handleSave(data: { name: string; activationDate: string; jsonInfo
     }
     showDialog.value = false;
     editingAccount.value = null;
-  } catch (e) { showMessage(`保存失败: ${e}`, 'error'); }
+  } catch (e) {
+    showMessage(`保存失败: ${e}`, 'error');
+  } finally {
+    savingAccount.value = false;
+  }
+}
+
+async function loadMigrationStatus() {
+  try {
+    migrationStatus.value = await invoke<MigrationStatus>('get_migration_status');
+  } catch (e) {
+    showMessage(`读取迁移状态失败: ${e}`, 'error');
+  }
+}
+
+function backupFileName(): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const d = new Date();
+  return [
+    'codex-accounts-backup',
+    d.getFullYear(),
+    pad(d.getMonth() + 1),
+    pad(d.getDate()),
+    pad(d.getHours()),
+    pad(d.getMinutes()),
+  ].join('-') + '.json';
+}
+
+function downloadTextFile(fileName: string, text: string) {
+  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+async function exportBackup() {
+  const password = prompt('请输入备份密码（至少 8 位）。导入时需要同一个密码。');
+  if (!password) return;
+  try {
+    const backupText = await invoke<string>('export_encrypted_backup', { password });
+    downloadTextFile(backupFileName(), backupText);
+    showMessage('加密备份已导出');
+  } catch (e) {
+    showMessage(`导出备份失败: ${e}`, 'error');
+  }
+}
+
+function openImportBackup() {
+  importInput.value?.click();
+}
+
+async function importBackup(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+
+  const password = prompt('请输入备份密码');
+  if (!password) return;
+
+  try {
+    const backupText = await file.text();
+    const count = await invoke<number>('import_encrypted_backup', { backupText, password });
+    await loadAccounts();
+    await loadMigrationStatus();
+    showMessage(`已导入 ${count} 个账号`);
+  } catch (err) {
+    showMessage(`导入备份失败: ${err}`, 'error');
+  }
+}
+
+async function migrateOldAccounts() {
+  const pending = migrationStatus.value?.pending_plaintext_accounts ?? 0;
+  if (pending <= 0) return;
+  if (!confirm(`检测到 ${pending} 个旧账号仍在数据库明文保存。现在迁移到系统凭据库吗？`)) return;
+
+  migratingAccounts.value = true;
+  try {
+    const status = await invoke<MigrationStatus>('migrate_plaintext_accounts');
+    migrationStatus.value = status;
+    await loadAccounts();
+    showMessage(status.pending_plaintext_accounts === 0 ? '旧账号已迁移到系统凭据库' : `仍有 ${status.pending_plaintext_accounts} 个账号待迁移`, status.pending_plaintext_accounts === 0 ? 'success' : 'error');
+  } catch (e) {
+    showMessage(`迁移旧账号失败: ${e}`, 'error');
+  } finally {
+    migratingAccounts.value = false;
+  }
 }
 
 async function handleRun(id: number) {
-  try { await switchAccount(id); showMessage('账号已切换，Codex 已重启'); }
+  try {
+    await switchAccount(id, restartCodexOnSwitch.value);
+    showMessage(restartCodexOnSwitch.value ? '账号已切换，Codex 已重启' : '账号已切换，未重启 Codex');
+  }
   catch (e) { showMessage(`切换失败: ${e}`, 'error'); }
 }
 
@@ -120,8 +223,12 @@ async function handleRefresh(id: number) {
   catch (e) { showMessage(`刷新失败: ${e}`, 'error'); }
 }
 
-function handleIntervalChange(e: Event) {
-  startAutoRefresh(Number((e.target as HTMLSelectElement).value));
+async function handleIntervalChange(e: Event) {
+  await setRefreshInterval(Number((e.target as HTMLSelectElement).value));
+}
+
+async function handleRestartToggle(e: Event) {
+  await setRestartCodexOnSwitch((e.target as HTMLInputElement).checked);
 }
 </script>
 
@@ -152,6 +259,10 @@ function handleIntervalChange(e: Event) {
               <option v-for="opt in intervalOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
             </select>
           </div>
+          <label class="restart-toggle" title="关闭后切换账号只写入 auth.json，不会结束或重启 Codex">
+            <input type="checkbox" :checked="restartCodexOnSwitch" @change="handleRestartToggle" />
+            <span>切换后重启 Codex</span>
+          </label>
           <button class="btn-add" @click="openAddDialog">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
               <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
@@ -189,11 +300,32 @@ function handleIntervalChange(e: Event) {
             </div>
             <div>
               <p class="storage-title">账号数据保存在本机</p>
-              <span>换电脑时复制 codex_accounts.db 即可迁移账号列表</span>
+              <span>换电脑请使用加密备份，账号密钥会写入系统凭据库</span>
             </div>
           </div>
 
           <div class="storage-actions">
+            <button
+              v-if="migrationStatus && migrationStatus.pending_plaintext_accounts > 0"
+              class="btn-storage-warning"
+              :disabled="migratingAccounts"
+              @click="migrateOldAccounts"
+            >
+              {{ migratingAccounts ? '迁移中...' : `迁移旧账号 (${migrationStatus.pending_plaintext_accounts})` }}
+            </button>
+            <button class="btn-storage-primary" @click="exportBackup">
+              导出加密备份
+            </button>
+            <button class="btn-storage" @click="openImportBackup">
+              导入备份
+            </button>
+            <input
+              ref="importInput"
+              class="backup-input"
+              type="file"
+              accept="application/json,.json"
+              @change="importBackup"
+            />
             <button class="btn-storage-primary" @click="openStorageFolder">
               打开账号库目录
             </button>
@@ -218,7 +350,10 @@ function handleIntervalChange(e: Event) {
             <button @click="copyText(storagePaths.auth_json_path, 'auth.json 路径')">复制</button>
           </div>
           <p class="storage-note">
-            `codex_accounts.db` 是管理器的账号仓库；`auth.json` 只代表当前正在被 Codex 使用的账号。
+            `codex_accounts.db` 只保存账号元数据；完整 auth.json 保存在系统凭据库中。换电脑请使用加密备份导出和导入。
+            <span v-if="migrationStatus && migrationStatus.pending_plaintext_accounts > 0">
+              当前检测到 {{ migrationStatus.pending_plaintext_accounts }} 个旧账号还未迁移。
+            </span>
           </p>
         </div>
       </section>
@@ -240,6 +375,7 @@ function handleIntervalChange(e: Event) {
       <AccountDialog
         v-if="showDialog"
         :account="editingAccount"
+        :saving="savingAccount"
         @save="handleSave"
         @close="closeDialog"
       />
@@ -346,6 +482,23 @@ function handleIntervalChange(e: Event) {
   box-shadow: 0 0 0 3px var(--primary-glow);
 }
 
+.restart-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.restart-toggle input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--primary);
+}
+
 .btn-add {
   display: inline-flex;
   align-items: center;
@@ -438,7 +591,8 @@ function handleIntervalChange(e: Event) {
 }
 
 .btn-storage,
-.btn-storage-primary {
+.btn-storage-primary,
+.btn-storage-warning {
   padding: 6px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -455,10 +609,26 @@ function handleIntervalChange(e: Event) {
   color: var(--primary);
 }
 
+.btn-storage-warning {
+  border-color: #fde68a;
+  background: var(--warning-light);
+  color: var(--warning);
+}
+
 .btn-storage:hover,
-.btn-storage-primary:hover {
+.btn-storage-primary:hover,
+.btn-storage-warning:hover:not(:disabled) {
   transform: translateY(-1px);
   box-shadow: var(--shadow-xs);
+}
+
+.btn-storage-warning:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.backup-input {
+  display: none;
 }
 
 .storage-details {

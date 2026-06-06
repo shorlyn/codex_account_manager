@@ -4,6 +4,7 @@ import type { Account } from '../types';
 
 const props = defineProps<{
   account?: Account | null;
+  saving?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -16,15 +17,12 @@ const activationDate = ref('');
 const jsonInfo = ref('');
 const jsonError = ref('');
 const jsonValid = ref(false);
-const saving = ref(false);
 const isEdit = !!props.account;
 
 onMounted(() => {
   if (props.account) {
     name.value = props.account.name;
     activationDate.value = props.account.activation_date || '';
-    jsonInfo.value = props.account.json_info || '';
-    validateJson();
   }
 });
 
@@ -33,7 +31,20 @@ function validateJson(): boolean {
   jsonValid.value = false;
   if (!jsonInfo.value.trim()) return true;
   try {
-    JSON.parse(jsonInfo.value);
+    const parsed = JSON.parse(jsonInfo.value);
+    const missing = [
+      ['tokens.access_token', parsed?.tokens?.access_token],
+      ['tokens.refresh_token', parsed?.tokens?.refresh_token],
+      ['tokens.account_id', parsed?.tokens?.account_id],
+    ]
+      .filter(([, value]) => typeof value !== 'string' || !value.trim())
+      .map(([label]) => label);
+
+    if (missing.length > 0) {
+      jsonError.value = `缺少必要字段：${missing.join('、')}`;
+      return false;
+    }
+
     jsonValid.value = true;
     return true;
   } catch {
@@ -45,13 +56,11 @@ function validateJson(): boolean {
 function handleSave() {
   if (!name.value.trim()) return;
   if (!validateJson()) return;
-  saving.value = true;
   emit('save', {
     name: name.value.trim(),
     activationDate: activationDate.value,
     jsonInfo: jsonInfo.value.trim(),
   });
-  saving.value = false;
 }
 
 function handleBackdrop(e: MouseEvent) {
@@ -62,8 +71,7 @@ function formatJson() {
   if (!jsonInfo.value.trim()) return;
   try {
     jsonInfo.value = JSON.stringify(JSON.parse(jsonInfo.value), null, 2);
-    jsonError.value = '';
-    jsonValid.value = true;
+    validateJson();
   } catch { /* skip */ }
 }
 </script>
@@ -116,7 +124,7 @@ function formatJson() {
           <textarea
             v-model="jsonInfo"
             rows="10"
-            placeholder='粘贴 auth.json 完整内容...'
+            :placeholder="isEdit ? '留空则不修改已保存的 auth.json；粘贴新内容可替换...' : '粘贴 auth.json 完整内容...'"
             @input="validateJson()"
           ></textarea>
           <div class="field-msg">
@@ -139,11 +147,11 @@ function formatJson() {
       <!-- Footer -->
       <div class="dialog-footer">
         <button class="btn-cancel" @click="emit('close')">取消</button>
-        <button class="btn-save" :disabled="!name.trim() || saving" @click="handleSave">
-          <svg v-if="saving" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <button class="btn-save" :disabled="!name.trim() || props.saving" @click="handleSave">
+          <svg v-if="props.saving" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
             <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
           </svg>
-          {{ saving ? '保存中...' : (isEdit ? '保存' : '添加') }}
+          {{ props.saving ? '保存中...' : (isEdit ? '保存' : '添加') }}
         </button>
       </div>
     </div>
