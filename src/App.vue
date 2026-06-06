@@ -113,7 +113,13 @@ async function addAccountWithOAuth() {
   }
 }
 
-function closeOauthDialog() {
+async function cancelOauthSession() {
+  if (!oauthLoginId.value) return;
+  await invoke('cancel_codex_oauth_login', { loginId: oauthLoginId.value }).catch(() => {});
+}
+
+async function closeOauthDialog() {
+  await cancelOauthSession();
   showOauthDialog.value = false;
   oauthAdding.value = false;
   oauthLoginId.value = '';
@@ -125,7 +131,12 @@ function closeOauthDialog() {
 }
 
 async function retryOauthLogin() {
-  closeOauthDialog();
+  await closeOauthDialog();
+  await addAccountWithOAuth();
+}
+
+async function reauthorizeAccount(account: Account) {
+  showMessage(`正在为 ${account.name} 重新授权...`);
   await addAccountWithOAuth();
 }
 
@@ -161,7 +172,7 @@ async function completeOauthLogin(auto = false) {
       callbackUrl: auto ? null : oauthCallbackUrl.value.trim(),
     });
     await loadAccounts();
-    closeOauthDialog();
+    await closeOauthDialog();
     showMessage('OAuth 账号已添加');
   } catch (e) {
     oauthError.value = String(e).replace(/^Error:\s*/, '');
@@ -494,6 +505,7 @@ async function handleRestartToggle(e: Event) {
         @edit="openEditDialog"
         @delete="handleDelete"
         @refresh="handleRefresh"
+        @reauth="reauthorizeAccount"
       />
     </main>
 

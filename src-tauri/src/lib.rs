@@ -125,9 +125,11 @@ struct CredentialManifest {
 #[derive(Debug, Clone)]
 struct OAuthState {
     login_id: String,
+    auth_url: String,
     state: String,
     code_verifier: String,
     redirect_uri: String,
+    expires_at: i64,
     code: Option<String>,
 }
 
@@ -669,6 +671,15 @@ fn start_oauth_callback_listener(
         let mut completed = false;
 
         while started.elapsed() < timeout {
+            let should_stop = OAUTH_STATE
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|state| state.login_id != login_id))
+                .unwrap_or(true);
+            if should_stop {
+                break;
+            }
+
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let mut buffer = [0u8; 4096];
@@ -679,6 +690,10 @@ fn start_oauth_callback_listener(
                         .next()
                         .and_then(|line| line.split_whitespace().nth(1))
                         .unwrap_or("");
+                    if path.starts_with("/cancel") {
+                        write_http_response(&mut stream, "200 OK", "OAuth cancelled");
+                        break;
+                    }
                     if !path.starts_with("/auth/callback") {
                         write_http_response(&mut stream, "404 Not Found", "Not Found");
                         continue;
@@ -1370,6 +1385,22 @@ fn start_codex_oauth_login(
     app: AppHandle,
     open_browser: Option<bool>,
 ) -> Result<OAuthStartResponse, String> {
+    if let Some(existing) = OAUTH_STATE
+        .lock()
+        .map_err(|_| "OAuth state lock is poisoned".to_string())?
+        .as_ref()
+        .filter(|state| state.expires_at > chrono_like_now_timestamp())
+        .cloned()
+    {
+        if open_browser.unwrap_or(true) {
+            open_url_in_browser(&existing.auth_url)?;
+        }
+        return Ok(OAuthStartResponse {
+            login_id: existing.login_id,
+            auth_url: existing.auth_url,
+        });
+    }
+
     let login_id = random_base64url_token();
     let state = random_base64url_token();
     let code_verifier = random_base64url_token();
@@ -1401,9 +1432,11 @@ fn start_codex_oauth_login(
         .map_err(|_| "OAuth state lock is poisoned".to_string())?;
     *guard = Some(OAuthState {
         login_id: login_id.clone(),
+        auth_url: auth_url.clone(),
         state: state.clone(),
         code_verifier,
         redirect_uri,
+        expires_at: chrono_like_now_timestamp() + 300,
         code: None,
     });
     drop(guard);
@@ -1415,6 +1448,39 @@ fn start_codex_oauth_login(
     }
 
     Ok(OAuthStartResponse { login_id, auth_url })
+}
+
+#[command]
+fn cancel_codex_oauth_login(login_id: Option<String>) -> Result<(), String> {
+    let should_cancel = {
+        let guard = OAUTH_STATE
+            .lock()
+            .map_err(|_| "OAuth state lock is poisoned".to_string())?;
+        match (guard.as_ref(), login_id.as_deref()) {
+            (Some(_), None) => true,
+            (Some(state), Some(id)) => state.login_id == id,
+            _ => false,
+        }
+    };
+
+    if !should_cancel {
+        return Ok(());
+    }
+
+    {
+        let mut guard = OAUTH_STATE
+            .lock()
+            .map_err(|_| "OAuth state lock is poisoned".to_string())?;
+        *guard = None;
+    }
+
+    if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", CODEX_OAUTH_CALLBACK_PORT)) {
+        let _ = stream
+            .write_all(b"GET /cancel HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+    }
+
+    Ok(())
 }
 
 fn save_oauth_account(
@@ -2322,6 +2388,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_quota,
             start_codex_oauth_login,
+            cancel_codex_oauth_login,
             complete_codex_oauth_login,
             list_accounts,
             add_account,
