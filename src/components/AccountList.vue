@@ -571,4 +571,30 @@ function isCurrent(account: Account): boolean {
   0%, 100% { opacity: 0.3; transform: scale(1); }
   50% { opacity: 1; transform: scale(1.2); }
 }
+
+@media (max-width: 980px) {
+  .card-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .card-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .card-footer {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .btn-run {
+    justify-content: center;
+  }
+
+  .btn-group {
+    justify-content: flex-end;
+  }
+}
 </style>

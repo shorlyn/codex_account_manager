@@ -31,3 +31,9 @@ export interface AuthJson {
   };
   last_refresh: string;
 }
+
+export interface StoragePaths {
+  app_data_dir: string;
+  database_path: string;
+  auth_json_path: string;
+}

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tauri::command;
+use tauri::{command, AppHandle, Manager};
 
 // ── API response structs ──────────────────────────────────────────────
 
@@ -30,6 +30,13 @@ pub struct QuotaInfo {
     pub secondary_reset_at: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StoragePaths {
+    pub app_data_dir: String,
+    pub database_path: String,
+    pub auth_json_path: String,
+}
+
 // ── Helper functions ──────────────────────────────────────────────────
 
 fn get_home_dir() -> Result<String, String> {
@@ -43,6 +50,14 @@ fn get_home_dir() -> Result<String, String> {
 fn get_auth_path() -> Result<std::path::PathBuf, String> {
     let home = get_home_dir()?;
     Ok(std::path::PathBuf::from(home).join(".codex").join("auth.json"))
+}
+
+fn get_database_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Cannot find app data directory: {}", e))?;
+    Ok(app_data_dir.join("codex_accounts.db"))
 }
 
 fn kill_codex_process() -> Result<(), String> {
@@ -187,6 +202,22 @@ async fn get_codex_auth_path() -> Result<String, String> {
 }
 
 #[command]
+async fn get_storage_paths(app: AppHandle) -> Result<StoragePaths, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Cannot find app data directory: {}", e))?;
+    let database_path = get_database_path(&app)?;
+    let auth_json_path = get_auth_path()?;
+
+    Ok(StoragePaths {
+        app_data_dir: app_data_dir.to_string_lossy().to_string(),
+        database_path: database_path.to_string_lossy().to_string(),
+        auth_json_path: auth_json_path.to_string_lossy().to_string(),
+    })
+}
+
+#[command]
 async fn is_codex_running() -> Result<bool, String> {
     let running = {
         #[cfg(target_os = "macos")]
@@ -229,6 +260,7 @@ pub fn run() {
             write_auth_json,
             read_auth_json,
             get_codex_auth_path,
+            get_storage_paths,
             is_codex_running,
         ])
         .run(tauri::generate_context!())

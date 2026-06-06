@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
+import { invoke } from '@tauri-apps/api/core';
 import { useAccounts } from './composables/useAccounts';
 import AccountList from './components/AccountList.vue';
 import AccountDialog from './components/AccountDialog.vue';
-import type { Account } from './types';
+import type { Account, StoragePaths } from './types';
 
 const {
   accounts, loading, switchingId, currentAccountId, refreshInterval,
@@ -15,6 +16,7 @@ const showDialog = ref(false);
 const editingAccount = ref<Account | null>(null);
 const message = ref('');
 const messageType = ref<'success' | 'error'>('success');
+const storagePaths = ref<StoragePaths | null>(null);
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 
 const intervalOptions = [
@@ -28,6 +30,7 @@ const intervalOptions = [
 onMounted(async () => {
   await loadAccounts();
   await loadCurrentAccount();
+  await loadStoragePaths();
   startAutoRefresh(10);
 });
 
@@ -41,6 +44,31 @@ function showMessage(text: string, type: 'success' | 'error' = 'success') {
 function openAddDialog() { editingAccount.value = null; showDialog.value = true; }
 function openEditDialog(account: Account) { editingAccount.value = account; showDialog.value = true; }
 function closeDialog() { showDialog.value = false; editingAccount.value = null; }
+
+async function loadStoragePaths() {
+  try {
+    storagePaths.value = await invoke<StoragePaths>('get_storage_paths');
+  } catch (e) {
+    showMessage(`读取数据位置失败: ${e}`, 'error');
+  }
+}
+
+async function copyText(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    showMessage(`${label}已复制`);
+  } catch {
+    const el = document.createElement('textarea');
+    el.value = text;
+    el.style.position = 'fixed';
+    el.style.opacity = '0';
+    document.body.appendChild(el);
+    el.select();
+    const copied = document.execCommand('copy');
+    document.body.removeChild(el);
+    showMessage(copied ? `${label}已复制` : '复制失败，请手动选中路径复制', copied ? 'success' : 'error');
+  }
+}
 
 async function handleSave(data: { name: string; activationDate: string; jsonInfo: string }) {
   try {
@@ -130,6 +158,39 @@ function handleIntervalChange(e: Event) {
 
     <!-- Content -->
     <main class="content">
+      <section v-if="storagePaths" class="storage-panel">
+        <div class="storage-copy">
+          <div class="storage-icon">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <ellipse cx="12" cy="5" rx="9" ry="3"/>
+              <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/>
+              <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/>
+            </svg>
+          </div>
+          <div>
+            <p class="storage-eyebrow">本机账号库</p>
+            <h2>换电脑时复制这个数据库文件即可迁移账号列表</h2>
+          </div>
+        </div>
+
+        <div class="storage-paths">
+          <div class="path-row">
+            <span class="path-label">账号库</span>
+            <code>{{ storagePaths.database_path }}</code>
+            <button @click="copyText(storagePaths.database_path, '账号库路径')">复制</button>
+          </div>
+          <div class="path-row path-row-muted">
+            <span class="path-label">当前生效</span>
+            <code>{{ storagePaths.auth_json_path }}</code>
+            <button @click="copyText(storagePaths.auth_json_path, 'auth.json 路径')">复制</button>
+          </div>
+        </div>
+
+        <p class="storage-note">
+          `codex_accounts.db` 是管理器的账号仓库；`auth.json` 只代表当前正在被 Codex 使用的账号。
+        </p>
+      </section>
+
       <AccountList
         :accounts="accounts"
         :loading="loading"
@@ -285,6 +346,112 @@ function handleIntervalChange(e: Event) {
   overflow-y: auto;
 }
 
+/* ── Storage panel ─────────────────────── */
+.storage-panel {
+  margin-bottom: 20px;
+  padding: 18px;
+  border: 1px solid rgba(99, 102, 241, 0.16);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(circle at 0 0, rgba(99, 102, 241, 0.11), transparent 34%),
+    linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+  box-shadow: var(--shadow-sm);
+}
+
+.storage-copy {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.storage-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--primary);
+  background: var(--primary-light);
+  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.12);
+}
+
+.storage-eyebrow {
+  margin: 0 0 2px;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.storage-copy h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.storage-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.path-row {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.path-row-muted {
+  opacity: 0.82;
+}
+
+.path-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.path-row code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-row button {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  transition: all 0.2s var(--ease-out);
+}
+
+.path-row button:hover {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+}
+
+.storage-note {
+  margin: 12px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
 /* ── Toast ────────────────────────────── */
 .toast {
   position: fixed;
@@ -341,5 +508,30 @@ function handleIntervalChange(e: Event) {
 .dialog-enter-from,
 .dialog-leave-to {
   opacity: 0;
+}
+
+@media (max-width: 760px) {
+  .header-inner {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .header-right {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .content {
+    padding: 18px;
+  }
+
+  .path-row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .path-label {
+    grid-column: 1 / -1;
+  }
 }
 </style>
