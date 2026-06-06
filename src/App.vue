@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAccounts } from './composables/useAccounts';
 import AccountList from './components/AccountList.vue';
 import AccountDialog from './components/AccountDialog.vue';
@@ -23,8 +24,16 @@ const migrationStatus = ref<MigrationStatus | null>(null);
 const showStorageDetails = ref(false);
 const savingAccount = ref(false);
 const migratingAccounts = ref(false);
+const oauthAdding = ref(false);
+const showOauthDialog = ref(false);
+const oauthLoginId = ref('');
+const oauthUrl = ref('');
+const oauthCallbackUrl = ref('');
+const oauthError = ref('');
+const oauthUrlCopied = ref(false);
 const importInput = ref<HTMLInputElement | null>(null);
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
+let unlistenOauth: UnlistenFn | null = null;
 
 const intervalOptions = [
   { label: '关闭', value: 0 },
@@ -35,12 +44,24 @@ const intervalOptions = [
 ];
 
 onMounted(async () => {
+  unlistenOauth = await listen<{ loginId?: string }>('codex-oauth-login-completed', async (event) => {
+    if (!showOauthDialog.value || !event.payload?.loginId) return;
+    if (event.payload.loginId !== oauthLoginId.value) return;
+    await completeOauthLogin(true);
+  });
   await loadAccounts();
   await loadCurrentAccount();
   await loadStoragePaths();
   await loadMigrationStatus();
   await loadRefreshInterval(10);
   await loadRestartCodexOnSwitch(true);
+});
+
+onUnmounted(() => {
+  if (unlistenOauth) {
+    unlistenOauth();
+    unlistenOauth = null;
+  }
 });
 
 function showMessage(text: string, type: 'success' | 'error' = 'success') {
@@ -53,6 +74,76 @@ function showMessage(text: string, type: 'success' | 'error' = 'success') {
 function openAddDialog() { editingAccount.value = null; showDialog.value = true; }
 function openEditDialog(account: Account) { editingAccount.value = account; showDialog.value = true; }
 function closeDialog() { showDialog.value = false; editingAccount.value = null; }
+
+async function addAccountWithOAuth() {
+  oauthAdding.value = true;
+  try {
+    const started = await invoke<{ loginId: string; authUrl: string }>('start_codex_oauth_login', {
+      openBrowser: true,
+    });
+    oauthLoginId.value = started.loginId;
+    oauthUrl.value = started.authUrl;
+    oauthCallbackUrl.value = '';
+    oauthError.value = '';
+    oauthUrlCopied.value = false;
+    showOauthDialog.value = true;
+  } catch (e) {
+    showMessage(`OAuth 添加失败: ${e}`, 'error');
+  } finally {
+    oauthAdding.value = false;
+  }
+}
+
+function closeOauthDialog() {
+  showOauthDialog.value = false;
+  oauthAdding.value = false;
+  oauthLoginId.value = '';
+  oauthUrl.value = '';
+  oauthCallbackUrl.value = '';
+  oauthError.value = '';
+  oauthUrlCopied.value = false;
+}
+
+async function copyOauthUrl() {
+  if (!oauthUrl.value) return;
+  try {
+    await navigator.clipboard.writeText(oauthUrl.value);
+    oauthUrlCopied.value = true;
+    setTimeout(() => { oauthUrlCopied.value = false; }, 1200);
+  } catch {
+    oauthError.value = '复制失败，请手动选中授权链接复制';
+  }
+}
+
+async function openOauthUrl() {
+  try {
+    window.open(oauthUrl.value, '_blank', 'noopener,noreferrer');
+  } catch {
+    await copyOauthUrl();
+  }
+}
+
+async function completeOauthLogin(auto = false) {
+  if (!auto && !oauthCallbackUrl.value.trim()) {
+    oauthError.value = '请粘贴完整回调地址';
+    return;
+  }
+  oauthAdding.value = true;
+  oauthError.value = '';
+  try {
+    await invoke<number>('complete_codex_oauth_login', {
+      loginId: oauthLoginId.value,
+      callbackUrl: auto ? null : oauthCallbackUrl.value.trim(),
+    });
+    await loadAccounts();
+    closeOauthDialog();
+    showMessage('OAuth 账号已添加');
+  } catch (e) {
+    oauthError.value = String(e).replace(/^Error:\s*/, '');
+  } finally {
+    oauthAdding.value = false;
+  }
+}
 
 async function loadStoragePaths() {
   try {
@@ -263,6 +354,17 @@ async function handleRestartToggle(e: Event) {
             <input type="checkbox" :checked="restartCodexOnSwitch" @change="handleRestartToggle" />
             <span>切换后重启 Codex</span>
           </label>
+          <button class="btn-add btn-oauth" :disabled="oauthAdding" @click="addAccountWithOAuth">
+            <svg v-if="oauthAdding" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+              <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+            </svg>
+            <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M15 3h4a2 2 0 0 1 2 2v4"/>
+              <path d="M10 14 21 3"/>
+              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+            </svg>
+            {{ oauthAdding ? '授权中...' : 'OAuth 登录' }}
+          </button>
           <button class="btn-add" @click="openAddDialog">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
               <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
@@ -379,6 +481,67 @@ async function handleRestartToggle(e: Event) {
         @save="handleSave"
         @close="closeDialog"
       />
+    </Transition>
+
+    <Transition name="dialog">
+      <div v-if="showOauthDialog" class="oauth-backdrop" @click.self="closeOauthDialog">
+        <div class="oauth-dialog">
+          <div class="oauth-header">
+            <div>
+              <h2>OAuth 授权添加账号</h2>
+              <p>通过 OpenAI 官方授权登录，成功后会自动保存账号信息。</p>
+            </div>
+            <button class="oauth-close" @click="closeOauthDialog" aria-label="关闭">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="oauth-body">
+            <div class="oauth-field">
+              <label>授权链接</label>
+              <div class="oauth-url-box">
+                <input :value="oauthUrl" readonly />
+                <button @click="copyOauthUrl">{{ oauthUrlCopied ? '已复制' : '复制' }}</button>
+              </div>
+            </div>
+
+            <button class="oauth-primary" @click="openOauthUrl">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M15 3h4a2 2 0 0 1 2 2v4"/>
+                <path d="M10 14 21 3"/>
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+              </svg>
+              在浏览器中打开
+            </button>
+
+            <div class="oauth-field">
+              <label>手动输入回调地址</label>
+              <div class="oauth-callback-row">
+                <input
+                  v-model="oauthCallbackUrl"
+                  placeholder="粘贴完整回调地址，例如：http://localhost:1455/auth/callback?code=...&state=..."
+                  @keyup.enter="() => completeOauthLogin()"
+                />
+                <button :disabled="oauthAdding || !oauthCallbackUrl.trim()" @click="() => completeOauthLogin()">
+                  <svg v-if="oauthAdding" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                  </svg>
+                  <span>{{ oauthAdding ? '处理中...' : '继续' }}</span>
+                </button>
+              </div>
+            </div>
+
+            <div v-if="oauthError" class="oauth-error">
+              {{ oauthError }}
+            </div>
+            <p class="oauth-hint">
+              如果浏览器没有自动打开，先复制授权链接手动打开；授权完成后把地址栏中的回调 URL 粘贴到上方。
+            </p>
+          </div>
+        </div>
+      </div>
     </Transition>
   </div>
 </template>
@@ -522,6 +685,21 @@ async function handleRestartToggle(e: Event) {
 
 .btn-add:active {
   transform: translateY(0);
+}
+
+.btn-add:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-oauth {
+  background: #111827;
+  box-shadow: 0 2px 8px rgba(17, 24, 39, 0.2);
+}
+
+.btn-oauth:hover:not(:disabled) {
+  box-shadow: 0 4px 14px rgba(17, 24, 39, 0.28);
 }
 
 /* ── Content ──────────────────────────── */
@@ -688,6 +866,198 @@ async function handleRestartToggle(e: Event) {
   margin: 12px 0 0;
   color: var(--text-tertiary);
   font-size: 12px;
+}
+
+/* ── OAuth dialog ─────────────────────── */
+.oauth-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(6px);
+}
+
+.oauth-dialog {
+  width: 640px;
+  max-width: 94vw;
+  max-height: 90vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  box-shadow: var(--shadow-xl), 0 0 0 1px rgba(0, 0, 0, 0.04);
+}
+
+.oauth-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.oauth-header h2 {
+  margin: 0;
+  font-size: 17px;
+  color: var(--text);
+}
+
+.oauth-header p {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--text-tertiary);
+}
+
+.oauth-close {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.oauth-close:hover {
+  background: var(--border-light);
+  color: var(--text);
+}
+
+.oauth-body {
+  padding: 22px 24px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  overflow-y: auto;
+}
+
+.oauth-field label {
+  display: block;
+  margin-bottom: 7px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.oauth-url-box,
+.oauth-callback-row {
+  display: flex;
+  gap: 8px;
+}
+
+.oauth-url-box input,
+.oauth-callback-row input {
+  min-width: 0;
+  flex: 1;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.oauth-url-box input {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+}
+
+.oauth-url-box input:focus,
+.oauth-callback-row input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+.oauth-url-box button,
+.oauth-callback-row button,
+.oauth-primary {
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  transition: all 0.15s var(--ease-out);
+}
+
+.oauth-url-box button {
+  min-width: 72px;
+  padding: 0 14px;
+  background: var(--border-light);
+  color: var(--text-secondary);
+}
+
+.oauth-url-box button:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.oauth-primary {
+  width: 100%;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: linear-gradient(135deg, var(--primary), var(--primary-hover));
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.22);
+}
+
+.oauth-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.3);
+}
+
+.oauth-callback-row button {
+  min-width: 92px;
+  padding: 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: var(--success);
+  color: #fff;
+}
+
+.oauth-callback-row button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.oauth-error {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.oauth-hint {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--primary-light);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 /* ── Toast ────────────────────────────── */

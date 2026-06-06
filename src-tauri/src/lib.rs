@@ -3,17 +3,24 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use rand_core::{OsRng, RngCore};
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::error::Error;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::Mutex;
 use tauri::{
     command,
     menu::{Menu, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, WindowEvent,
+    AppHandle, Emitter, Manager, WindowEvent,
 };
 
 // ── API response structs ──────────────────────────────────────────────
@@ -115,10 +122,44 @@ struct CredentialManifest {
     parts: usize,
 }
 
+#[derive(Debug, Clone)]
+struct OAuthState {
+    login_id: String,
+    state: String,
+    code_verifier: String,
+    redirect_uri: String,
+    code: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthStartResponse {
+    pub login_id: String,
+    pub auth_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct AccountIdentity {
+    email: Option<String>,
+    account_id: Option<String>,
+    plan_type: Option<String>,
+    account_name: Option<String>,
+}
+
 // ── Helper functions ──────────────────────────────────────────────────
 
 const CREDENTIAL_CHUNK_CHARS: usize = 500;
 const CREDENTIAL_MANIFEST_FORMAT: &str = "codex-account-manager-secret-chunks";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_AUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
+const CODEX_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+const CODEX_ACCOUNT_CHECK_ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
+const CODEX_OAUTH_SCOPES: &str = "openid profile email offline_access";
+const CODEX_OAUTH_ORIGINATOR: &str = "codex_vscode";
+const CODEX_OAUTH_CALLBACK_PORT: u16 = 1455;
+const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
+
+static OAUTH_STATE: Mutex<Option<OAuthState>> = Mutex::new(None);
 
 fn get_home_dir() -> Result<String, String> {
     if cfg!(target_os = "windows") {
@@ -420,6 +461,470 @@ fn extract_access_token(json_info: &str) -> Result<String, String> {
     require_json_string(&value, "/tokens/access_token", "tokens.access_token")
 }
 
+fn normalize_json_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+}
+
+fn first_json_string(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        let mut current = value;
+        for key in *path {
+            current = match current {
+                serde_json::Value::Array(items) => items.get(key.parse::<usize>().ok()?)?,
+                _ => current.get(*key)?,
+            };
+        }
+        normalize_json_string(current.as_str())
+    })
+}
+
+fn decode_jwt_payload_value(token: &str) -> Option<serde_json::Value> {
+    let mut parts = token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    if parts.next().is_none() {
+        return None;
+    }
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice(&payload_bytes).ok()
+}
+
+fn is_token_expired(access_token: &str) -> bool {
+    let payload = match decode_jwt_payload_value(access_token) {
+        Some(value) => value,
+        None => return true,
+    };
+    let exp = match payload.get("exp").and_then(|value| value.as_i64()) {
+        Some(value) => value,
+        None => return true,
+    };
+
+    exp < chrono_like_now_timestamp() + TOKEN_REFRESH_SKEW_SECONDS
+}
+
+fn extract_identity_from_tokens(id_token: &str, access_token: &str) -> AccountIdentity {
+    let id_payload = decode_jwt_payload_value(id_token);
+    let access_payload = decode_jwt_payload_value(access_token);
+    let auth_data = access_payload
+        .as_ref()
+        .and_then(|payload| payload.get("https://api.openai.com/auth"));
+
+    let email = id_payload
+        .as_ref()
+        .and_then(|payload| {
+            first_json_string(
+                payload,
+                &[
+                    &["email"],
+                    &["https://api.openai.com/profile", "email"],
+                    &["https://api.openai.com/auth", "email"],
+                ],
+            )
+        })
+        .or_else(|| {
+            access_payload.as_ref().and_then(|payload| {
+                first_json_string(
+                    payload,
+                    &[&["email"], &["https://api.openai.com/profile", "email"]],
+                )
+            })
+        });
+    let account_id = auth_data
+        .and_then(|value| first_json_string(value, &[&["chatgpt_account_id"], &["account_id"]]))
+        .or_else(|| {
+            id_payload.as_ref().and_then(|payload| {
+                first_json_string(
+                    payload,
+                    &[
+                        &["https://api.openai.com/auth", "chatgpt_account_id"],
+                        &["https://api.openai.com/auth", "account_id"],
+                    ],
+                )
+            })
+        });
+    let plan_type = auth_data.and_then(|value| first_json_string(value, &[&["chatgpt_plan_type"]]));
+
+    AccountIdentity {
+        email,
+        account_id,
+        plan_type,
+        account_name: None,
+    }
+}
+
+fn chrono_like_now_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn random_base64url_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn code_challenge(code_verifier: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn percent_encode(input: &str) -> String {
+    let mut output = String::new();
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char)
+            }
+            _ => output.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    output
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                output.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(if bytes[index] == b'+' {
+            b' '
+        } else {
+            bytes[index]
+        });
+        index += 1;
+    }
+    String::from_utf8(output).unwrap_or_else(|_| input.to_string())
+}
+
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let query = url.split_once('?')?.1.split_once('#').map_or_else(
+        || url.split_once('?').map(|(_, query)| query).unwrap_or(""),
+        |(query, _)| query,
+    );
+    query.split('&').find_map(|pair| {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(raw_key) == key {
+            Some(percent_decode(raw_value))
+        } else {
+            None
+        }
+    })
+}
+
+fn callback_response_html() -> &'static str {
+    r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>授权成功</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; display: grid; place-items: center; min-height: 100vh; margin: 0; background: #111827; color: white; }
+    main { text-align: center; padding: 32px; }
+    h1 { margin: 0 0 10px; font-size: 24px; }
+    p { margin: 0; color: #cbd5e1; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>授权成功</h1>
+    <p>可以关闭此窗口并返回 Codex Account Manager。</p>
+  </main>
+</body>
+</html>"#
+}
+
+fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        body.as_bytes().len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn start_oauth_callback_listener(app: AppHandle, login_id: String, expected_state: String) {
+    std::thread::spawn(move || {
+        let listener = match TcpListener::bind(("127.0.0.1", CODEX_OAUTH_CALLBACK_PORT)) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("Failed to start OAuth callback listener: {}", e);
+                return;
+            }
+        };
+        let _ = listener.set_nonblocking(true);
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(300);
+
+        while started.elapsed() < timeout {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buffer = [0u8; 4096];
+                    let bytes = stream.read(&mut buffer).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buffer[..bytes]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("");
+                    if !path.starts_with("/auth/callback") {
+                        write_http_response(&mut stream, "404 Not Found", "Not Found");
+                        continue;
+                    }
+                    let callback_url =
+                        format!("http://localhost:{}{}", CODEX_OAUTH_CALLBACK_PORT, path);
+                    let code = query_param(&callback_url, "code").unwrap_or_default();
+                    let state = query_param(&callback_url, "state").unwrap_or_default();
+                    if code.is_empty() || state != expected_state {
+                        write_http_response(
+                            &mut stream,
+                            "400 Bad Request",
+                            "OAuth callback invalid",
+                        );
+                        continue;
+                    }
+
+                    let mut accepted = false;
+                    if let Ok(mut guard) = OAUTH_STATE.lock() {
+                        if let Some(current) = guard.as_mut() {
+                            if current.login_id == login_id && current.state == expected_state {
+                                current.code = Some(code);
+                                accepted = true;
+                            }
+                        }
+                    }
+
+                    if accepted {
+                        write_http_response(&mut stream, "200 OK", callback_response_html());
+                        let _ = app.emit(
+                            "codex-oauth-login-completed",
+                            serde_json::json!({ "loginId": login_id }),
+                        );
+                    } else {
+                        write_http_response(&mut stream, "409 Conflict", "OAuth state changed");
+                    }
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    eprintln!("OAuth callback listener error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn open_url_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn()
+            .map_err(|e| format!("Failed to open browser: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("Failed to open browser: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|e| format!("Failed to open browser: {}", e))?;
+    }
+
+    Ok(())
+}
+
+async fn fetch_remote_account_identity(
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<AccountIdentity, String> {
+    let auth_header = HeaderValue::from_str(&format!("Bearer {}", access_token))
+        .map_err(|e| format!("Invalid access token for account check: {}", e))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", error_chain(&e)))?;
+    let mut request = client
+        .get(CODEX_ACCOUNT_CHECK_ENDPOINT)
+        .header(AUTHORIZATION, auth_header)
+        .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(account_id) = normalize_json_string(account_id) {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("Account check request failed: {}", error_chain(&e)))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read account check response: {}", e))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Account check failed: status={}, body_len={}",
+            status,
+            body.len()
+        ));
+    }
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid account check JSON: {}", e))?;
+    Ok(AccountIdentity {
+        email: first_json_string(
+            &payload,
+            &[&["email"], &["user", "email"], &["account", "email"]],
+        ),
+        account_id: first_json_string(
+            &payload,
+            &[
+                &["id"],
+                &["account_id"],
+                &["chatgpt_account_id"],
+                &["account", "id"],
+                &["account", "account_id"],
+                &["accounts", "0", "id"],
+            ],
+        ),
+        plan_type: first_json_string(
+            &payload,
+            &[
+                &["plan_type"],
+                &["planType"],
+                &["account", "plan_type"],
+                &["account", "planType"],
+            ],
+        ),
+        account_name: first_json_string(
+            &payload,
+            &[
+                &["name"],
+                &["display_name"],
+                &["account_name"],
+                &["account", "name"],
+                &["account", "display_name"],
+            ],
+        ),
+    })
+}
+
+async fn refresh_auth_json_if_needed(
+    json_info: &str,
+    force: bool,
+) -> Result<(String, bool), String> {
+    let mut value = parse_auth_json(json_info)?;
+    let access_token = require_json_string(&value, "/tokens/access_token", "tokens.access_token")?;
+    if !force && !is_token_expired(&access_token) {
+        return Ok((json_info.to_string(), false));
+    }
+
+    let refresh_token =
+        require_json_string(&value, "/tokens/refresh_token", "tokens.refresh_token")?;
+    let current_id_token = value
+        .pointer("/tokens/id_token")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", error_chain(&e)))?;
+    let response = client
+        .post(CODEX_TOKEN_ENDPOINT)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Token refresh request failed: {}", error_chain(&e)))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read token refresh response: {}", e))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Token refresh failed: status={}, body_len={}",
+            status,
+            body.len()
+        ));
+    }
+
+    let token_response: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse token refresh response: {}", e))?;
+    let new_access_token = token_response
+        .get("access_token")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.trim().is_empty())
+        .ok_or_else(|| "Token refresh response missing access_token".to_string())?;
+    let new_refresh_token = token_response
+        .get("refresh_token")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.trim().is_empty())
+        .unwrap_or(refresh_token.as_str());
+    let new_id_token = token_response
+        .get("id_token")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.trim().is_empty())
+        .or(current_id_token.as_deref());
+
+    let tokens = value
+        .get_mut("tokens")
+        .and_then(|item| item.as_object_mut())
+        .ok_or_else(|| "Auth JSON missing tokens object".to_string())?;
+    tokens.insert(
+        "access_token".to_string(),
+        serde_json::Value::String(new_access_token.to_string()),
+    );
+    tokens.insert(
+        "refresh_token".to_string(),
+        serde_json::Value::String(new_refresh_token.to_string()),
+    );
+    if let Some(id_token) = new_id_token {
+        tokens.insert(
+            "id_token".to_string(),
+            serde_json::Value::String(id_token.to_string()),
+        );
+    }
+    value["last_refresh"] =
+        serde_json::Value::Number(serde_json::Number::from(chrono_like_now_timestamp()));
+
+    let updated = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("Failed to serialize refreshed auth JSON: {}", e))?;
+    Ok((updated, true))
+}
+
 fn account_secret_key(conn: &Connection, id: i64) -> Result<String, String> {
     let key: String = conn
         .query_row(
@@ -701,6 +1206,242 @@ async fn fetch_quota(access_token: String) -> Result<QuotaInfo, String> {
 
 async fn fetch_quota_with_token(access_token: &str) -> Result<QuotaInfo, String> {
     fetch_quota(access_token.to_string()).await
+}
+
+#[command]
+fn start_codex_oauth_login(
+    app: AppHandle,
+    open_browser: Option<bool>,
+) -> Result<OAuthStartResponse, String> {
+    let login_id = random_base64url_token();
+    let state = random_base64url_token();
+    let code_verifier = random_base64url_token();
+    let redirect_uri = format!(
+        "http://localhost:{}/auth/callback",
+        CODEX_OAUTH_CALLBACK_PORT
+    );
+    let challenge = code_challenge(&code_verifier);
+    let auth_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator={}",
+        CODEX_AUTH_ENDPOINT,
+        percent_encode(CODEX_OAUTH_CLIENT_ID),
+        percent_encode(&redirect_uri),
+        percent_encode(CODEX_OAUTH_SCOPES),
+        percent_encode(&challenge),
+        percent_encode(&state),
+        percent_encode(CODEX_OAUTH_ORIGINATOR),
+    );
+
+    let mut guard = OAUTH_STATE
+        .lock()
+        .map_err(|_| "OAuth state lock is poisoned".to_string())?;
+    *guard = Some(OAuthState {
+        login_id: login_id.clone(),
+        state: state.clone(),
+        code_verifier,
+        redirect_uri,
+        code: None,
+    });
+    drop(guard);
+
+    start_oauth_callback_listener(app, login_id.clone(), state.clone());
+
+    if open_browser.unwrap_or(true) {
+        open_url_in_browser(&auth_url)?;
+    }
+
+    Ok(OAuthStartResponse { login_id, auth_url })
+}
+
+fn save_oauth_account(
+    app: &AppHandle,
+    auth_json: &str,
+    identity: &AccountIdentity,
+) -> Result<i64, String> {
+    parse_auth_json(auth_json)?;
+    let conn = open_accounts_db(app)?;
+    let account_id = identity
+        .account_id
+        .as_deref()
+        .ok_or_else(|| "OAuth login did not return a ChatGPT account id".to_string())?;
+    let name = identity
+        .email
+        .as_deref()
+        .or(identity.account_name.as_deref())
+        .unwrap_or("Codex OAuth Account");
+    let plan_type = identity.plan_type.as_deref().unwrap_or("unknown");
+
+    let existing_id = conn
+        .query_row(
+            "
+            SELECT id
+            FROM accounts
+            WHERE COALESCE(json_extract(json_info, '$.tokens.account_id'), '') = ?1
+            LIMIT 1
+            ",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok();
+
+    let id = if let Some(id) = existing_id {
+        id
+    } else {
+        conn.execute(
+            "
+            INSERT INTO accounts (name, activation_date, json_info, plan_type, updated_at)
+            VALUES (?1, '', '{}', ?2, datetime('now'))
+            ",
+            params![name, plan_type],
+        )
+        .map_err(|e| format!("Failed to add OAuth account: {}", e))?;
+        conn.last_insert_rowid()
+    };
+
+    let key = credential_key(id);
+    save_account_secret(&key, auth_json)?;
+    conn.execute(
+        "
+        UPDATE accounts
+        SET name = ?1,
+            credential_key = ?2,
+            json_info = ?3,
+            plan_type = ?4,
+            updated_at = datetime('now')
+        WHERE id = ?5
+        ",
+        params![name, key, account_stub_from_json(auth_json), plan_type, id],
+    )
+    .map_err(|e| format!("Failed to save OAuth account: {}", e))?;
+
+    Ok(id)
+}
+
+async fn exchange_oauth_code(
+    state: &OAuthState,
+    code: &str,
+) -> Result<(String, String, String), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", error_chain(&e)))?;
+    let response = client
+        .post(CODEX_TOKEN_ENDPOINT)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", state.redirect_uri.as_str()),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+            ("code_verifier", state.code_verifier.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("OAuth token request failed: {}", error_chain(&e)))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read OAuth token response: {}", e))?;
+    if !status.is_success() {
+        return Err(format!(
+            "OAuth token exchange failed: status={}, body_len={}",
+            status,
+            body.len()
+        ));
+    }
+
+    let token_response: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid OAuth token JSON: {}", e))?;
+    let id_token = require_json_string(&token_response, "/id_token", "id_token")?;
+    let access_token = require_json_string(&token_response, "/access_token", "access_token")?;
+    let refresh_token = require_json_string(&token_response, "/refresh_token", "refresh_token")?;
+    Ok((id_token, access_token, refresh_token))
+}
+
+async fn save_oauth_tokens(
+    app: AppHandle,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+) -> Result<i64, String> {
+    let mut identity = extract_identity_from_tokens(&id_token, &access_token);
+    if let Ok(remote) =
+        fetch_remote_account_identity(&access_token, identity.account_id.as_deref()).await
+    {
+        identity.email = remote.email.or(identity.email);
+        identity.account_id = remote.account_id.or(identity.account_id);
+        identity.plan_type = remote.plan_type.or(identity.plan_type);
+        identity.account_name = remote.account_name.or(identity.account_name);
+    }
+    let account_id = identity
+        .account_id
+        .clone()
+        .ok_or_else(|| "OAuth login succeeded, but account id could not be detected".to_string())?;
+
+    let auth_json = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "account_id": account_id
+        },
+        "last_refresh": chrono_like_now_timestamp()
+    })
+    .to_string();
+    let id = save_oauth_account(&app, &auth_json, &identity)?;
+    if let Err(e) = refresh_account_quota(app, id).await {
+        eprintln!("Failed to fetch initial OAuth quota: {}", e);
+    }
+
+    Ok(id)
+}
+
+#[command]
+async fn complete_codex_oauth_login(
+    app: AppHandle,
+    login_id: String,
+    callback_url: Option<String>,
+) -> Result<i64, String> {
+    let (state, code) = {
+        let mut guard = OAUTH_STATE
+            .lock()
+            .map_err(|_| "OAuth state lock is poisoned".to_string())?;
+        let state_ref = guard
+            .as_ref()
+            .filter(|state| state.login_id == login_id)
+            .ok_or_else(|| "OAuth login state not found, please start login again".to_string())?;
+
+        let code = if let Some(callback_url) = callback_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let callback_state = query_param(callback_url, "state")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Callback URL missing state parameter".to_string())?;
+            if callback_state != state_ref.state {
+                return Err(
+                    "OAuth state mismatch, please paste the latest callback URL".to_string()
+                );
+            }
+            query_param(callback_url, "code")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Callback URL missing code parameter".to_string())?
+        } else {
+            state_ref
+                .code
+                .clone()
+                .ok_or_else(|| "OAuth authorization has not completed yet".to_string())?
+        };
+
+        let state = state_ref.clone();
+        *guard = None;
+        (state, code)
+    };
+
+    let (id_token, access_token, refresh_token) = exchange_oauth_code(&state, &code).await?;
+    save_oauth_tokens(app, id_token, access_token, refresh_token).await
 }
 
 #[command]
@@ -1123,7 +1864,29 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
         let conn = open_accounts_db(&app)?;
         let key = account_secret_key(&conn, id)?;
         let json_info = read_account_secret(&key)?;
-        match extract_access_token(&json_info) {
+        let refreshed_json = match refresh_auth_json_if_needed(&json_info, false).await {
+            Ok((updated_json, changed)) => {
+                if changed {
+                    save_account_secret(&key, &updated_json)?;
+                    let account_stub = account_stub_from_json(&updated_json);
+                    conn.execute(
+                        "
+                        UPDATE accounts
+                        SET json_info = ?1, updated_at = datetime('now')
+                        WHERE id = ?2
+                        ",
+                        params![account_stub, id],
+                    )
+                    .map_err(|e| format!("Failed to update refreshed account credential: {}", e))?;
+                }
+                updated_json
+            }
+            Err(e) => {
+                mark_quota_error(&conn, id, &e)?;
+                return Err(e);
+            }
+        };
+        match extract_access_token(&refreshed_json) {
             Ok(token) => token,
             Err(e) => {
                 mark_quota_error(&conn, id, &e)?;
@@ -1154,6 +1917,20 @@ async fn switch_account_by_id(
     let conn = open_accounts_db(&app)?;
     let key = account_secret_key(&conn, id)?;
     let json_info = read_account_secret(&key)?;
+    let (json_info, changed) = refresh_auth_json_if_needed(&json_info, false).await?;
+    if changed {
+        save_account_secret(&key, &json_info)?;
+        let account_stub = account_stub_from_json(&json_info);
+        conn.execute(
+            "
+            UPDATE accounts
+            SET json_info = ?1, updated_at = datetime('now')
+            WHERE id = ?2
+            ",
+            params![account_stub, id],
+        )
+        .map_err(|e| format!("Failed to update refreshed account credential: {}", e))?;
+    }
     switch_account(json_info, restart_codex).await
 }
 
@@ -1377,6 +2154,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             fetch_quota,
+            start_codex_oauth_login,
+            complete_codex_oauth_login,
             list_accounts,
             add_account,
             update_account,
@@ -1406,6 +2185,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_jwt_with_exp(exp: i64) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{}}}"#, exp));
+        format!("{}.{}.signature", header, payload)
+    }
 
     fn sample_auth_json() -> String {
         serde_json::json!({
@@ -1443,6 +2228,17 @@ mod tests {
         assert_eq!(parsed.pointer("/tokens/account_id").unwrap(), "account-123");
         assert!(parsed.pointer("/tokens/access_token").is_none());
         assert!(parsed.pointer("/tokens/refresh_token").is_none());
+    }
+
+    #[test]
+    fn token_expiration_uses_jwt_exp_with_refresh_skew() {
+        let now = chrono_like_now_timestamp();
+
+        assert!(!is_token_expired(&sample_jwt_with_exp(
+            now + TOKEN_REFRESH_SKEW_SECONDS + 60
+        )));
+        assert!(is_token_expired(&sample_jwt_with_exp(now - 60)));
+        assert!(is_token_expired("not-a-jwt"));
     }
 
     #[test]
