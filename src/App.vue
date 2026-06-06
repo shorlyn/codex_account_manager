@@ -17,6 +17,7 @@ const editingAccount = ref<Account | null>(null);
 const message = ref('');
 const messageType = ref<'success' | 'error'>('success');
 const storagePaths = ref<StoragePaths | null>(null);
+const showStorageDetails = ref(false);
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 
 const intervalOptions = [
@@ -67,6 +68,24 @@ async function copyText(text: string, label: string) {
     const copied = document.execCommand('copy');
     document.body.removeChild(el);
     showMessage(copied ? `${label}已复制` : '复制失败，请手动选中路径复制', copied ? 'success' : 'error');
+  }
+}
+
+async function openStorageFolder() {
+  try {
+    await invoke('open_storage_folder');
+    showMessage('已打开账号库目录');
+  } catch (e) {
+    showMessage(`打开账号库目录失败: ${e}`, 'error');
+  }
+}
+
+async function openAuthFolder() {
+  try {
+    await invoke('open_codex_auth_folder');
+    showMessage('已打开当前账号目录');
+  } catch (e) {
+    showMessage(`打开当前账号目录失败: ${e}`, 'error');
   }
 }
 
@@ -159,21 +178,35 @@ function handleIntervalChange(e: Event) {
     <!-- Content -->
     <main class="content">
       <section v-if="storagePaths" class="storage-panel">
-        <div class="storage-copy">
-          <div class="storage-icon">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-              <ellipse cx="12" cy="5" rx="9" ry="3"/>
-              <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/>
-              <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/>
-            </svg>
+        <div class="storage-bar">
+          <div class="storage-summary">
+            <div class="storage-icon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/>
+                <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/>
+              </svg>
+            </div>
+            <div>
+              <p class="storage-title">账号数据保存在本机</p>
+              <span>换电脑时复制 codex_accounts.db 即可迁移账号列表</span>
+            </div>
           </div>
-          <div>
-            <p class="storage-eyebrow">本机账号库</p>
-            <h2>换电脑时复制这个数据库文件即可迁移账号列表</h2>
+
+          <div class="storage-actions">
+            <button class="btn-storage-primary" @click="openStorageFolder">
+              打开账号库目录
+            </button>
+            <button class="btn-storage" @click="openAuthFolder">
+              打开当前账号目录
+            </button>
+            <button class="btn-storage" @click="showStorageDetails = !showStorageDetails">
+              {{ showStorageDetails ? '收起' : '详情' }}
+            </button>
           </div>
         </div>
 
-        <div class="storage-paths">
+        <div v-if="showStorageDetails" class="storage-details">
           <div class="path-row">
             <span class="path-label">账号库</span>
             <code>{{ storagePaths.database_path }}</code>
@@ -184,11 +217,10 @@ function handleIntervalChange(e: Event) {
             <code>{{ storagePaths.auth_json_path }}</code>
             <button @click="copyText(storagePaths.auth_json_path, 'auth.json 路径')">复制</button>
           </div>
+          <p class="storage-note">
+            `codex_accounts.db` 是管理器的账号仓库；`auth.json` 只代表当前正在被 Codex 使用的账号。
+          </p>
         </div>
-
-        <p class="storage-note">
-          `codex_accounts.db` 是管理器的账号仓库；`auth.json` 只代表当前正在被 Codex 使用的账号。
-        </p>
       </section>
 
       <AccountList
@@ -348,55 +380,91 @@ function handleIntervalChange(e: Event) {
 
 /* ── Storage panel ─────────────────────── */
 .storage-panel {
-  margin-bottom: 20px;
-  padding: 18px;
-  border: 1px solid rgba(99, 102, 241, 0.16);
-  border-radius: var(--radius-lg);
-  background:
-    radial-gradient(circle at 0 0, rgba(99, 102, 241, 0.11), transparent 34%),
-    linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-  box-shadow: var(--shadow-sm);
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(99, 102, 241, 0.14);
+  border-radius: var(--radius);
+  background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+  box-shadow: var(--shadow-xs);
 }
 
-.storage-copy {
+.storage-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 14px;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.storage-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 
 .storage-icon {
-  width: 40px;
-  height: 40px;
-  border-radius: 12px;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--primary);
   background: var(--primary-light);
-  box-shadow: inset 0 0 0 1px rgba(99, 102, 241, 0.12);
+  flex-shrink: 0;
 }
 
-.storage-eyebrow {
-  margin: 0 0 2px;
-  color: var(--primary);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.storage-copy h2 {
+.storage-title {
   margin: 0;
   color: var(--text);
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 700;
-  letter-spacing: -0.01em;
 }
 
-.storage-paths {
+.storage-summary span {
+  display: block;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-actions {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 8px;
+  flex-shrink: 0;
+}
+
+.btn-storage,
+.btn-storage-primary {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  transition: all 0.2s var(--ease-out);
+}
+
+.btn-storage-primary {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.btn-storage:hover,
+.btn-storage-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-xs);
+}
+
+.storage-details {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
 }
 
 .path-row {
@@ -404,9 +472,9 @@ function handleIntervalChange(e: Event) {
   grid-template-columns: 78px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px solid var(--border-light);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.78);
 }
 
@@ -524,6 +592,16 @@ function handleIntervalChange(e: Event) {
 
   .content {
     padding: 18px;
+  }
+
+  .storage-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .storage-actions {
+    justify-content: flex-end;
+    flex-wrap: wrap;
   }
 
   .path-row {

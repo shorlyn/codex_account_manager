@@ -60,6 +60,34 @@ fn get_database_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(app_data_dir.join("codex_accounts.db"))
 }
 
+fn open_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {}", e))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("Failed to open path: {}", e))?;
+    }
+
+    Ok(())
+}
+
 fn kill_codex_process() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -218,6 +246,28 @@ async fn get_storage_paths(app: AppHandle) -> Result<StoragePaths, String> {
 }
 
 #[command]
+async fn open_storage_folder(app: AppHandle) -> Result<(), String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Cannot find app data directory: {}", e))?;
+    std::fs::create_dir_all(&app_data_dir)
+        .map_err(|e| format!("Failed to create app data directory: {}", e))?;
+    open_in_file_manager(&app_data_dir)
+}
+
+#[command]
+async fn open_codex_auth_folder() -> Result<(), String> {
+    let auth_path = get_auth_path()?;
+    let auth_dir = auth_path
+        .parent()
+        .ok_or_else(|| "Cannot find auth.json parent directory".to_string())?;
+    std::fs::create_dir_all(auth_dir)
+        .map_err(|e| format!("Failed to create .codex directory: {}", e))?;
+    open_in_file_manager(auth_dir)
+}
+
+#[command]
 async fn is_codex_running() -> Result<bool, String> {
     let running = {
         #[cfg(target_os = "macos")]
@@ -261,6 +311,8 @@ pub fn run() {
             read_auth_json,
             get_codex_auth_path,
             get_storage_paths,
+            open_storage_folder,
+            open_codex_auth_folder,
             is_codex_running,
         ])
         .run(tauri::generate_context!())
