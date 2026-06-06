@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
-use tauri::{command, AppHandle, Manager};
+use tauri::{
+    command,
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, WindowEvent,
+};
 
 // ── API response structs ──────────────────────────────────────────────
 
@@ -84,6 +89,43 @@ fn open_in_file_manager(path: &std::path::Path) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("Failed to open path: {}", e))?;
     }
+
+    Ok(())
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    TrayIconBuilder::new()
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .icon(app.default_window_icon().unwrap().clone())
+        .tooltip("Codex Account Manager")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                show_main_window(&tray.app_handle());
+            }
+        })
+        .build(app)?;
 
     Ok(())
 }
@@ -304,6 +346,21 @@ async fn is_codex_running() -> Result<bool, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_sql::Builder::new().build())
+        .setup(|app| {
+            setup_tray(app.handle())?;
+            Ok(())
+        })
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            #[cfg(target_os = "windows")]
+            WindowEvent::Resized(size) if size.width == 0 && size.height == 0 => {
+                let _ = window.hide();
+            }
+            _ => {}
+        })
         .invoke_handler(tauri::generate_handler![
             fetch_quota,
             switch_account,

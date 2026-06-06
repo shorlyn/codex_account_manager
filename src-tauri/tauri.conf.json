@@ -10,7 +10,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": ["app", "nsis"],
     "icon": [
       "icons/icon.png",
       "icons/icon.icns",
