@@ -67,6 +67,7 @@ const operationLogs = ref<OperationLog[]>([]);
 const operationLogsLoading = ref(false);
 const operationLogAccountId = ref<number | null>(null);
 const operationLogErrorsOnly = ref(false);
+const operationLogActionFilter = ref('all');
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 let unlistenOauth: UnlistenFn | null = null;
 let unlistenOauthTimeout: UnlistenFn | null = null;
@@ -414,10 +415,17 @@ const detailHealthReport = computed(() => {
   return healthReports.value[account.id] ?? null;
 });
 
+const operationLogActionOptions = computed(() => {
+  const actions = Array.from(new Set(operationLogs.value.map(log => log.action).filter(Boolean)));
+  return actions.sort((a, b) => logActionLabel(a).localeCompare(logActionLabel(b), 'zh-Hans-CN'));
+});
+
 const visibleOperationLogs = computed(() =>
-  operationLogErrorsOnly.value
-    ? operationLogs.value.filter(log => log.level === 'error')
-    : operationLogs.value,
+  operationLogs.value.filter((log) => {
+    if (operationLogErrorsOnly.value && log.level !== 'error') return false;
+    if (operationLogActionFilter.value !== 'all' && log.action !== operationLogActionFilter.value) return false;
+    return true;
+  }),
 );
 
 onMounted(async () => {
@@ -939,6 +947,20 @@ async function openFailureLogs(failure: BatchRefreshFailure) {
   await openOperationLogs(failure.id);
 }
 
+function failureSummaryText(): string {
+  return batchRefreshFailures.value
+    .map(failure => `#${failure.id} ${failure.name}\n${failure.error}`)
+    .join('\n\n');
+}
+
+async function copyBatchRefreshFailures() {
+  if (batchRefreshFailures.value.length === 0) {
+    showMessage('没有可复制的失败摘要', 'error');
+    return;
+  }
+  await copyText(failureSummaryText(), '失败摘要');
+}
+
 function logCopyText(log: OperationLog): string {
   const details = formatLogDetails(log.details);
   return [
@@ -952,6 +974,20 @@ function logCopyText(log: OperationLog): string {
 
 async function copyOperationLog(log: OperationLog) {
   await copyText(logCopyText(log), '日志详情');
+}
+
+async function copyVisibleOperationLogs() {
+  if (visibleOperationLogs.value.length === 0) {
+    showMessage('没有可复制的日志', 'error');
+    return;
+  }
+  await copyText(visibleOperationLogs.value.map(logCopyText).join('\n\n---\n\n'), '当前日志');
+}
+
+function openLogAccountDetail(log: OperationLog) {
+  if (!log.account_id) return;
+  detailAccountId.value = log.account_id;
+  showOperationLogs.value = false;
 }
 
 async function loadOperationLogs() {
@@ -1310,7 +1346,10 @@ function editDetailAccount(account: Account) {
       <section v-if="batchRefreshFailures.length > 0" class="batch-failures">
         <div class="batch-failures-head">
           <strong>批量刷新失败 {{ batchRefreshFailures.length }} 个</strong>
-          <button @click="batchRefreshFailures = []">清除</button>
+          <div class="batch-failures-actions">
+            <button @click="copyBatchRefreshFailures">复制摘要</button>
+            <button @click="batchRefreshFailures = []">清除</button>
+          </div>
         </div>
         <div class="batch-failure-list">
           <div v-for="failure in batchRefreshFailures" :key="failure.id" class="batch-failure-item">
@@ -1499,9 +1538,16 @@ function editDetailAccount(account: Account) {
                 {{ account.name }}
               </option>
             </select>
+            <select v-model="operationLogActionFilter" class="log-action-select">
+              <option value="all">全部操作</option>
+              <option v-for="action in operationLogActionOptions" :key="action" :value="action">
+                {{ logActionLabel(action) }}
+              </option>
+            </select>
             <button :disabled="operationLogsLoading" @click="loadOperationLogs">
               {{ operationLogsLoading ? '刷新中' : '刷新' }}
             </button>
+            <button @click="copyVisibleOperationLogs">复制当前</button>
             <label class="log-toggle">
               <input v-model="operationLogErrorsOnly" type="checkbox" />
               <span>只看错误</span>
@@ -1527,7 +1573,10 @@ function editDetailAccount(account: Account) {
                   <button class="log-copy" @click="copyOperationLog(log)">复制</button>
                 </div>
                 <p>{{ log.message }}</p>
-                <div class="log-account">{{ logAccountLabel(log) }}</div>
+                <div class="log-account">
+                  <span>{{ logAccountLabel(log) }}</span>
+                  <button v-if="log.account_id" @click="openLogAccountDetail(log)">详情</button>
+                </div>
                 <pre v-if="log.details" class="log-details">{{ formatLogDetails(log.details) }}</pre>
               </article>
             </template>
@@ -2321,6 +2370,13 @@ function editDetailAccount(account: Account) {
   font-size: 12px;
 }
 
+.batch-failures-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 .batch-failures-head button {
   height: 26px;
   padding: 0 9px;
@@ -2763,6 +2819,10 @@ function editDetailAccount(account: Account) {
   font-size: 12px;
 }
 
+.log-toolbar .log-action-select {
+  flex: 0 0 118px;
+}
+
 .log-toolbar button {
   height: 34px;
   padding: 0 12px;
@@ -2915,13 +2975,39 @@ function editDetailAccount(account: Account) {
 }
 
 .log-account {
-  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-top: 6px;
   color: var(--text-tertiary);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-account span {
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-variant-numeric: tabular-nums;
+}
+
+.log-account button {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.log-account button:hover {
+  border-color: #cbd5e1;
+  background: #f1f5f9;
 }
 
 .log-details {
