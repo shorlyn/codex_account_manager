@@ -46,7 +46,7 @@ const codexAppSpeed = ref<CodexAppSpeed>('standard');
 const codexSpeedSaving = ref(false);
 const codexUsage = ref<CodexUsageSummary | null>(null);
 const codexUsageLoading = ref(false);
-const showUsageDetails = ref(false);
+const showUsageSidebar = ref(false);
 const batchRefreshing = ref(false);
 const batchRefreshProgress = ref<BatchRefreshProgress | null>(null);
 const batchRefreshFailures = ref<BatchRefreshFailure[]>([]);
@@ -1325,107 +1325,6 @@ function editDetailAccount(account: Account) {
         </div>
       </section>
 
-      <section class="usage-panel">
-        <div class="usage-strip">
-          <div class="usage-title">
-            <span>Codex 使用</span>
-            <strong>{{ codexUsage ? formatTokenAmount(codexUsage.today.total_tokens) : '-' }}</strong>
-            <small>今日 Tokens</small>
-          </div>
-
-          <div v-if="codexUsage" class="usage-strip-metrics">
-            <div>
-              <span>请求</span>
-              <strong>{{ formatExactNumber(codexUsage.today.request_count) }}</strong>
-              <small>{{ usageSuccessRate(codexUsage.today) }}</small>
-            </div>
-            <div>
-              <span>Credits</span>
-              <strong>{{ formatCredits(codexUsage.today.codex_credits) }}</strong>
-              <small>全部 {{ formatCredits(codexUsage.total.codex_credits) }}</small>
-            </div>
-            <div>
-              <span>成本</span>
-              <strong>{{ formatUsd(codexUsage.today.api_cost_usd) }}</strong>
-              <small>估算</small>
-            </div>
-          </div>
-
-          <div v-else class="usage-strip-empty">
-            {{ codexUsageLoading ? '读取中...' : '暂无统计' }}
-          </div>
-
-          <div class="usage-actions">
-            <button class="usage-icon-button" :disabled="codexUsageLoading" title="刷新统计" @click="loadCodexUsage(true)">
-              <svg v-if="codexUsageLoading" class="spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
-                <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
-              </svg>
-              <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
-                <polyline points="23 4 23 10 17 10"/>
-                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-              </svg>
-            </button>
-            <button class="usage-detail-button" :disabled="!codexUsage" @click="showUsageDetails = !showUsageDetails">
-              {{ showUsageDetails ? '收起' : '详情' }}
-            </button>
-          </div>
-        </div>
-
-        <div v-if="codexUsage && showUsageDetails" class="usage-detail-grid">
-          <div class="usage-detail-card">
-            <div class="usage-detail-title">今日拆分</div>
-            <div class="usage-breakdown-row">
-              <span>Input</span>
-              <strong>{{ formatTokenAmount(codexUsage.today.input_tokens) }}</strong>
-            </div>
-            <div class="usage-breakdown-row">
-              <span>Cached</span>
-              <strong>{{ formatTokenAmount(codexUsage.today.cached_input_tokens) }}</strong>
-            </div>
-            <div class="usage-breakdown-row">
-              <span>Output</span>
-              <strong>{{ formatTokenAmount(codexUsage.today.output_tokens) }}</strong>
-            </div>
-            <div class="usage-breakdown-row">
-              <span>Reasoning</span>
-              <strong>{{ formatTokenAmount(codexUsage.today.reasoning_output_tokens) }}</strong>
-            </div>
-          </div>
-
-          <div class="usage-detail-card">
-            <div class="usage-detail-title">请求结果</div>
-            <div class="usage-breakdown-row">
-              <span>成功</span>
-              <strong>{{ codexUsage.today.success_count }}</strong>
-            </div>
-            <div class="usage-breakdown-row">
-              <span>失败</span>
-              <strong>{{ codexUsage.today.error_count }}</strong>
-            </div>
-            <div class="usage-breakdown-row">
-              <span>全部请求</span>
-              <strong>{{ formatExactNumber(codexUsage.total.request_count) }}</strong>
-            </div>
-            <div class="usage-breakdown-row">
-              <span>全部成本</span>
-              <strong>{{ formatUsd(codexUsage.total.api_cost_usd) }}</strong>
-            </div>
-          </div>
-
-          <div class="usage-detail-card usage-models-card">
-            <div class="usage-detail-title">模型</div>
-            <div v-if="topCodexUsageModels.length === 0" class="usage-empty">暂无 token 记录</div>
-            <div v-for="item in topCodexUsageModels" :key="item.model" class="usage-model-row">
-              <span :title="item.model">{{ item.model }}</span>
-              <strong>{{ formatTokenAmount(item.usage.total_tokens) }}</strong>
-              <small>{{ formatUsd(item.usage.api_cost_usd) }}</small>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="codexUsage?.note && showUsageDetails" class="usage-note">{{ codexUsage.note }}</div>
-      </section>
-
       <section class="account-toolbar">
         <div class="toolbar-main">
           <div class="account-search">
@@ -1474,6 +1373,18 @@ function editDetailAccount(account: Account) {
           <span class="toolbar-result">
             {{ filteredAccounts.length }} / {{ accounts.length }} 个账号
           </span>
+          <button
+            class="btn-toolbar btn-usage-toggle"
+            :class="{ active: showUsageSidebar }"
+            @click="showUsageSidebar = true"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 3v18h18"/>
+              <path d="M7 15l3-3 3 2 5-6"/>
+            </svg>
+            统计
+            <span v-if="codexUsage && codexUsage.today.error_count > 0" class="usage-badge">{{ codexUsage.today.error_count }}</span>
+          </button>
           <button
             class="btn-toolbar"
             :disabled="batchRefreshing || filteredRefreshableIds.length === 0"
@@ -1534,6 +1445,109 @@ function editDetailAccount(account: Account) {
         @detail="openDetailDrawer"
       />
     </main>
+
+    <Transition name="drawer">
+      <div v-if="showUsageSidebar" class="detail-backdrop" @click.self="showUsageSidebar = false">
+        <aside class="usage-drawer">
+          <div class="detail-header">
+            <div>
+              <span class="detail-kicker">统计</span>
+              <h2>Codex 使用统计</h2>
+            </div>
+            <button class="detail-close" @click="showUsageSidebar = false" aria-label="关闭统计">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="usage-drawer-body">
+            <div class="usage-drawer-actions">
+              <span>{{ codexUsage ? '今日' : '本地日志' }}</span>
+              <button :disabled="codexUsageLoading" @click="loadCodexUsage(true)">
+                <svg v-if="codexUsageLoading" class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                  <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                </svg>
+                {{ codexUsageLoading ? '读取中' : '刷新' }}
+              </button>
+            </div>
+
+            <div v-if="codexUsage" class="usage-drawer-content">
+              <section class="usage-hero">
+                <span>今日 Tokens</span>
+                <strong>{{ formatExactNumber(codexUsage.today.total_tokens) }}</strong>
+                <small>全部 {{ formatTokenAmount(codexUsage.total.total_tokens) }} · 成功率 {{ usageSuccessRate(codexUsage.today) }}</small>
+              </section>
+
+              <section class="usage-metric-list">
+                <div>
+                  <span>请求数</span>
+                  <strong>{{ formatExactNumber(codexUsage.today.request_count) }}</strong>
+                </div>
+                <div>
+                  <span>成功 / 失败</span>
+                  <strong><em>{{ codexUsage.today.success_count }}</em> / <b>{{ codexUsage.today.error_count }}</b></strong>
+                </div>
+                <div>
+                  <span>Codex Credits</span>
+                  <strong>{{ formatCredits(codexUsage.today.codex_credits) }}</strong>
+                </div>
+                <div>
+                  <span>API 等价成本</span>
+                  <strong>{{ formatUsd(codexUsage.today.api_cost_usd) }}</strong>
+                </div>
+              </section>
+
+              <section class="usage-drawer-section">
+                <div class="usage-drawer-section-title">按模型统计</div>
+                <div v-if="topCodexUsageModels.length === 0" class="usage-empty">暂无 token 记录</div>
+                <div v-for="item in topCodexUsageModels" :key="item.model" class="usage-model-row">
+                  <span :title="item.model">{{ item.model }}</span>
+                  <strong>{{ formatTokenAmount(item.usage.total_tokens) }}</strong>
+                  <small>{{ formatUsd(item.usage.api_cost_usd) }}</small>
+                </div>
+              </section>
+
+              <details class="usage-fold" open>
+                <summary>Token 构成</summary>
+                <div class="usage-breakdown-row">
+                  <span>Input</span>
+                  <strong>{{ formatTokenAmount(codexUsage.today.input_tokens) }}</strong>
+                </div>
+                <div class="usage-breakdown-row">
+                  <span>Cached</span>
+                  <strong>{{ formatTokenAmount(codexUsage.today.cached_input_tokens) }}</strong>
+                </div>
+                <div class="usage-breakdown-row">
+                  <span>Output</span>
+                  <strong>{{ formatTokenAmount(codexUsage.today.output_tokens) }}</strong>
+                </div>
+                <div class="usage-breakdown-row">
+                  <span>Reasoning</span>
+                  <strong>{{ formatTokenAmount(codexUsage.today.reasoning_output_tokens) }}</strong>
+                </div>
+              </details>
+
+              <details class="usage-fold">
+                <summary>失败详情</summary>
+                <div v-if="codexUsage.recent_failures.length === 0" class="usage-empty">没有失败记录</div>
+                <div v-for="failure in codexUsage.recent_failures" :key="`${failure.ts}-${failure.response_id}-${failure.turn_id}`" class="usage-failure-row">
+                  <strong>{{ failure.status }}</strong>
+                  <span>{{ failure.model }}</span>
+                  <small>{{ failure.message }}</small>
+                </div>
+              </details>
+
+              <p class="usage-note">{{ codexUsage.note }}</p>
+            </div>
+
+            <div v-else class="usage-empty usage-drawer-empty">
+              {{ codexUsageLoading ? '读取 Codex 本地日志中...' : '暂无 Codex 使用统计' }}
+            </div>
+          </div>
+        </aside>
+      </div>
+    </Transition>
 
     <Transition name="drawer">
       <div v-if="detailAccount" class="detail-backdrop" @click.self="closeDetailDrawer">
@@ -2366,148 +2380,172 @@ function editDetailAccount(account: Account) {
   grid-template-columns: repeat(3, minmax(54px, 1fr));
 }
 
-.usage-panel {
-  margin-bottom: 14px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+.usage-drawer {
+  width: 320px;
+  max-width: 92vw;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
   background: var(--surface);
-  box-shadow: var(--shadow-xs);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--shadow-xl);
 }
 
-.usage-strip {
+.usage-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  background: #f8fafc;
+}
+
+.usage-drawer-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
-  min-height: 42px;
-}
-
-.usage-title {
-  min-width: 190px;
-  display: grid;
-  grid-template-columns: auto auto auto;
-  align-items: center;
-  justify-content: start;
-  gap: 8px;
-}
-
-.usage-title span,
-.usage-strip-metrics span,
-.usage-detail-title {
-  color: var(--text-tertiary);
-  font-size: 11px;
-  font-weight: 850;
-}
-
-.usage-title strong {
-  color: var(--text);
-  font-size: 18px;
-  line-height: 1;
-  font-weight: 850;
-  font-variant-numeric: tabular-nums;
-}
-
-.usage-title small,
-.usage-strip-metrics small,
-.usage-model-row small,
-.usage-note {
-  color: var(--text-tertiary);
-  font-size: 11px;
-}
-
-.usage-strip-metrics {
-  min-width: 0;
-  flex: 1;
-  display: grid;
-  grid-template-columns: repeat(3, minmax(110px, 1fr));
   gap: 10px;
+  margin-bottom: 12px;
 }
 
-.usage-strip-metrics > div {
-  min-width: 0;
-  display: grid;
-  grid-template-columns: auto auto auto;
-  align-items: baseline;
-  justify-content: start;
-  gap: 7px;
-  padding-left: 12px;
-  border-left: 1px solid var(--border-light);
-}
-
-.usage-strip-metrics strong {
-  color: var(--text);
-  font-size: 14px;
-  font-weight: 850;
-  font-variant-numeric: tabular-nums;
-}
-
-.usage-strip-empty {
-  flex: 1;
+.usage-drawer-actions span,
+.usage-drawer-section-title {
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 850;
 }
 
-.usage-actions {
+.usage-drawer-actions button {
+  height: 30px;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  flex: 0 0 auto;
-}
-
-.usage-icon-button,
-.usage-detail-button {
-  height: 30px;
+  gap: 6px;
+  padding: 0 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #f8fafc;
+  background: var(--surface);
   color: var(--text-secondary);
   font-size: 12px;
   font-weight: 850;
   cursor: pointer;
 }
 
-.usage-icon-button {
-  width: 30px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+.usage-drawer-actions button:hover:not(:disabled) {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+  color: var(--primary);
 }
 
-.usage-detail-button {
-  padding: 0 10px;
-}
-
-.usage-icon-button:hover:not(:disabled),
-.usage-detail-button:hover:not(:disabled) {
-  border-color: #cbd5e1;
-  background: #f1f5f9;
-}
-
-.usage-icon-button:disabled,
-.usage-detail-button:disabled {
+.usage-drawer-actions button:disabled {
   opacity: 0.55;
   cursor: wait;
 }
 
-.usage-detail-grid {
+.usage-drawer-content {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(220px, 1.2fr);
   gap: 10px;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-light);
 }
 
-.usage-detail-card {
-  min-width: 0;
-  display: grid;
-  align-content: start;
-  gap: 7px;
-  padding: 10px;
-  border: 1px solid var(--border-light);
+.usage-hero,
+.usage-metric-list,
+.usage-drawer-section,
+.usage-fold {
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: #f8fafc;
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.usage-hero {
+  padding: 12px;
+}
+
+.usage-hero span,
+.usage-metric-list span,
+.usage-fold summary {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.usage-hero strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--text);
+  font-size: 27px;
+  line-height: 1.08;
+  font-weight: 850;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-hero small,
+.usage-model-row small,
+.usage-note,
+.usage-failure-row small {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.usage-hero small {
+  display: block;
+  margin-top: 5px;
+}
+
+.usage-metric-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  overflow: hidden;
+}
+
+.usage-metric-list div {
+  min-width: 0;
+  padding: 10px;
+  border-right: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border-light);
+}
+
+.usage-metric-list div:nth-child(2n) {
+  border-right: 0;
+}
+
+.usage-metric-list div:nth-last-child(-n + 2) {
+  border-bottom: 0;
+}
+
+.usage-metric-list strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-metric-list em {
+  color: var(--success);
+  font-style: normal;
+}
+
+.usage-metric-list b {
+  color: var(--danger);
+}
+
+.usage-drawer-section {
+  padding: 10px;
+}
+
+.usage-drawer-section-title {
+  margin-bottom: 8px;
+}
+
+.usage-fold {
+  padding: 0 10px 10px;
+}
+
+.usage-fold summary {
+  padding: 10px 0;
+  cursor: pointer;
 }
 
 .usage-breakdown-row,
@@ -2550,6 +2588,52 @@ function editDetailAccount(account: Account) {
 .usage-note {
   margin: 8px 0 0;
   line-height: 1.5;
+}
+
+.usage-drawer-empty {
+  padding: 34px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  text-align: center;
+}
+
+.usage-failure-row {
+  display: grid;
+  gap: 3px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-light);
+}
+
+.usage-failure-row strong {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.usage-failure-row span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.usage-badge {
+  min-width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.btn-usage-toggle.active {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+  color: var(--primary);
 }
 
 /* ── Account toolbar ──────────────────── */
@@ -3373,7 +3457,11 @@ function editDetailAccount(account: Account) {
 }
 
 .drawer-enter-active .detail-drawer,
-.drawer-leave-active .detail-drawer {
+.drawer-enter-active .usage-drawer,
+.drawer-enter-active .log-drawer,
+.drawer-leave-active .detail-drawer,
+.drawer-leave-active .usage-drawer,
+.drawer-leave-active .log-drawer {
   transition: transform 0.18s ease;
 }
 
@@ -3383,7 +3471,11 @@ function editDetailAccount(account: Account) {
 }
 
 .drawer-enter-from .detail-drawer,
-.drawer-leave-to .detail-drawer {
+.drawer-enter-from .usage-drawer,
+.drawer-enter-from .log-drawer,
+.drawer-leave-to .detail-drawer,
+.drawer-leave-to .usage-drawer,
+.drawer-leave-to .log-drawer {
   transform: translateX(24px);
 }
 
@@ -3857,24 +3949,6 @@ function editDetailAccount(account: Account) {
     flex: 1;
   }
 
-  .usage-strip {
-    align-items: stretch;
-    flex-wrap: wrap;
-  }
-
-  .usage-title {
-    min-width: 170px;
-  }
-
-  .usage-strip-metrics {
-    order: 3;
-    flex: 1 0 100%;
-  }
-
-  .usage-detail-grid {
-    grid-template-columns: 1fr;
-  }
-
   .account-toolbar,
   .toolbar-main,
   .toolbar-actions {
@@ -3940,27 +4014,8 @@ function editDetailAccount(account: Account) {
     grid-template-columns: 1fr;
   }
 
-  .usage-title,
-  .usage-strip-metrics,
-  .usage-strip-metrics > div {
-    grid-template-columns: 1fr auto;
-  }
-
-  .usage-title small,
-  .usage-strip-metrics small {
-    grid-column: 1 / -1;
-  }
-
-  .usage-strip-metrics {
-    grid-template-columns: 1fr;
-  }
-
-  .usage-actions {
-    width: 100%;
-    justify-content: flex-end;
-  }
-
-  .detail-drawer {
+  .detail-drawer,
+  .usage-drawer {
     width: 100vw;
     max-width: 100vw;
   }
