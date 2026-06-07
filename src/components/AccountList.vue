@@ -532,7 +532,8 @@ function statusClass(account: Account): string {
 .account-table {
   width: 100%;
   min-width: 1280px;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   table-layout: fixed;
 }
 
@@ -595,7 +596,25 @@ function statusClass(account: Account): string {
 
 .account-table th:nth-child(6),
 .account-table td:nth-child(6) {
+  position: sticky;
+  right: 0;
+  z-index: 2;
   width: 236px;
+  background: var(--surface);
+  box-shadow: -8px 0 12px rgba(15, 23, 42, 0.06);
+}
+
+.account-table th:nth-child(6) {
+  z-index: 3;
+  background: #f8fafc;
+}
+
+.account-table tr.current td:nth-child(6) {
+  background: #ecfdf5;
+}
+
+.account-table tr:hover td:nth-child(6) {
+  background: #f8fafc;
 }
 
 .table-account,
