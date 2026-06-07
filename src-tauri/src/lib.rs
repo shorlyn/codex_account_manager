@@ -103,6 +103,31 @@ pub struct CodexAppSpeedConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexOfficialModeIssue {
+    pub line: usize,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexFeatureStatus {
+    pub config_path: String,
+    pub global_state_path: String,
+    pub goals_db_path: String,
+    pub goals_enabled: bool,
+    pub goals_db_present: bool,
+    pub memory_generate_enabled: bool,
+    pub memory_use_enabled: bool,
+    pub official_mode_ok: bool,
+    pub official_mode_issues: Vec<CodexOfficialModeIssue>,
+    pub config_speed: CodexAppSpeed,
+    pub config_service_tier: Option<String>,
+    pub global_state_speed: CodexAppSpeed,
+    pub global_state_service_tier: Option<String>,
+    pub global_state_user_changed_tier: bool,
+    pub fast_state_synced: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodexProjectVisibilityStatus {
     pub project_path: String,
     pub config_path: String,
@@ -299,6 +324,9 @@ const CODEX_OAUTH_CALLBACK_PORT: u16 = 1455;
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
 const CODEX_CONFIG_FILE: &str = "config.toml";
 const CODEX_GLOBAL_STATE_FILE: &str = ".codex-global-state.json";
+const CODEX_GOALS_DB_FILE: &str = "goals_1.sqlite";
+const CODEX_FEATURES_SECTION: &str = "features";
+const CODEX_MEMORIES_SECTION: &str = "memories";
 const CODEX_DESKTOP_SECTION: &str = "desktop";
 const CODEX_SERVICE_TIER_KEY: &str = "default-service-tier";
 const CODEX_PRIORITY_SERVICE_TIER: &str = "priority";
@@ -692,6 +720,90 @@ fn toml_value_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     Some(right.trim().trim_matches('"'))
 }
 
+fn toml_bool_value_for_key(line: &str, key: &str) -> Option<bool> {
+    match toml_value_for_key(line, key)?.to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn read_toml_bool_in_section(content: &str, section_name: &str, key: &str) -> bool {
+    let mut in_section = false;
+    for line in content.lines() {
+        if let Some(section) = toml_section_name(line) {
+            in_section = section == section_name;
+            continue;
+        }
+        if in_section {
+            if let Some(value) = toml_bool_value_for_key(line, key) {
+                return value;
+            }
+        }
+    }
+    false
+}
+
+fn is_official_mode_provider_section(section: &str) -> bool {
+    let normalized = section.trim().to_ascii_lowercase();
+    normalized == "provider"
+        || normalized == "providers"
+        || normalized == "model_provider"
+        || normalized == "model-providers"
+        || normalized == "model_providers"
+        || normalized.starts_with("provider.")
+        || normalized.starts_with("providers.")
+        || normalized.starts_with("model_provider.")
+        || normalized.starts_with("model-providers.")
+        || normalized.starts_with("model_providers.")
+}
+
+fn is_official_mode_forbidden_key(key: &str) -> bool {
+    matches!(
+        key.trim().to_ascii_lowercase().as_str(),
+        "provider"
+            | "model_provider"
+            | "model-provider"
+            | "base_url"
+            | "base-url"
+            | "api_base"
+            | "api-base"
+            | "api_base_url"
+            | "api-base-url"
+            | "proxy"
+            | "http_proxy"
+            | "https_proxy"
+    )
+}
+
+fn official_mode_issues_from_config(content: &str) -> Vec<CodexOfficialModeIssue> {
+    let mut issues = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let line_number = index + 1;
+        if let Some(section) = toml_section_name(line) {
+            if is_official_mode_provider_section(section) {
+                issues.push(CodexOfficialModeIssue {
+                    line: line_number,
+                    label: format!("[{}]", section),
+                });
+            }
+            continue;
+        }
+
+        let trimmed = strip_toml_comment(line);
+        if let Some((left, _)) = trimmed.split_once('=') {
+            let key = left.trim();
+            if is_official_mode_forbidden_key(key) {
+                issues.push(CodexOfficialModeIssue {
+                    line: line_number,
+                    label: key.to_string(),
+                });
+            }
+        }
+    }
+    issues
+}
+
 fn is_project_trusted_in_config(content: &str, project_path: &str) -> bool {
     let target = normalize_project_path_for_match(project_path);
     let mut in_target = false;
@@ -832,6 +944,28 @@ fn read_codex_app_speed_from_path(path: &std::path::Path) -> Result<CodexAppSpee
     ))
 }
 
+fn read_codex_global_state_tier(path: &std::path::Path) -> Result<(Option<String>, bool), String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, false)),
+        Err(e) => return Err(format!("读取 Codex 全局状态失败: {}", e)),
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|e| format!("解析 Codex 全局状态失败: {}", e))?;
+    let atom_state = value
+        .get(CODEX_ATOM_STATE_KEY)
+        .and_then(|item| item.as_object());
+    let service_tier = atom_state
+        .and_then(|item| item.get(CODEX_SERVICE_TIER_KEY))
+        .and_then(|item| item.as_str())
+        .map(str::to_string);
+    let user_changed_tier = atom_state
+        .and_then(|item| item.get(CODEX_USER_CHANGED_TIER_KEY))
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    Ok((service_tier, user_changed_tier))
+}
+
 fn sync_codex_global_state(path: &std::path::Path, speed: &CodexAppSpeed) -> Result<(), String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -902,6 +1036,54 @@ fn write_codex_app_speed_to_path(
         speed,
         config_path: config_path.to_string_lossy().to_string(),
         global_state_path: global_state_path.to_string_lossy().to_string(),
+    })
+}
+
+fn read_codex_feature_status_from_paths(
+    config_path: &std::path::Path,
+    global_state_path: &std::path::Path,
+) -> Result<CodexFeatureStatus, String> {
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取 Codex config.toml 失败: {}", e)),
+    };
+    let config_service_tier = read_service_tier_from_config(&content);
+    let config_speed = normalize_service_tier_speed(config_service_tier.as_deref());
+    let (global_state_service_tier, global_state_user_changed_tier) =
+        read_codex_global_state_tier(global_state_path)?;
+    let global_state_speed = normalize_service_tier_speed(global_state_service_tier.as_deref());
+    let official_mode_issues = official_mode_issues_from_config(&content);
+    let goals_db_path = get_codex_home_path()?.join(CODEX_GOALS_DB_FILE);
+    let fast_state_synced = match config_speed {
+        CodexAppSpeed::Fast => global_state_speed == CodexAppSpeed::Fast,
+        CodexAppSpeed::Standard => global_state_service_tier.is_none(),
+    };
+
+    Ok(CodexFeatureStatus {
+        config_path: config_path.to_string_lossy().to_string(),
+        global_state_path: global_state_path.to_string_lossy().to_string(),
+        goals_db_path: goals_db_path.to_string_lossy().to_string(),
+        goals_enabled: read_toml_bool_in_section(&content, CODEX_FEATURES_SECTION, "goals"),
+        goals_db_present: goals_db_path.exists(),
+        memory_generate_enabled: read_toml_bool_in_section(
+            &content,
+            CODEX_MEMORIES_SECTION,
+            "generate_memories",
+        ),
+        memory_use_enabled: read_toml_bool_in_section(
+            &content,
+            CODEX_MEMORIES_SECTION,
+            "use_memories",
+        ),
+        official_mode_ok: official_mode_issues.is_empty(),
+        official_mode_issues,
+        config_speed,
+        config_service_tier,
+        global_state_speed,
+        global_state_service_tier,
+        global_state_user_changed_tier,
+        fast_state_synced,
     })
 }
 
@@ -4029,6 +4211,22 @@ async fn set_codex_app_speed(speed: CodexAppSpeed) -> Result<CodexAppSpeedConfig
     write_codex_app_speed_to_path(&config_path, &global_state_path, speed)
 }
 
+#[command]
+async fn get_codex_feature_status() -> Result<CodexFeatureStatus, String> {
+    let config_path = get_codex_config_path()?;
+    let global_state_path = get_codex_global_state_path()?;
+    read_codex_feature_status_from_paths(&config_path, &global_state_path)
+}
+
+#[command]
+async fn repair_codex_app_speed_state() -> Result<CodexFeatureStatus, String> {
+    let config_path = get_codex_config_path()?;
+    let global_state_path = get_codex_global_state_path()?;
+    let speed = read_codex_app_speed_from_path(&config_path)?;
+    sync_codex_global_state(&global_state_path, &speed)?;
+    read_codex_feature_status_from_paths(&config_path, &global_state_path)
+}
+
 fn default_project_visibility_path() -> String {
     std::env::current_dir()
         .ok()
@@ -4329,6 +4527,8 @@ pub fn run() {
             get_storage_paths,
             get_codex_app_speed_config,
             set_codex_app_speed,
+            get_codex_feature_status,
+            repair_codex_app_speed_state,
             get_codex_project_visibility_status,
             repair_codex_project_visibility,
             get_codex_usage_summary,

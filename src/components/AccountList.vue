@@ -531,14 +531,14 @@ function statusClass(account: Account): string {
 
 .account-table {
   width: 100%;
-  min-width: 1280px;
+  min-width: 1040px;
   border-collapse: separate;
   border-spacing: 0;
   table-layout: fixed;
 }
 
 .account-table th {
-  padding: 11px 14px;
+  padding: 10px 12px;
   background: #f8fafc;
   color: var(--text-secondary);
   font-size: 11px;
@@ -549,7 +549,7 @@ function statusClass(account: Account): string {
 }
 
 .account-table td {
-  padding: 12px 14px;
+  padding: 11px 12px;
   border-bottom: 1px solid var(--border-light);
   color: var(--text);
   font-size: 12px;
@@ -574,12 +574,12 @@ function statusClass(account: Account): string {
 
 .account-table th:nth-child(1),
 .account-table td:nth-child(1) {
-  width: 18%;
+  width: 17%;
 }
 
 .account-table th:nth-child(2),
 .account-table td:nth-child(2) {
-  width: 13%;
+  width: 12%;
 }
 
 .account-table th:nth-child(3),
@@ -591,7 +591,7 @@ function statusClass(account: Account): string {
 
 .account-table th:nth-child(5),
 .account-table td:nth-child(5) {
-  width: 17%;
+  width: 16%;
 }
 
 .account-table th:nth-child(6),
@@ -599,7 +599,7 @@ function statusClass(account: Account): string {
   position: sticky;
   right: 0;
   z-index: 2;
-  width: 236px;
+  width: 198px;
   background: var(--surface);
   box-shadow: -8px 0 12px rgba(15, 23, 42, 0.06);
 }
@@ -730,13 +730,13 @@ function statusClass(account: Account): string {
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 4px;
+  gap: 3px;
   width: 100%;
 }
 
 .table-actions .btn-icon {
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
 }
 
 .btn-run-icon {

@@ -95,6 +95,29 @@ export interface CodexAppSpeedConfig {
   global_state_path: string;
 }
 
+export interface CodexOfficialModeIssue {
+  line: number;
+  label: string;
+}
+
+export interface CodexFeatureStatus {
+  config_path: string;
+  global_state_path: string;
+  goals_db_path: string;
+  goals_enabled: boolean;
+  goals_db_present: boolean;
+  memory_generate_enabled: boolean;
+  memory_use_enabled: boolean;
+  official_mode_ok: boolean;
+  official_mode_issues: CodexOfficialModeIssue[];
+  config_speed: CodexAppSpeed;
+  config_service_tier: string | null;
+  global_state_speed: CodexAppSpeed;
+  global_state_service_tier: string | null;
+  global_state_user_changed_tier: boolean;
+  fast_state_synced: boolean;
+}
+
 export interface CodexProjectVisibilityStatus {
   project_path: string;
   config_path: string;

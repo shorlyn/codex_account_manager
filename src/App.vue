@@ -2,6 +2,7 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import appLogoUrl from '../src-tauri/icons/128x128.png';
 import { useAccounts } from './composables/useAccounts';
 import AccountList from './components/AccountList.vue';
 import AccountDialog from './components/AccountDialog.vue';
@@ -11,6 +12,7 @@ import type {
   BackupPreview,
   CodexAppSpeed,
   CodexAppSpeedConfig,
+  CodexFeatureStatus,
   CodexProjectVisibilityStatus,
   CodexUsageRollup,
   CodexUsageSummary,
@@ -44,6 +46,10 @@ const oauthAdding = ref(false);
 const showToolsMenu = ref(false);
 const codexAppSpeed = ref<CodexAppSpeed>('standard');
 const codexSpeedSaving = ref(false);
+const codexFeatureStatus = ref<CodexFeatureStatus | null>(null);
+const codexFeatureLoading = ref(false);
+const codexFeatureRepairing = ref(false);
+const showCodexFeatureStatus = ref(false);
 const codexUsage = ref<CodexUsageSummary | null>(null);
 const codexUsageLoading = ref(false);
 const showUsageSidebar = ref(false);
@@ -53,6 +59,8 @@ const batchRefreshFailures = ref<BatchRefreshFailure[]>([]);
 const detailAccountId = ref<number | null>(null);
 const healthCheckingId = ref<number | null>(null);
 const healthReports = ref<Record<number, AccountHealthReport>>({});
+const pendingDeleteAccount = ref<Account | null>(null);
+const deletingAccount = ref(false);
 const showOauthDialog = ref(false);
 const oauthLoginId = ref('');
 const oauthUrl = ref('');
@@ -67,6 +75,17 @@ const importPreview = ref<BackupPreview | null>(null);
 const importStrategy = ref<ImportBackupStrategy>('add');
 const importingBackup = ref(false);
 const showImportPreviewDialog = ref(false);
+const backupPasswordMode = ref<BackupPasswordMode | null>(null);
+const backupPassword = ref('');
+const backupPasswordError = ref('');
+const backupPasswordBusy = ref(false);
+const pendingExportAccountIds = ref<number[] | null>(null);
+const pendingImportFile = ref<File | null>(null);
+const showProjectVisibilityDialog = ref(false);
+const projectVisibilityPath = ref('');
+const projectVisibilityBusy = ref(false);
+const pendingConfirmAction = ref<ConfirmAction | null>(null);
+const confirmActionBusy = ref(false);
 const showOperationLogs = ref(false);
 const operationLogs = ref<OperationLog[]>([]);
 const operationLogsLoading = ref(false);
@@ -89,6 +108,8 @@ type AccountFilterStatus = 'all' | 'current' | 'usable' | 'unavailable' | 'authI
 type AccountSortBy = 'created_at' | 'name' | 'primary_remaining' | 'secondary_remaining' | 'primary_reset' | 'secondary_reset' | 'last_checked';
 type AccountSortDirection = 'asc' | 'desc';
 type ErrorReasonKey = 'missing_json' | 'auth' | 'billing' | 'forbidden' | 'rate_limit' | 'network' | 'parse' | 'other';
+type BackupPasswordMode = 'export_all' | 'export_filtered' | 'import';
+type ConfirmAction = 'migrate_plaintext' | 'clear_logs';
 
 interface ErrorReason {
   key: ErrorReasonKey;
@@ -461,6 +482,57 @@ const operationLogActionOptions = computed(() => {
 
 const topCodexUsageModels = computed(() => codexUsage.value?.by_model.slice(0, 4) ?? []);
 
+const codexFeatureIssueCount = computed(() => {
+  const status = codexFeatureStatus.value;
+  if (!status) return 0;
+  let count = 0;
+  if (!status.goals_enabled) count += 1;
+  if (!status.memory_generate_enabled) count += 1;
+  if (!status.memory_use_enabled) count += 1;
+  if (!status.official_mode_ok) count += status.official_mode_issues.length || 1;
+  if (!status.fast_state_synced) count += 1;
+  return count;
+});
+
+const codexFeatureStatusLabel = computed(() =>
+  codexFeatureIssueCount.value > 0 ? `${codexFeatureIssueCount.value} 项需确认` : '配置正常',
+);
+
+const backupPasswordTitle = computed(() => {
+  if (backupPasswordMode.value === 'import') return '导入加密备份';
+  if (backupPasswordMode.value === 'export_filtered') return '导出筛选账号';
+  return '导出全部账号';
+});
+
+const backupPasswordDescription = computed(() =>
+  backupPasswordMode.value === 'import'
+    ? '输入导出时设置的密码，先预览备份内容，再决定导入策略。'
+    : '设置一个至少 8 位的备份密码，导入到新机器时需要使用同一个密码。',
+);
+
+const backupPasswordConfirmLabel = computed(() =>
+  backupPasswordMode.value === 'import'
+    ? (backupPasswordBusy.value ? '读取中...' : '读取备份')
+    : (backupPasswordBusy.value ? '导出中...' : '导出备份'),
+);
+
+const confirmActionTitle = computed(() =>
+  pendingConfirmAction.value === 'clear_logs' ? '清空操作日志？' : '迁移旧账号凭据？',
+);
+
+const confirmActionDescription = computed(() => {
+  if (pendingConfirmAction.value === 'clear_logs') {
+    return '这会删除当前账号管理器记录的操作日志，不会影响账号凭据。';
+  }
+  const pending = migrationStatus.value?.pending_plaintext_accounts ?? 0;
+  return `检测到 ${pending} 个旧账号仍在数据库明文保存。迁移后完整凭据会保存到系统凭据库。`;
+});
+
+const confirmActionButtonLabel = computed(() => {
+  if (pendingConfirmAction.value === 'clear_logs') return confirmActionBusy.value ? '清空中...' : '清空日志';
+  return confirmActionBusy.value ? '迁移中...' : '开始迁移';
+});
+
 const visibleOperationLogs = computed(() =>
   operationLogs.value.filter((log) => {
     if (operationLogErrorsOnly.value && log.level !== 'error') return false;
@@ -490,6 +562,7 @@ onMounted(async () => {
   await loadRestartCodexOnSwitch(true);
   await loadAccountViewMode('cards');
   await loadCodexAppSpeed();
+  await loadCodexFeatureStatus();
   await loadCodexUsage();
 });
 
@@ -621,6 +694,33 @@ async function loadCodexAppSpeed() {
   }
 }
 
+async function loadCodexFeatureStatus(showSuccess = false) {
+  codexFeatureLoading.value = true;
+  try {
+    codexFeatureStatus.value = await invoke<CodexFeatureStatus>('get_codex_feature_status');
+    codexAppSpeed.value = codexFeatureStatus.value.config_speed;
+    if (showSuccess) showMessage('Codex 配置检查已刷新');
+  } catch (e) {
+    showMessage(`读取 Codex 配置检查失败: ${e}`, 'error');
+  } finally {
+    codexFeatureLoading.value = false;
+  }
+}
+
+async function repairCodexAppSpeedState() {
+  if (codexFeatureRepairing.value) return;
+  codexFeatureRepairing.value = true;
+  try {
+    codexFeatureStatus.value = await invoke<CodexFeatureStatus>('repair_codex_app_speed_state');
+    codexAppSpeed.value = codexFeatureStatus.value.config_speed;
+    showMessage('Fast 状态已同步');
+  } catch (e) {
+    showMessage(`同步 Fast 状态失败: ${e}`, 'error');
+  } finally {
+    codexFeatureRepairing.value = false;
+  }
+}
+
 async function loadCodexUsage(showSuccess = false) {
   codexUsageLoading.value = true;
   try {
@@ -634,11 +734,18 @@ async function loadCodexUsage(showSuccess = false) {
 }
 
 async function changeCodexAppSpeed(speed: CodexAppSpeed) {
-  if (codexAppSpeed.value === speed || codexSpeedSaving.value) return;
+  if (codexSpeedSaving.value) return;
+  if (codexAppSpeed.value === speed) {
+    if (codexFeatureStatus.value && !codexFeatureStatus.value.fast_state_synced) {
+      await repairCodexAppSpeedState();
+    }
+    return;
+  }
   codexSpeedSaving.value = true;
   try {
     const config = await invoke<CodexAppSpeedConfig>('set_codex_app_speed', { speed });
     codexAppSpeed.value = config.speed;
+    await loadCodexFeatureStatus();
     showMessage(config.speed === 'fast' ? '已切换为 Fast 模式' : '已切换为标准模式');
   } catch (e) {
     showMessage(`切换速度失败: ${e}`, 'error');
@@ -709,15 +816,32 @@ async function repairProjectVisibility() {
     const status = await invoke<CodexProjectVisibilityStatus>('get_codex_project_visibility_status', {
       projectPath: null,
     });
-    const projectPath = prompt(
-      '请输入要修复为 trusted 的 Codex 项目路径。此操作只会新增或修正该项目的 trust_level，不会修改 provider、MCP、模型或内存配置。',
-      status.project_path,
-    );
-    if (!projectPath?.trim()) return;
+    projectVisibilityPath.value = status.project_path;
+    showProjectVisibilityDialog.value = true;
+  } catch (e) {
+    showMessage(`读取项目可见性失败: ${e}`, 'error');
+  }
+}
 
+function closeProjectVisibilityDialog(force = false) {
+  if (projectVisibilityBusy.value && !force) return;
+  showProjectVisibilityDialog.value = false;
+  projectVisibilityPath.value = '';
+}
+
+async function confirmProjectVisibilityRepair() {
+  if (projectVisibilityBusy.value) return;
+  const projectPath = projectVisibilityPath.value.trim();
+  if (!projectPath) {
+    showMessage('请输入项目路径', 'error');
+    return;
+  }
+  projectVisibilityBusy.value = true;
+  try {
     const repaired = await invoke<CodexProjectVisibilityStatus>('repair_codex_project_visibility', {
-      projectPath: projectPath.trim(),
+      projectPath,
     });
+    closeProjectVisibilityDialog(true);
     showMessage(
       repaired.changed
         ? `项目可见性已修复: ${repaired.project_path}`
@@ -725,6 +849,8 @@ async function repairProjectVisibility() {
     );
   } catch (e) {
     showMessage(`修复项目可见性失败: ${e}`, 'error');
+  } finally {
+    projectVisibilityBusy.value = false;
   }
 }
 
@@ -761,29 +887,50 @@ function downloadTextFile(fileName: string, text: string) {
   URL.revokeObjectURL(url);
 }
 
-async function exportBackup(accountIds?: number[]) {
+function openBackupPasswordDialog(mode: BackupPasswordMode, accountIds?: number[], file?: File) {
   showToolsMenu.value = false;
-  const password = prompt('请输入备份密码（至少 8 位）。导入时需要同一个密码。');
-  if (!password) return;
+  backupPasswordMode.value = mode;
+  backupPassword.value = '';
+  backupPasswordError.value = '';
+  backupPasswordBusy.value = false;
+  pendingExportAccountIds.value = accountIds && accountIds.length > 0 ? accountIds : null;
+  pendingImportFile.value = file ?? null;
+}
+
+function closeBackupPasswordDialog(force = false) {
+  if (backupPasswordBusy.value && !force) return;
+  backupPasswordMode.value = null;
+  backupPassword.value = '';
+  backupPasswordError.value = '';
+  pendingExportAccountIds.value = null;
+  pendingImportFile.value = null;
+}
+
+async function runExportBackup(accountIds: number[] | null, password: string) {
   try {
     const backupText = await invoke<string>('export_encrypted_backup', {
       password,
-      accountIds: accountIds && accountIds.length > 0 ? accountIds : null,
+      accountIds,
     });
     downloadTextFile(backupFileName(), backupText);
     showMessage(`加密备份已导出（${accountIds?.length || accounts.value.length} 个账号）`);
   } catch (e) {
     showMessage(`导出备份失败: ${e}`, 'error');
+    throw e;
   }
 }
 
-async function exportFilteredBackup() {
+function exportBackup(accountIds?: number[]) {
+  openBackupPasswordDialog(accountIds && accountIds.length > 0 ? 'export_filtered' : 'export_all', accountIds);
+}
+
+function exportFilteredBackup() {
   const ids = filteredAccounts.value.filter(account => account.has_json_info).map(account => account.id);
   if (ids.length === 0) {
     showMessage('当前筛选结果里没有可导出的账号', 'error');
     return;
   }
-  await exportBackup(ids);
+  exportBackup(ids);
 }
 
 function openImportBackup() {
@@ -797,9 +944,10 @@ async function importBackup(e: Event) {
   input.value = '';
   if (!file) return;
 
-  const password = prompt('请输入备份密码');
-  if (!password) return;
+  openBackupPasswordDialog('import', undefined, file);
+}
 
+async function runImportPreview(file: File, password: string) {
   try {
     const backupText = await file.text();
     const preview = await invoke<BackupPreview>('preview_encrypted_backup', { backupText, password });
@@ -810,6 +958,38 @@ async function importBackup(e: Event) {
     showImportPreviewDialog.value = true;
   } catch (err) {
     showMessage(`读取备份失败: ${err}`, 'error');
+    throw err;
+  }
+}
+
+async function confirmBackupPassword() {
+  const mode = backupPasswordMode.value;
+  if (!mode || backupPasswordBusy.value) return;
+  const password = backupPassword.value;
+  if (!password) {
+    backupPasswordError.value = '请输入备份密码';
+    return;
+  }
+  if (mode !== 'import' && password.length < 8) {
+    backupPasswordError.value = '备份密码至少 8 位';
+    return;
+  }
+
+  backupPasswordBusy.value = true;
+  backupPasswordError.value = '';
+  try {
+    if (mode === 'import') {
+      const file = pendingImportFile.value;
+      if (!file) throw new Error('未选择备份文件');
+      await runImportPreview(file, password);
+    } else {
+      await runExportBackup(pendingExportAccountIds.value, password);
+    }
+    closeBackupPasswordDialog(true);
+  } catch (e) {
+    backupPasswordError.value = String(e).replace(/^Error:\s*/, '');
+  } finally {
+    backupPasswordBusy.value = false;
   }
 }
 
@@ -846,8 +1026,15 @@ async function migrateOldAccounts() {
   showToolsMenu.value = false;
   const pending = migrationStatus.value?.pending_plaintext_accounts ?? 0;
   if (pending <= 0) return;
-  if (!confirm(`检测到 ${pending} 个旧账号仍在数据库明文保存。现在迁移到系统凭据库吗？`)) return;
+  pendingConfirmAction.value = 'migrate_plaintext';
+}
 
+function closeConfirmActionDialog() {
+  if (confirmActionBusy.value) return;
+  pendingConfirmAction.value = null;
+}
+
+async function runMigrateOldAccounts() {
   migratingAccounts.value = true;
   try {
     const status = await invoke<MigrationStatus>('migrate_plaintext_accounts');
@@ -861,6 +1048,28 @@ async function migrateOldAccounts() {
   }
 }
 
+async function confirmDangerAction() {
+  if (!pendingConfirmAction.value || confirmActionBusy.value) return;
+  const action = pendingConfirmAction.value;
+  confirmActionBusy.value = true;
+  try {
+    if (action === 'migrate_plaintext') {
+      await runMigrateOldAccounts();
+    } else if (action === 'clear_logs') {
+      await invoke('clear_operation_logs');
+      await loadOperationLogs();
+      showMessage('操作日志已清空');
+    }
+    pendingConfirmAction.value = null;
+  } catch (e) {
+    if (action === 'clear_logs') {
+      showMessage(`清空日志失败: ${e}`, 'error');
+    }
+  } finally {
+    confirmActionBusy.value = false;
+  }
+}
+
 async function handleRun(id: number) {
   try {
     await switchAccount(id, restartCodexOnSwitch.value);
@@ -871,9 +1080,28 @@ async function handleRun(id: number) {
 
 async function handleDelete(id: number) {
   const account = accounts.value.find(a => a.id === id);
-  if (!account || !confirm(`确定要删除「${account.name}」吗？`)) return;
-  try { await deleteAccount(id); showMessage('账号已删除'); }
-  catch (e) { showMessage(`删除失败: ${e}`, 'error'); }
+  if (!account) return;
+  pendingDeleteAccount.value = account;
+}
+
+function closeDeleteConfirm() {
+  if (deletingAccount.value) return;
+  pendingDeleteAccount.value = null;
+}
+
+async function confirmDeleteAccount() {
+  const account = pendingDeleteAccount.value;
+  if (!account || deletingAccount.value) return;
+  deletingAccount.value = true;
+  try {
+    await deleteAccount(account.id);
+    pendingDeleteAccount.value = null;
+    showMessage('账号已删除');
+  } catch (e) {
+    showMessage(`删除失败: ${e}`, 'error');
+  } finally {
+    deletingAccount.value = false;
+  }
 }
 
 async function handleRefresh(id: number) {
@@ -959,6 +1187,14 @@ async function handleRestartToggle(e: Event) {
 function toggleStorageDetails() {
   showToolsMenu.value = false;
   showStorageDetails.value = !showStorageDetails.value;
+}
+
+async function toggleCodexFeatureStatus() {
+  showToolsMenu.value = false;
+  showCodexFeatureStatus.value = !showCodexFeatureStatus.value;
+  if (showCodexFeatureStatus.value) {
+    await loadCodexFeatureStatus();
+  }
 }
 
 function formatLogDetails(details: string): string {
@@ -1076,14 +1312,7 @@ async function changeOperationLogAccount(e: Event) {
 }
 
 async function clearOperationLogs() {
-  if (!confirm('确定清空所有操作日志吗？')) return;
-  try {
-    await invoke('clear_operation_logs');
-    await loadOperationLogs();
-    showMessage('操作日志已清空');
-  } catch (e) {
-    showMessage(`清空日志失败: ${e}`, 'error');
-  }
+  pendingConfirmAction.value = 'clear_logs';
 }
 
 function openDetailDrawer(account: Account) {
@@ -1108,10 +1337,7 @@ function editDetailAccount(account: Account) {
       <div class="header-inner">
         <div class="header-left">
           <div class="logo">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-            </svg>
+            <img :src="appLogoUrl" alt="" />
           </div>
           <div class="header-text">
             <h1>Codex Manager</h1>
@@ -1225,6 +1451,9 @@ function editDetailAccount(account: Account) {
                 <button @click="repairProjectVisibility">
                   <span>修复项目可见性</span>
                 </button>
+                <button @click="toggleCodexFeatureStatus">
+                  <span>{{ showCodexFeatureStatus ? '收起 Codex 配置检查' : '检查 Codex 配置' }}</span>
+                </button>
                 <button @click="() => openOperationLogs()">
                   <span>查看操作日志</span>
                 </button>
@@ -1253,6 +1482,78 @@ function editDetailAccount(account: Account) {
               当前检测到 {{ migrationStatus.pending_plaintext_accounts }} 个旧账号还未迁移。
             </span>
           </p>
+        </div>
+
+        <div v-if="showCodexFeatureStatus" class="codex-feature-panel">
+          <div class="codex-feature-head">
+            <div>
+              <strong>Codex 配置检查</strong>
+              <span>{{ codexFeatureStatusLabel }}</span>
+            </div>
+            <button :disabled="codexFeatureLoading" @click="loadCodexFeatureStatus(true)">
+              {{ codexFeatureLoading ? '检查中...' : '刷新' }}
+            </button>
+          </div>
+
+          <div v-if="codexFeatureStatus" class="codex-feature-grid">
+            <div class="codex-feature-item" :class="{ warn: !codexFeatureStatus.goals_enabled }">
+              <span>Goal 模式</span>
+              <strong>{{ codexFeatureStatus.goals_enabled ? '已开启' : '未开启' }}</strong>
+              <small>{{ codexFeatureStatus.goals_db_present ? 'Goals 数据库存在' : '尚未发现 Goals 数据库' }}</small>
+            </div>
+            <div
+              class="codex-feature-item"
+              :class="{ warn: !codexFeatureStatus.memory_generate_enabled || !codexFeatureStatus.memory_use_enabled }"
+            >
+              <span>Memory</span>
+              <strong>
+                {{ codexFeatureStatus.memory_generate_enabled && codexFeatureStatus.memory_use_enabled ? '已开启' : '需确认' }}
+              </strong>
+              <small>
+                生成 {{ codexFeatureStatus.memory_generate_enabled ? '开' : '关' }} · 使用 {{ codexFeatureStatus.memory_use_enabled ? '开' : '关' }}
+              </small>
+            </div>
+            <div class="codex-feature-item" :class="{ warn: !codexFeatureStatus.official_mode_ok }">
+              <span>官方模式</span>
+              <strong>{{ codexFeatureStatus.official_mode_ok ? '干净' : '发现 provider 配置' }}</strong>
+              <small v-if="codexFeatureStatus.official_mode_ok">未发现 provider / proxy / base_url</small>
+              <small v-else :title="codexFeatureStatus.official_mode_issues.map(item => `第 ${item.line} 行 ${item.label}`).join(' · ')">
+                {{ codexFeatureStatus.official_mode_issues.length }} 处需人工确认
+              </small>
+            </div>
+            <div class="codex-feature-item" :class="{ warn: !codexFeatureStatus.fast_state_synced }">
+              <span>Fast 状态</span>
+              <strong>{{ codexFeatureStatus.config_speed === 'fast' ? 'Fast' : '标准' }}</strong>
+              <small>
+                App 状态 {{ codexFeatureStatus.global_state_service_tier || '空' }}
+                <template v-if="!codexFeatureStatus.fast_state_synced"> · 未同步</template>
+              </small>
+            </div>
+          </div>
+
+          <div v-if="codexFeatureStatus" class="codex-feature-actions">
+            <button @click="copyText(codexFeatureStatus.config_path, 'config.toml 路径')">复制 config.toml</button>
+            <button @click="copyText(codexFeatureStatus.global_state_path, '全局状态路径')">复制 App 状态</button>
+            <button
+              v-if="!codexFeatureStatus.fast_state_synced"
+              :disabled="codexFeatureRepairing"
+              @click="repairCodexAppSpeedState"
+            >
+              {{ codexFeatureRepairing ? '同步中...' : '同步 Fast 状态' }}
+            </button>
+          </div>
+
+          <div
+            v-if="codexFeatureStatus && codexFeatureStatus.official_mode_issues.length > 0"
+            class="codex-feature-issues"
+          >
+            <span
+              v-for="issue in codexFeatureStatus.official_mode_issues"
+              :key="`${issue.line}-${issue.label}`"
+            >
+              第 {{ issue.line }} 行 {{ issue.label }}
+            </span>
+          </div>
         </div>
       </section>
 
@@ -1756,6 +2057,134 @@ function editDetailAccount(account: Account) {
 
     <!-- Dialog -->
     <Transition name="dialog">
+      <div v-if="backupPasswordMode" class="confirm-backdrop" @click.self="closeBackupPasswordDialog()">
+        <div class="confirm-dialog">
+          <div class="confirm-icon confirm-icon-primary">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <path v-if="backupPasswordMode === 'import'" d="M7 10l5 5 5-5"/>
+              <path v-if="backupPasswordMode === 'import'" d="M12 15V3"/>
+              <path v-if="backupPasswordMode !== 'import'" d="M7 8l5-5 5 5"/>
+              <path v-if="backupPasswordMode !== 'import'" d="M12 3v12"/>
+            </svg>
+          </div>
+          <div class="confirm-content">
+            <span>加密备份</span>
+            <h2>{{ backupPasswordTitle }}</h2>
+            <p>{{ backupPasswordDescription }}</p>
+            <label class="confirm-field">
+              <span>备份密码</span>
+              <input
+                v-model="backupPassword"
+                type="password"
+                autocomplete="off"
+                placeholder="输入备份密码"
+                @keyup.enter="confirmBackupPassword"
+              />
+            </label>
+            <p v-if="backupPasswordError" class="confirm-error">{{ backupPasswordError }}</p>
+          </div>
+          <div class="confirm-actions">
+            <button class="confirm-cancel" :disabled="backupPasswordBusy" @click="closeBackupPasswordDialog()">取消</button>
+            <button class="confirm-primary" :disabled="backupPasswordBusy" @click="confirmBackupPassword">
+              {{ backupPasswordConfirmLabel }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="dialog">
+      <div v-if="showProjectVisibilityDialog" class="confirm-backdrop" @click.self="closeProjectVisibilityDialog()">
+        <div class="confirm-dialog">
+          <div class="confirm-icon confirm-icon-primary">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l7 4v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V7l7-4z"/>
+              <path d="M9 12l2 2 4-4"/>
+            </svg>
+          </div>
+          <div class="confirm-content">
+            <span>项目可见性</span>
+            <h2>修复 Codex 项目可见性</h2>
+            <p>只会新增或修正该项目的 trust_level，不会修改 provider、MCP、模型或 Memory 配置。</p>
+            <label class="confirm-field">
+              <span>项目路径</span>
+              <input
+                v-model="projectVisibilityPath"
+                type="text"
+                autocomplete="off"
+                placeholder="D:\\project\\rust\\codex_account_manager"
+                @keyup.enter="confirmProjectVisibilityRepair"
+              />
+            </label>
+          </div>
+          <div class="confirm-actions">
+            <button class="confirm-cancel" :disabled="projectVisibilityBusy" @click="closeProjectVisibilityDialog()">取消</button>
+            <button class="confirm-primary" :disabled="projectVisibilityBusy" @click="confirmProjectVisibilityRepair">
+              {{ projectVisibilityBusy ? '修复中...' : '修复可见性' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="dialog">
+      <div v-if="pendingConfirmAction" class="confirm-backdrop" @click.self="closeConfirmActionDialog">
+        <div class="confirm-dialog">
+          <div class="confirm-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10.3 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.7 3.86a2 2 0 0 0-3.4 0z"/>
+              <path d="M12 9v4"/>
+              <path d="M12 17h.01"/>
+            </svg>
+          </div>
+          <div class="confirm-content">
+            <span>确认操作</span>
+            <h2>{{ confirmActionTitle }}</h2>
+            <p>{{ confirmActionDescription }}</p>
+          </div>
+          <div class="confirm-actions">
+            <button class="confirm-cancel" :disabled="confirmActionBusy" @click="closeConfirmActionDialog">取消</button>
+            <button class="confirm-danger" :disabled="confirmActionBusy" @click="confirmDangerAction">
+              {{ confirmActionButtonLabel }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="dialog">
+      <div v-if="pendingDeleteAccount" class="confirm-backdrop" @click.self="closeDeleteConfirm">
+        <div class="confirm-dialog">
+          <div class="confirm-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 6h18"/>
+              <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6"/>
+              <path d="M14 11v6"/>
+            </svg>
+          </div>
+          <div class="confirm-content">
+            <span>删除账号</span>
+            <h2>确认删除「{{ pendingDeleteAccount.name }}」？</h2>
+            <p>这会从账号管理器里移除该记录和保存的凭据。当前生效的 auth.json 不会在这里被自动切换。</p>
+            <div class="confirm-account">
+              <strong>{{ pendingDeleteAccount.name }}</strong>
+              <code>{{ pendingDeleteAccount.account_id || `记录 #${pendingDeleteAccount.id}` }}</code>
+            </div>
+          </div>
+          <div class="confirm-actions">
+            <button class="confirm-cancel" :disabled="deletingAccount" @click="closeDeleteConfirm">取消</button>
+            <button class="confirm-danger" :disabled="deletingAccount" @click="confirmDeleteAccount">
+              {{ deletingAccount ? '删除中...' : '删除账号' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <Transition name="dialog">
       <AccountDialog
         v-if="showDialog"
         :account="editingAccount"
@@ -1953,15 +2382,22 @@ function editDetailAccount(account: Account) {
 }
 
 .logo {
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
-  background: linear-gradient(135deg, var(--primary), var(--accent));
-  color: #fff;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--surface);
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.18);
+}
+
+.logo img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
 }
 
 .header-text h1 {
@@ -2276,6 +2712,133 @@ function editDetailAccount(account: Account) {
   margin: 12px 0 0;
   color: var(--text-tertiary);
   font-size: 12px;
+}
+
+.codex-feature-panel {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+}
+
+.codex-feature-head,
+.codex-feature-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.codex-feature-head strong {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.codex-feature-head span {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.codex-feature-head button,
+.codex-feature-actions button {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.codex-feature-head button:hover:not(:disabled),
+.codex-feature-actions button:hover:not(:disabled) {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.codex-feature-head button:disabled,
+.codex-feature-actions button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.codex-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.codex-feature-item {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.codex-feature-item span,
+.codex-feature-item small {
+  display: block;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-feature-item strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--success);
+  font-size: 14px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codex-feature-item small {
+  margin-top: 3px;
+}
+
+.codex-feature-item.warn strong {
+  color: var(--warning);
+}
+
+.codex-feature-actions {
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+
+.codex-feature-issues {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.codex-feature-issues span {
+  max-width: 240px;
+  overflow: hidden;
+  padding: 4px 7px;
+  border: 1px solid #fed7aa;
+  border-radius: 999px;
+  background: #fff7ed;
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Overview panel ───────────────────── */
@@ -2903,6 +3466,189 @@ function editDetailAccount(account: Account) {
   background: var(--surface);
   border-left: 1px solid var(--border);
   box-shadow: var(--shadow-xl);
+}
+
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 130;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 22px;
+  background: rgba(15, 23, 42, 0.34);
+  backdrop-filter: blur(6px);
+}
+
+.confirm-dialog {
+  width: min(420px, 100%);
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-xl);
+}
+
+.confirm-icon {
+  width: 42px;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #fecaca;
+  border-radius: 12px;
+  background: var(--danger-light);
+  color: var(--danger);
+}
+
+.confirm-icon-primary {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.confirm-content {
+  margin-top: 14px;
+}
+
+.confirm-content span {
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.confirm-content h2 {
+  margin: 5px 0 0;
+  color: var(--text);
+  font-size: 18px;
+  line-height: 1.25;
+  font-weight: 850;
+}
+
+.confirm-content p {
+  margin: 9px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.confirm-field {
+  display: grid;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.confirm-field span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.confirm-field input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  background: #f8fafc;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.confirm-field input:focus {
+  border-color: var(--primary);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+.confirm-error {
+  margin-top: 8px !important;
+  color: var(--danger) !important;
+  font-weight: 750;
+}
+
+.confirm-account {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+}
+
+.confirm-account strong,
+.confirm-account code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confirm-account strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.confirm-account code {
+  color: var(--text-tertiary);
+  font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+  font-size: 11px;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.confirm-actions button {
+  height: 34px;
+  padding: 0 13px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 850;
+  cursor: pointer;
+}
+
+.confirm-actions button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.confirm-cancel {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+}
+
+.confirm-danger {
+  border: 1px solid #dc2626;
+  background: #dc2626;
+  color: #fff;
+}
+
+.confirm-primary {
+  border: 1px solid var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+.confirm-cancel:hover:not(:disabled) {
+  background: #f8fafc;
+}
+
+.confirm-danger:hover:not(:disabled) {
+  border-color: #b91c1c;
+  background: #b91c1c;
+}
+
+.confirm-primary:hover:not(:disabled) {
+  border-color: var(--primary-hover);
+  background: var(--primary-hover);
 }
 
 .detail-header {
