@@ -862,31 +862,6 @@ async function loadMigrationStatus() {
   }
 }
 
-function backupFileName(): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  const d = new Date();
-  return [
-    'codex-accounts-backup',
-    d.getFullYear(),
-    pad(d.getMonth() + 1),
-    pad(d.getDate()),
-    pad(d.getHours()),
-    pad(d.getMinutes()),
-  ].join('-') + '.json';
-}
-
-function downloadTextFile(fileName: string, text: string) {
-  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = fileName;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
-}
-
 function openBackupPasswordDialog(mode: BackupPasswordMode, accountIds?: number[], file?: File) {
   showToolsMenu.value = false;
   backupPasswordMode.value = mode;
@@ -908,12 +883,11 @@ function closeBackupPasswordDialog(force = false) {
 
 async function runExportBackup(accountIds: number[] | null, password: string) {
   try {
-    const backupText = await invoke<string>('export_encrypted_backup', {
+    const backupPath = await invoke<string>('export_encrypted_backup_file', {
       password,
       accountIds,
     });
-    downloadTextFile(backupFileName(), backupText);
-    showMessage(`加密备份已导出（${accountIds?.length || accounts.value.length} 个账号）`);
+    showMessage(`加密备份已导出到: ${backupPath}`);
   } catch (e) {
     showMessage(`导出备份失败: ${e}`, 'error');
     throw e;

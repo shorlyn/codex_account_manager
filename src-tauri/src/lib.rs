@@ -3408,6 +3408,65 @@ fn export_encrypted_backup(
     )
 }
 
+fn backup_file_name() -> String {
+    let now = chrono::Local::now();
+    format!(
+        "codex-accounts-backup-{}.json",
+        now.format("%Y-%m-%d-%H-%M")
+    )
+}
+
+fn default_backup_export_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    if let Ok(path) = app.path().download_dir() {
+        return Ok(path);
+    }
+    if let Ok(path) = app.path().desktop_dir() {
+        return Ok(path);
+    }
+    Ok(std::path::PathBuf::from(get_home_dir()?))
+}
+
+fn unique_backup_path(dir: std::path::PathBuf, file_name: &str) -> std::path::PathBuf {
+    let base = std::path::Path::new(file_name)
+        .file_stem()
+        .and_then(|item| item.to_str())
+        .unwrap_or("codex-accounts-backup");
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or("json");
+    let first = dir.join(file_name);
+    if !first.exists() {
+        return first;
+    }
+    for index in 2..1000 {
+        let candidate = dir.join(format!("{}-{}.{}", base, index, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!(
+        "{}-{}.{}",
+        base,
+        chrono::Local::now().timestamp(),
+        ext
+    ))
+}
+
+#[command]
+fn export_encrypted_backup_file(
+    app: AppHandle,
+    password: String,
+    account_ids: Option<Vec<i64>>,
+) -> Result<String, String> {
+    let backup_text = export_encrypted_backup(app.clone(), password, account_ids)?;
+    let export_dir = default_backup_export_dir(&app)?;
+    std::fs::create_dir_all(&export_dir).map_err(|e| format!("创建备份目录失败: {}", e))?;
+    let path = unique_backup_path(export_dir, &backup_file_name());
+    std::fs::write(&path, backup_text).map_err(|e| format!("写入备份文件失败: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 async fn normalized_backup_accounts(
     backup_text: &str,
     password: &str,
@@ -4509,6 +4568,7 @@ pub fn run() {
             update_account,
             delete_account,
             export_encrypted_backup,
+            export_encrypted_backup_file,
             preview_encrypted_backup,
             import_encrypted_backup,
             get_migration_status,
