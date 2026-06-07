@@ -23,6 +23,9 @@ use tauri::{
     AppHandle, Emitter, Manager, WindowEvent,
 };
 
+#[cfg(target_os = "windows")]
+const WINDOWS_CODEX_APP_ID: &str = "OpenAI.Codex_2p2nqsd0c76g0!App";
+
 // ── API response structs ──────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -1987,15 +1990,12 @@ fn restart_codex_process() -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let result = std::process::Command::new("cmd")
-            .args(["/C", "start", "", "Codex"])
-            .output();
-
-        if result.is_err() || result.unwrap().status.code() != Some(0) {
-            std::process::Command::new("codex.exe")
-                .spawn()
-                .map_err(|e| format!("Failed to restart Codex: {}", e))?;
-        }
+        // Codex desktop is a packaged Windows app. Do not fall back to
+        // codex.exe here: that starts the CLI and leaves the desktop app closed.
+        std::process::Command::new("explorer.exe")
+            .arg(format!("shell:AppsFolder\\{}", WINDOWS_CODEX_APP_ID))
+            .spawn()
+            .map_err(|e| format!("Failed to restart Codex desktop app: {}", e))?;
     }
 
     Ok(())
