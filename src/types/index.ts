@@ -116,6 +116,45 @@ export interface AccountHealthReport {
   items: AccountHealthItem[];
 }
 
+export interface CodexUsageRollup {
+  request_count: number;
+  success_count: number;
+  error_count: number;
+  input_tokens: number;
+  cached_input_tokens: number;
+  non_cached_input_tokens: number;
+  output_tokens: number;
+  reasoning_output_tokens: number;
+  total_tokens: number;
+  api_cost_usd: number;
+  codex_credits: number;
+}
+
+export interface CodexModelUsage {
+  model: string;
+  usage: CodexUsageRollup;
+}
+
+export interface CodexUsageFailure {
+  ts: number;
+  model: string;
+  turn_id: string;
+  response_id: string;
+  status: string;
+  message: string;
+}
+
+export interface CodexUsageSummary {
+  log_path: string;
+  today_start_ts: number;
+  today_end_ts: number;
+  total: CodexUsageRollup;
+  today: CodexUsageRollup;
+  by_model: CodexModelUsage[];
+  recent_failures: CodexUsageFailure[];
+  note: string;
+}
+
 export interface BackupPreview {
   version: number;
   total_accounts: number;

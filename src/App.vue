@@ -12,6 +12,8 @@ import type {
   CodexAppSpeed,
   CodexAppSpeedConfig,
   CodexProjectVisibilityStatus,
+  CodexUsageRollup,
+  CodexUsageSummary,
   BatchRefreshFailure,
   BatchRefreshProgress,
   ImportBackupResult,
@@ -42,6 +44,8 @@ const oauthAdding = ref(false);
 const showToolsMenu = ref(false);
 const codexAppSpeed = ref<CodexAppSpeed>('standard');
 const codexSpeedSaving = ref(false);
+const codexUsage = ref<CodexUsageSummary | null>(null);
+const codexUsageLoading = ref(false);
 const batchRefreshing = ref(false);
 const batchRefreshProgress = ref<BatchRefreshProgress | null>(null);
 const batchRefreshFailures = ref<BatchRefreshFailure[]>([]);
@@ -158,6 +162,40 @@ function formatResetTime(timestamp: number): string {
 function formatCheckedTime(value: string): string {
   if (!value) return '尚未检查';
   return value.replace('T', ' ');
+}
+
+function formatTokenAmount(value: number | null | undefined): string {
+  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
+  if (normalized >= 100_000_000) return `${(normalized / 100_000_000).toFixed(2).replace(/\.00$/, '')}亿`;
+  if (normalized >= 10_000) return `${(normalized / 10_000).toFixed(1).replace(/\.0$/, '')}万`;
+  return Math.round(normalized).toLocaleString('zh-CN');
+}
+
+function formatExactNumber(value: number | null | undefined): string {
+  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
+  return Math.round(normalized).toLocaleString('zh-CN');
+}
+
+function formatUsd(value: number | null | undefined): string {
+  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: normalized >= 100 ? 2 : 4,
+  }).format(normalized);
+}
+
+function formatCredits(value: number | null | undefined): string {
+  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
+  return normalized.toLocaleString('zh-CN', {
+    maximumFractionDigits: normalized >= 100 ? 1 : 3,
+  });
+}
+
+function usageSuccessRate(usage: CodexUsageRollup | null | undefined): string {
+  if (!usage || usage.request_count <= 0) return '-';
+  return `${((usage.success_count / usage.request_count) * 100).toFixed(1)}%`;
 }
 
 function hasQuotaError(account: Account): boolean {
@@ -420,6 +458,8 @@ const operationLogActionOptions = computed(() => {
   return actions.sort((a, b) => logActionLabel(a).localeCompare(logActionLabel(b), 'zh-Hans-CN'));
 });
 
+const topCodexUsageModels = computed(() => codexUsage.value?.by_model.slice(0, 4) ?? []);
+
 const visibleOperationLogs = computed(() =>
   operationLogs.value.filter((log) => {
     if (operationLogErrorsOnly.value && log.level !== 'error') return false;
@@ -449,6 +489,7 @@ onMounted(async () => {
   await loadRestartCodexOnSwitch(true);
   await loadAccountViewMode('cards');
   await loadCodexAppSpeed();
+  await loadCodexUsage();
 });
 
 onUnmounted(() => {
@@ -576,6 +617,18 @@ async function loadCodexAppSpeed() {
     codexAppSpeed.value = config.speed;
   } catch (e) {
     showMessage(`读取 Codex 速度失败: ${e}`, 'error');
+  }
+}
+
+async function loadCodexUsage(showSuccess = false) {
+  codexUsageLoading.value = true;
+  try {
+    codexUsage.value = await invoke<CodexUsageSummary>('get_codex_usage_summary');
+    if (showSuccess) showMessage('Codex 使用统计已刷新');
+  } catch (e) {
+    showMessage(`读取 Codex 使用统计失败: ${e}`, 'error');
+  } finally {
+    codexUsageLoading.value = false;
   }
 }
 
@@ -1269,6 +1322,90 @@ function editDetailAccount(account: Account) {
             </button>
           </div>
         </div>
+      </section>
+
+      <section class="usage-panel">
+        <div class="usage-head">
+          <div>
+            <span class="section-kicker">Codex 使用统计</span>
+            <h2>Tokens 与估算成本</h2>
+          </div>
+          <button class="usage-refresh" :disabled="codexUsageLoading" @click="loadCodexUsage(true)">
+            <svg v-if="codexUsageLoading" class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+              <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+            </svg>
+            <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+            {{ codexUsageLoading ? '读取中' : '刷新' }}
+          </button>
+        </div>
+
+        <div v-if="codexUsage" class="usage-layout">
+          <div class="usage-primary">
+            <div class="usage-total">
+              <span>今日 Tokens</span>
+              <strong>{{ formatExactNumber(codexUsage.today.total_tokens) }}</strong>
+              <small>
+                全部 {{ formatTokenAmount(codexUsage.total.total_tokens) }}
+                · 成功率 {{ usageSuccessRate(codexUsage.today) }}
+              </small>
+            </div>
+            <div class="usage-mini-grid">
+              <div class="usage-mini-card">
+                <span>今日请求</span>
+                <strong>{{ formatExactNumber(codexUsage.today.request_count) }}</strong>
+                <small>成功 {{ codexUsage.today.success_count }} · 失败 {{ codexUsage.today.error_count }}</small>
+              </div>
+              <div class="usage-mini-card">
+                <span>Codex Credits</span>
+                <strong>{{ formatCredits(codexUsage.today.codex_credits) }}</strong>
+                <small>全部 {{ formatCredits(codexUsage.total.codex_credits) }}</small>
+              </div>
+              <div class="usage-mini-card">
+                <span>API 等价成本</span>
+                <strong>{{ formatUsd(codexUsage.today.api_cost_usd) }}</strong>
+                <small>全部 {{ formatUsd(codexUsage.total.api_cost_usd) }}</small>
+              </div>
+            </div>
+          </div>
+
+          <div class="usage-breakdown">
+            <div class="usage-breakdown-row">
+              <span>Input</span>
+              <strong>{{ formatTokenAmount(codexUsage.today.input_tokens) }}</strong>
+            </div>
+            <div class="usage-breakdown-row">
+              <span>Cached</span>
+              <strong>{{ formatTokenAmount(codexUsage.today.cached_input_tokens) }}</strong>
+            </div>
+            <div class="usage-breakdown-row">
+              <span>Output</span>
+              <strong>{{ formatTokenAmount(codexUsage.today.output_tokens) }}</strong>
+            </div>
+            <div class="usage-breakdown-row">
+              <span>Reasoning</span>
+              <strong>{{ formatTokenAmount(codexUsage.today.reasoning_output_tokens) }}</strong>
+            </div>
+          </div>
+
+          <div class="usage-models">
+            <div class="usage-subhead">模型</div>
+            <div v-if="topCodexUsageModels.length === 0" class="usage-empty">暂无 token 记录</div>
+            <div v-for="item in topCodexUsageModels" :key="item.model" class="usage-model-row">
+              <span :title="item.model">{{ item.model }}</span>
+              <strong>{{ formatTokenAmount(item.usage.total_tokens) }}</strong>
+              <small>{{ formatUsd(item.usage.api_cost_usd) }}</small>
+            </div>
+          </div>
+        </div>
+
+        <div v-else class="usage-empty usage-empty-large">
+          {{ codexUsageLoading ? '读取 Codex 本地日志中...' : '暂无 Codex 使用统计' }}
+        </div>
+
+        <div v-if="codexUsage?.note" class="usage-note">{{ codexUsage.note }}</div>
       </section>
 
       <section class="account-toolbar">
@@ -2209,6 +2346,206 @@ function editDetailAccount(account: Account) {
 
 .view-segmented {
   grid-template-columns: repeat(3, minmax(54px, 1fr));
+}
+
+.usage-panel {
+  margin-bottom: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.usage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.section-kicker {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.usage-head h2 {
+  margin: 3px 0 0;
+  color: var(--text);
+  font-size: 16px;
+  letter-spacing: 0;
+}
+
+.usage-refresh {
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.usage-refresh:hover:not(:disabled) {
+  border-color: #cbd5e1;
+  background: #f1f5f9;
+}
+
+.usage-refresh:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.usage-layout {
+  display: grid;
+  grid-template-columns: minmax(360px, 1.35fr) minmax(180px, 0.62fr) minmax(220px, 0.78fr);
+  gap: 12px;
+}
+
+.usage-primary,
+.usage-breakdown,
+.usage-models {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+}
+
+.usage-total span,
+.usage-mini-card span,
+.usage-breakdown-row span,
+.usage-subhead {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.usage-total strong {
+  display: block;
+  margin-top: 6px;
+  color: var(--text);
+  font-size: 34px;
+  line-height: 1.08;
+  font-weight: 850;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-total small,
+.usage-mini-card small,
+.usage-model-row small,
+.usage-note {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.usage-total small {
+  display: block;
+  margin-top: 5px;
+}
+
+.usage-mini-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.usage-mini-card {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.usage-mini-card strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 5px;
+  color: var(--text);
+  font-size: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-mini-card small {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-breakdown {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.usage-breakdown-row,
+.usage-model-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.usage-breakdown-row strong,
+.usage-model-row strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-models {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.usage-model-row {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-light);
+}
+
+.usage-model-row span {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-empty {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.usage-empty-large {
+  padding: 28px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+  text-align: center;
+}
+
+.usage-note {
+  margin-top: 10px;
+  line-height: 1.5;
 }
 
 /* ── Account toolbar ──────────────────── */
@@ -3516,6 +3853,14 @@ function editDetailAccount(account: Account) {
     flex: 1;
   }
 
+  .usage-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-mini-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .account-toolbar,
   .toolbar-main,
   .toolbar-actions {
@@ -3578,6 +3923,24 @@ function editDetailAccount(account: Account) {
   }
 
   .stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .usage-refresh {
+    justify-content: center;
+    width: 100%;
+  }
+
+  .usage-total strong {
+    font-size: 28px;
+  }
+
+  .usage-mini-grid {
     grid-template-columns: 1fr;
   }
 

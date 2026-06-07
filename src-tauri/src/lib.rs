@@ -12,6 +12,7 @@ use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -123,6 +124,49 @@ pub struct AccountHealthReport {
     pub checked_at: String,
     pub summary_status: String,
     pub items: Vec<AccountHealthItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct CodexUsageRollup {
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_count: i64,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub non_cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+    pub api_cost_usd: f64,
+    pub codex_credits: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexModelUsage {
+    pub model: String,
+    pub usage: CodexUsageRollup,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexUsageFailure {
+    pub ts: i64,
+    pub model: String,
+    pub turn_id: String,
+    pub response_id: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexUsageSummary {
+    pub log_path: String,
+    pub today_start_ts: i64,
+    pub today_end_ts: i64,
+    pub total: CodexUsageRollup,
+    pub today: CodexUsageRollup,
+    pub by_model: Vec<CodexModelUsage>,
+    pub recent_failures: Vec<CodexUsageFailure>,
+    pub note: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -291,6 +335,268 @@ fn get_codex_config_path() -> Result<std::path::PathBuf, String> {
 
 fn get_codex_global_state_path() -> Result<std::path::PathBuf, String> {
     Ok(get_codex_home_path()?.join(CODEX_GLOBAL_STATE_FILE))
+}
+
+fn get_codex_logs_path() -> Result<std::path::PathBuf, String> {
+    Ok(get_codex_home_path()?.join("logs_2.sqlite"))
+}
+
+fn local_day_bounds_ts() -> Result<(i64, i64), String> {
+    let now = chrono::Local::now();
+    let today = now.date_naive();
+    let start_naive = today
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| "Failed to build local day start".to_string())?;
+    let end_naive = (today + chrono::Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| "Failed to build local day end".to_string())?;
+    let start = match start_naive.and_local_timezone(chrono::Local) {
+        chrono::LocalResult::Single(value) => value.timestamp(),
+        chrono::LocalResult::Ambiguous(a, b) => a.timestamp().min(b.timestamp()),
+        chrono::LocalResult::None => now.timestamp(),
+    };
+    let end = match end_naive.and_local_timezone(chrono::Local) {
+        chrono::LocalResult::Single(value) => value.timestamp(),
+        chrono::LocalResult::Ambiguous(a, b) => a.timestamp().max(b.timestamp()),
+        chrono::LocalResult::None => start + 86_400,
+    };
+    Ok((start, end.max(start)))
+}
+
+fn extract_log_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let start = body.find(key)? + key.len();
+    let rest = &body[start..];
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || ch == '}' || ch == ',' || ch == ')')
+        .unwrap_or(rest.len());
+    let value = rest[..end].trim_matches('"').trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\":\"", key);
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest.find('"')?;
+    let value = rest[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn extract_log_i64(body: &str, key: &str) -> i64 {
+    extract_log_value(body, key)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn normalized_model(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
+fn model_api_prices_per_1m(model: &str, input_tokens: i64) -> Option<(f64, f64, f64)> {
+    let model = normalized_model(model);
+    if model.starts_with("gpt-5.5-pro") {
+        return if input_tokens >= 270_000 {
+            Some((60.0, 60.0, 270.0))
+        } else {
+            Some((30.0, 30.0, 180.0))
+        };
+    }
+    if model == "gpt-5.5" || model.starts_with("gpt-5.5-") {
+        return if input_tokens >= 270_000 {
+            Some((10.0, 1.0, 45.0))
+        } else {
+            Some((5.0, 0.5, 30.0))
+        };
+    }
+    if model.starts_with("gpt-5.4-pro") {
+        return if input_tokens >= 270_000 {
+            Some((60.0, 60.0, 270.0))
+        } else {
+            Some((30.0, 30.0, 180.0))
+        };
+    }
+    if model == "gpt-5.4" || model.starts_with("gpt-5.4-") {
+        if model.starts_with("gpt-5.4-mini") {
+            return Some((0.75, 0.075, 4.5));
+        }
+        if model.starts_with("gpt-5.4-nano") {
+            return Some((0.2, 0.02, 1.25));
+        }
+        return if input_tokens >= 270_000 {
+            Some((5.0, 0.5, 22.5))
+        } else {
+            Some((2.5, 0.25, 15.0))
+        };
+    }
+    if model.starts_with("gpt-5-codex-mini") || model.starts_with("gpt-5.1-codex-mini") {
+        return Some((0.25, 0.025, 2.0));
+    }
+    if model.starts_with("gpt-5-codex")
+        || model.starts_with("gpt-5.1-codex")
+        || model == "gpt-5"
+        || model.starts_with("gpt-5-")
+    {
+        return Some((1.25, 0.125, 10.0));
+    }
+    None
+}
+
+fn model_codex_credit_prices_per_1m(model: &str) -> Option<(f64, f64, f64)> {
+    let model = normalized_model(model);
+    if model.starts_with("gpt-5.5-pro") {
+        return Some((750.0, 750.0, 4_500.0));
+    }
+    if model == "gpt-5.5" || model.starts_with("gpt-5.5-") {
+        return Some((125.0, 12.5, 750.0));
+    }
+    if model.starts_with("gpt-5.4-pro") {
+        return Some((750.0, 750.0, 4_500.0));
+    }
+    if model == "gpt-5.4" || model.starts_with("gpt-5.4-") {
+        return Some((62.5, 6.25, 375.0));
+    }
+    None
+}
+
+fn estimate_weighted_cost(
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    prices_per_1m: Option<(f64, f64, f64)>,
+) -> f64 {
+    let Some((input_price, cached_price, output_price)) = prices_per_1m else {
+        return 0.0;
+    };
+    let input = input_tokens.max(0) as f64;
+    let cached = (cached_input_tokens.max(0) as f64).min(input);
+    let billable_input = (input - cached).max(0.0);
+    let output = output_tokens.max(0) as f64;
+    billable_input / 1_000_000.0 * input_price
+        + cached / 1_000_000.0 * cached_price
+        + output / 1_000_000.0 * output_price
+}
+
+#[derive(Debug, Clone)]
+struct ParsedCodexTurnUsage {
+    ts: i64,
+    turn_id: String,
+    model: String,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    non_cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+}
+
+fn parse_codex_turn_usage(ts: i64, body: &str) -> Option<ParsedCodexTurnUsage> {
+    if !body.contains("codex.turn.token_usage.") {
+        return None;
+    }
+    let turn_id = extract_log_value(body, "turn.id=")
+        .or_else(|| extract_log_value(body, "submission.id="))
+        .unwrap_or("unknown-turn")
+        .to_string();
+    let model = extract_log_value(body, "model=")
+        .map(str::to_string)
+        .unwrap_or_else(|| "unknown".to_string());
+    let input_tokens = extract_log_i64(body, "codex.turn.token_usage.input_tokens=");
+    let cached_input_tokens = extract_log_i64(body, "codex.turn.token_usage.cached_input_tokens=");
+    let non_cached_input_tokens =
+        extract_log_i64(body, "codex.turn.token_usage.non_cached_input_tokens=");
+    let output_tokens = extract_log_i64(body, "codex.turn.token_usage.output_tokens=");
+    let reasoning_output_tokens =
+        extract_log_i64(body, "codex.turn.token_usage.reasoning_output_tokens=");
+    let total_tokens = extract_log_i64(body, "codex.turn.token_usage.total_tokens=");
+    if input_tokens == 0
+        && cached_input_tokens == 0
+        && non_cached_input_tokens == 0
+        && output_tokens == 0
+        && reasoning_output_tokens == 0
+        && total_tokens == 0
+    {
+        return None;
+    }
+    Some(ParsedCodexTurnUsage {
+        ts,
+        turn_id,
+        model,
+        input_tokens,
+        cached_input_tokens,
+        non_cached_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+        total_tokens,
+    })
+}
+
+fn parse_codex_failure(ts: i64, body: &str) -> Option<CodexUsageFailure> {
+    let failed = body.contains("response.failed")
+        || body.contains("\"status\":\"failed\"")
+        || body.contains("\"status\":\"incomplete\"");
+    if !failed {
+        return None;
+    }
+    let response_id = extract_json_string(body, "id")
+        .or_else(|| extract_log_value(body, "response.id=").map(str::to_string))
+        .unwrap_or_default();
+    let turn_id = extract_log_value(body, "turn.id=")
+        .or_else(|| extract_log_value(body, "submission.id="))
+        .unwrap_or_default()
+        .to_string();
+    let model = extract_log_value(body, "model=")
+        .map(str::to_string)
+        .or_else(|| extract_json_string(body, "model"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let status = if body.contains("\"status\":\"incomplete\"") {
+        "incomplete"
+    } else {
+        "failed"
+    }
+    .to_string();
+    let message = extract_json_string(body, "message")
+        .or_else(|| extract_json_string(body, "code"))
+        .unwrap_or_else(|| truncate_log_text(body, 240));
+    Some(CodexUsageFailure {
+        ts,
+        model,
+        turn_id,
+        response_id,
+        status,
+        message,
+    })
+}
+
+fn add_usage_to_rollup(rollup: &mut CodexUsageRollup, usage: &ParsedCodexTurnUsage) {
+    rollup.success_count += 1;
+    rollup.request_count += 1;
+    rollup.input_tokens += usage.input_tokens;
+    rollup.cached_input_tokens += usage.cached_input_tokens;
+    rollup.non_cached_input_tokens += if usage.non_cached_input_tokens > 0 {
+        usage.non_cached_input_tokens
+    } else {
+        (usage.input_tokens - usage.cached_input_tokens).max(0)
+    };
+    rollup.output_tokens += usage.output_tokens;
+    rollup.reasoning_output_tokens += usage.reasoning_output_tokens;
+    rollup.total_tokens += if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage.input_tokens + usage.output_tokens
+    };
+    rollup.api_cost_usd += estimate_weighted_cost(
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        model_api_prices_per_1m(&usage.model, usage.input_tokens),
+    );
+    rollup.codex_credits += estimate_weighted_cost(
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        model_codex_credit_prices_per_1m(&usage.model),
+    );
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -3791,6 +4097,135 @@ async fn repair_codex_project_visibility(
 }
 
 #[command]
+fn get_codex_usage_summary() -> Result<CodexUsageSummary, String> {
+    let log_path = get_codex_logs_path()?;
+    let (today_start_ts, today_end_ts) = local_day_bounds_ts()?;
+    if !log_path.exists() {
+        return Ok(CodexUsageSummary {
+            log_path: log_path.to_string_lossy().to_string(),
+            today_start_ts,
+            today_end_ts,
+            total: CodexUsageRollup::default(),
+            today: CodexUsageRollup::default(),
+            by_model: Vec::new(),
+            recent_failures: Vec::new(),
+            note: "未找到 Codex 本地日志库，启动 Codex 后才会产生统计数据。".to_string(),
+        });
+    }
+
+    let conn = Connection::open_with_flags(
+        &log_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("打开 Codex 日志失败: {}", e))?;
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT ts, feedback_log_body
+            FROM logs
+            WHERE feedback_log_body LIKE '%codex.turn.token_usage.%'
+               OR feedback_log_body LIKE '%response.failed%'
+               OR feedback_log_body LIKE '%"status":"failed"%'
+               OR feedback_log_body LIKE '%"status":"incomplete"%'
+            ORDER BY ts ASC, ts_nanos ASC
+            "#,
+        )
+        .map_err(|e| format!("读取 Codex 日志结构失败: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| format!("查询 Codex 日志失败: {}", e))?;
+
+    let mut usage_by_turn: HashMap<String, ParsedCodexTurnUsage> = HashMap::new();
+    let mut failures_by_key: HashMap<String, CodexUsageFailure> = HashMap::new();
+
+    for row in rows {
+        let (ts, body) = row.map_err(|e| format!("读取 Codex 日志行失败: {}", e))?;
+        if let Some(usage) = parse_codex_turn_usage(ts, &body) {
+            usage_by_turn
+                .entry(usage.turn_id.clone())
+                .and_modify(|existing| {
+                    if usage.total_tokens > existing.total_tokens
+                        || (usage.total_tokens == existing.total_tokens && usage.ts > existing.ts)
+                    {
+                        *existing = usage.clone();
+                    }
+                })
+                .or_insert(usage);
+        }
+        if let Some(failure) = parse_codex_failure(ts, &body) {
+            let key = if !failure.response_id.is_empty() {
+                failure.response_id.clone()
+            } else if !failure.turn_id.is_empty() {
+                format!("turn:{}:{}", failure.turn_id, failure.status)
+            } else {
+                format!("{}:{}:{}", failure.ts, failure.status, failure.message)
+            };
+            failures_by_key.entry(key).or_insert(failure);
+        }
+    }
+
+    let success_turn_ids = usage_by_turn.keys().cloned().collect::<HashSet<_>>();
+    let mut total = CodexUsageRollup::default();
+    let mut today = CodexUsageRollup::default();
+    let mut by_model = HashMap::<String, CodexUsageRollup>::new();
+
+    for usage in usage_by_turn.values() {
+        add_usage_to_rollup(&mut total, usage);
+        add_usage_to_rollup(by_model.entry(usage.model.clone()).or_default(), usage);
+        if usage.ts >= today_start_ts && usage.ts < today_end_ts {
+            add_usage_to_rollup(&mut today, usage);
+        }
+    }
+
+    let mut recent_failures = failures_by_key.into_values().collect::<Vec<_>>();
+    recent_failures.sort_by(|a, b| b.ts.cmp(&a.ts));
+    for failure in &recent_failures {
+        if !failure.turn_id.is_empty() && success_turn_ids.contains(&failure.turn_id) {
+            continue;
+        }
+        total.error_count += 1;
+        total.request_count += 1;
+        let model_usage = by_model.entry(failure.model.clone()).or_default();
+        model_usage.error_count += 1;
+        model_usage.request_count += 1;
+        if failure.ts >= today_start_ts && failure.ts < today_end_ts {
+            today.error_count += 1;
+            today.request_count += 1;
+        }
+    }
+    recent_failures.truncate(10);
+
+    let mut by_model = by_model
+        .into_iter()
+        .map(|(model, usage)| CodexModelUsage { model, usage })
+        .collect::<Vec<_>>();
+    by_model.sort_by(|a, b| {
+        b.usage
+            .total_tokens
+            .cmp(&a.usage.total_tokens)
+            .then_with(|| a.model.cmp(&b.model))
+    });
+
+    Ok(CodexUsageSummary {
+        log_path: log_path.to_string_lossy().to_string(),
+        today_start_ts,
+        today_end_ts,
+        total,
+        today,
+        by_model,
+        recent_failures,
+        note: "统计来自本机 Codex logs_2.sqlite；token 按 turn.id 去重，费用为本地价格表估算，不代表官方账单。".to_string(),
+    })
+}
+
+#[command]
 async fn open_storage_folder(app: AppHandle) -> Result<(), String> {
     let app_data_dir = app
         .path()
@@ -3896,6 +4331,7 @@ pub fn run() {
             set_codex_app_speed,
             get_codex_project_visibility_status,
             repair_codex_project_visibility,
+            get_codex_usage_summary,
             open_storage_folder,
             open_codex_auth_folder,
             is_codex_running,
