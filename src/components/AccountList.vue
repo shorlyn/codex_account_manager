@@ -5,7 +5,10 @@ const props = defineProps<{
   accounts: Account[];
   loading: boolean;
   switchingId: number | null;
-  currentAccountId: string | null;
+  currentAccountRecordId: number | null;
+  viewMode: 'cards' | 'compact' | 'table';
+  emptyTitle?: string;
+  emptyDescription?: string;
 }>();
 
 const emit = defineEmits<{
@@ -14,7 +17,7 @@ const emit = defineEmits<{
   delete: [id: number];
   refresh: [id: number];
   profile: [id: number];
-  reauth: [account: Account];
+  detail: [account: Account];
 }>();
 
 function formatResetTime(timestamp: number): string {
@@ -30,21 +33,36 @@ function formatCheckedTime(value: string): string {
 }
 
 function remaining(used: number): number {
-  return Math.max(0, 100 - used);
+  return Math.max(0, Math.min(100, 100 - used));
 }
 
-function quotaColor(used: number): string {
+function quotaTone(used: number): 'high' | 'medium' | 'low' {
   const rem = 100 - used;
-  if (rem <= 20) return '#ef4444';
-  if (rem <= 50) return '#f59e0b';
-  return '#10b981';
+  if (rem <= 20) return 'low';
+  if (rem <= 50) return 'medium';
+  return 'high';
 }
 
-function quotaGradient(used: number): string {
-  const rem = 100 - used;
-  if (rem <= 20) return 'linear-gradient(90deg, #ef4444, #f87171)';
-  if (rem <= 50) return 'linear-gradient(90deg, #f59e0b, #fbbf24)';
-  return 'linear-gradient(90deg, #10b981, #34d399)';
+function quotaText(used: number): string {
+  return `${remaining(used)}%`;
+}
+
+function quotaWindowLabel(minutes: number | null, fallback: 'primary' | 'secondary', compact = false): string {
+  if (!minutes || minutes <= 0) {
+    return fallback === 'secondary' ? (compact ? '周' : '周额度') : (compact ? '5h' : '5 小时额度');
+  }
+
+  const hourMinutes = 60;
+  const dayMinutes = 24 * hourMinutes;
+  const weekMinutes = 7 * dayMinutes;
+  if (minutes >= 28 * dayMinutes && minutes <= 31 * dayMinutes) return compact ? '月' : '月额度';
+  if (minutes >= weekMinutes - 1) {
+    const weeks = Math.ceil(minutes / weekMinutes);
+    return weeks <= 1 ? (compact ? '周' : '周额度') : `${weeks} 周额度`;
+  }
+  if (minutes >= dayMinutes - 1) return `${Math.ceil(minutes / dayMinutes)}d 额度`;
+  if (minutes >= hourMinutes) return `${Math.ceil(minutes / hourMinutes)}h 额度`;
+  return `${Math.ceil(minutes)}m 额度`;
 }
 
 function getPlanClass(t: string): string {
@@ -55,7 +73,107 @@ function getPlanClass(t: string): string {
 }
 
 function isCurrent(account: Account): boolean {
-  return Boolean(props.currentAccountId && account.account_id === props.currentAccountId);
+  return props.currentAccountRecordId === account.id;
+}
+
+function shortAccountId(value: string | null): string {
+  if (!value) return '未识别账号 ID';
+  if (value.length <= 16) return value;
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+}
+
+function extractHttpStatus(error: string): number | null {
+  const explicitMatch = error.match(/\b(?:http\s*status|status(?:\s*code)?|code|http)\D*(\d{3})\b/i);
+  if (explicitMatch) return Number(explicitMatch[1]);
+  const standaloneMatch = error.match(/\b([45]\d{2})\b/);
+  return standaloneMatch ? Number(standaloneMatch[1]) : null;
+}
+
+function errorReasonLabel(account: Account): string | null {
+  if (!account.has_json_info) return '无凭据';
+  const rawError = account.last_quota_error?.trim();
+  if (!rawError) return null;
+
+  const error = rawError.toLowerCase();
+  const status = extractHttpStatus(rawError);
+
+  if (
+    status === 401
+    || error.includes('unauthorized')
+    || error.includes('auth')
+    || error.includes('token')
+    || error.includes('refresh')
+    || error.includes('授权')
+    || error.includes('登录')
+  ) {
+    return '401 授权无效';
+  }
+
+  if (
+    status === 402
+    || error.includes('payment required')
+    || error.includes('billing')
+    || error.includes('insufficient_quota')
+    || error.includes('quota exceeded')
+    || error.includes('额度')
+    || error.includes('付款')
+  ) {
+    return '402 额度/付款';
+  }
+
+  if (status === 403 || error.includes('forbidden') || error.includes('permission') || error.includes('权限')) {
+    return '403 权限拒绝';
+  }
+
+  if (status === 429 || error.includes('rate limit') || error.includes('too many requests') || error.includes('频率')) {
+    return '429 频率限制';
+  }
+
+  if (
+    error.includes('timeout')
+    || error.includes('network')
+    || error.includes('connection')
+    || error.includes('dns')
+    || error.includes('timed out')
+    || error.includes('网络')
+    || error.includes('超时')
+  ) {
+    return '网络/超时';
+  }
+
+  if (error.includes('json') || error.includes('parse') || error.includes('解析')) {
+    return '数据解析';
+  }
+
+  return status ? `${status} 其他错误` : '其他错误';
+}
+
+function isQuotaDepleted(account: Account): boolean {
+  if (!account.has_json_info || account.last_quota_error) return false;
+  const primaryEmpty = account.primary_window_present && remaining(account.primary_used_percent) <= 0;
+  const secondaryEmpty = account.secondary_window_present && remaining(account.secondary_used_percent) <= 0;
+  return primaryEmpty || secondaryEmpty;
+}
+
+function isSoftQuotaError(account: Account): boolean {
+  const label = errorReasonLabel(account);
+  return label === '网络/超时' || label === '数据解析' || label === '其他错误' || Boolean(label?.match(/^[45]\d{2} 其他错误$/));
+}
+
+function statusLabel(account: Account): string {
+  if (!account.has_json_info) return '无凭据';
+  if (account.last_quota_error) return errorReasonLabel(account) ?? '异常';
+  if (isQuotaDepleted(account)) return '额度耗尽';
+  if (isCurrent(account)) return '当前';
+  return '可用';
+}
+
+function statusClass(account: Account): string {
+  if (!account.has_json_info) return 'status-empty';
+  if (account.last_quota_error) return isSoftQuotaError(account) ? 'status-warning' : 'status-error';
+  if (isQuotaDepleted(account)) return 'status-error';
+  if (isCurrent(account)) return 'status-current';
+  return 'status-ok';
 }
 </script>
 
@@ -70,104 +188,97 @@ function isCurrent(account: Account): boolean {
     <!-- Empty -->
     <div v-else-if="accounts.length === 0" class="empty-state">
       <div class="empty-illustration">
-        <div class="empty-circle">
-          <div class="empty-circle-inner">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
-              <circle cx="9" cy="7" r="4"/>
-              <line x1="19" y1="8" x2="19" y2="14"/>
-              <line x1="22" y1="11" x2="16" y2="11"/>
-            </svg>
-          </div>
-        </div>
-        <div class="empty-dots">
-          <span></span><span></span><span></span>
+        <div class="empty-mark">
+          <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="16" rx="3"/>
+            <path d="M7 9h10"/>
+            <path d="M7 13h6"/>
+            <path d="M16 17l2 2 4-4"/>
+          </svg>
         </div>
       </div>
-      <h3>还没有账号</h3>
-      <p>点击右上角「添加账号」开始管理</p>
+      <h3>{{ emptyTitle || '还没有账号' }}</h3>
+      <p>{{ emptyDescription || '使用 OAuth 登录或导入 auth.json 后，账号会出现在这里' }}</p>
     </div>
 
     <!-- Cards -->
-    <div v-else class="card-grid">
+    <div v-else-if="viewMode === 'cards'" class="card-grid">
       <div v-for="account in accounts" :key="account.id" :class="['card', { 'card-active': isCurrent(account) }]">
-        <!-- Top accent -->
         <div class="card-accent"></div>
 
-        <!-- Current indicator -->
-        <div v-if="isCurrent(account)" class="active-indicator">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="20 6 9 17 4 12"/>
-          </svg>
-          当前使用
-        </div>
-
-        <!-- Header -->
         <div class="card-header">
           <div class="card-title-row">
-            <h3>{{ account.name }}</h3>
-            <span :class="['badge', getPlanClass(account.plan_type)]">
-              {{ account.plan_type || '—' }}
-            </span>
+            <div class="account-title">
+              <h3 :title="account.name">{{ account.name }}</h3>
+              <span class="account-id" :title="account.account_id || ''">{{ shortAccountId(account.account_id) }}</span>
+            </div>
+            <div class="card-tags">
+              <span v-if="isCurrent(account)" class="status-tag current-tag">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                当前
+              </span>
+              <span :class="['badge', getPlanClass(account.plan_type)]">
+                {{ account.plan_type || 'unknown' }}
+              </span>
+            </div>
           </div>
-          <span v-if="account.activation_date" class="card-date">{{ account.activation_date }}</span>
+          <div class="card-meta">
+            <span v-if="account.activation_date">开通 {{ account.activation_date }}</span>
+            <span>记录 #{{ account.id }}</span>
+          </div>
         </div>
 
-        <!-- Body -->
         <div class="card-body">
-          <!-- 5h -->
-          <div class="quota-block">
+          <div v-if="account.primary_window_present" :class="['quota-block', `quota-${quotaTone(account.primary_used_percent)}`]">
             <div class="quota-head">
-              <span class="quota-label">5 小时额度</span>
-              <span class="quota-pct" :style="{ color: quotaColor(account.primary_used_percent) }">
-                {{ remaining(account.primary_used_percent) }}%
-              </span>
+              <span class="quota-label">{{ quotaWindowLabel(account.primary_window_minutes, 'primary') }}</span>
+              <span class="quota-pct">{{ quotaText(account.primary_used_percent) }}</span>
             </div>
             <div class="bar-track">
               <div
                 class="bar-fill"
-                :style="{
-                  width: remaining(account.primary_used_percent) + '%',
-                  background: quotaGradient(account.primary_used_percent)
-                }"
-              >
-                <div class="bar-glow"></div>
-              </div>
+                :style="{ width: remaining(account.primary_used_percent) + '%' }"
+              ></div>
             </div>
             <span class="quota-reset">刷新 {{ formatResetTime(account.primary_reset_at) }}</span>
           </div>
 
-          <!-- Weekly -->
-          <div class="quota-block">
+          <div v-if="account.secondary_window_present" :class="['quota-block', `quota-${quotaTone(account.secondary_used_percent)}`]">
             <div class="quota-head">
-              <span class="quota-label">周额度</span>
-              <span class="quota-pct" :style="{ color: quotaColor(account.secondary_used_percent) }">
-                {{ remaining(account.secondary_used_percent) }}%
-              </span>
+              <span class="quota-label">{{ quotaWindowLabel(account.secondary_window_minutes, 'secondary') }}</span>
+              <span class="quota-pct">{{ quotaText(account.secondary_used_percent) }}</span>
             </div>
             <div class="bar-track">
               <div
                 class="bar-fill"
-                :style="{
-                  width: remaining(account.secondary_used_percent) + '%',
-                  background: quotaGradient(account.secondary_used_percent)
-                }"
-              >
-                <div class="bar-glow"></div>
-              </div>
+                :style="{ width: remaining(account.secondary_used_percent) + '%' }"
+              ></div>
             </div>
             <span class="quota-reset">刷新 {{ formatResetTime(account.secondary_reset_at) }}</span>
           </div>
 
           <div :class="['quota-status', { 'quota-status-error': account.last_quota_error }]">
-            <span>上次检查 {{ formatCheckedTime(account.last_quota_checked_at) }}</span>
+            <span class="quota-status-line">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <polyline points="12 6 12 12 16 14"/>
+              </svg>
+              上次检查 {{ formatCheckedTime(account.last_quota_checked_at) }}
+            </span>
             <span v-if="account.last_quota_error" class="quota-error" :title="account.last_quota_error">
-              {{ account.last_quota_error }}
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+              <span class="quota-error-reason">{{ errorReasonLabel(account) }}</span>
+              <span>{{ account.last_quota_error }}</span>
             </span>
           </div>
         </div>
 
-        <!-- Footer -->
         <div class="card-footer">
           <button
             class="btn-run"
@@ -181,7 +292,7 @@ function isCurrent(account: Account): boolean {
             <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
               <polygon points="6 3 20 12 6 21 6 3"/>
             </svg>
-            <span>{{ switchingId === account.id ? '切换中' : '运行' }}</span>
+            <span>{{ switchingId === account.id ? '切换中' : (isCurrent(account) ? '已在运行' : '运行') }}</span>
           </button>
           <div class="btn-group">
             <button class="btn-icon btn-refresh" title="刷新额度" @click="emit('refresh', account.id)">
@@ -195,11 +306,11 @@ function isCurrent(account: Account): boolean {
                 <path d="M4 21a8 8 0 0 1 16 0"/>
               </svg>
             </button>
-            <button class="btn-icon btn-reauth" title="重新授权" @click="emit('reauth', account)">
+            <button class="btn-icon btn-detail" title="详情" @click="emit('detail', account)">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M15 7h1a5 5 0 0 1 0 10h-1"/>
-                <path d="M9 7H8a5 5 0 0 0 0 10h1"/>
-                <line x1="8" y1="12" x2="16" y2="12"/>
+                <circle cx="12" cy="12" r="10"/>
+                <path d="M12 16v-4"/>
+                <path d="M12 8h.01"/>
               </svg>
             </button>
             <button class="btn-icon btn-edit" title="编辑" @click="emit('edit', account)">
@@ -217,6 +328,184 @@ function isCurrent(account: Account): boolean {
         </div>
       </div>
     </div>
+
+    <!-- Compact -->
+    <div v-else-if="viewMode === 'compact'" class="compact-list">
+      <div
+        v-for="account in accounts"
+        :key="account.id"
+        :class="['compact-row', { current: isCurrent(account), disabled: !account.has_json_info }]"
+      >
+        <div class="compact-main">
+          <div class="compact-title">
+            <span :class="['table-status-dot', statusClass(account)]"></span>
+            <strong :title="account.name">{{ account.name }}</strong>
+            <span v-if="isCurrent(account)" class="compact-current">当前</span>
+            <span :class="['badge', getPlanClass(account.plan_type)]">{{ account.plan_type || 'unknown' }}</span>
+          </div>
+          <span class="compact-sub" :title="account.account_id || ''">
+            {{ shortAccountId(account.account_id) }} · #{{ account.id }} · {{ formatCheckedTime(account.last_quota_checked_at) }}
+          </span>
+        </div>
+
+        <div class="compact-quotas">
+          <div class="compact-quota">
+            <span>{{ quotaWindowLabel(account.primary_window_minutes, 'primary', true) }}</span>
+            <strong :class="`quota-text-${quotaTone(account.primary_used_percent)}`">{{ quotaText(account.primary_used_percent) }}</strong>
+          </div>
+          <div v-if="account.secondary_window_present" class="compact-quota">
+            <span>{{ quotaWindowLabel(account.secondary_window_minutes, 'secondary', true) }}</span>
+            <strong :class="`quota-text-${quotaTone(account.secondary_used_percent)}`">{{ quotaText(account.secondary_used_percent) }}</strong>
+          </div>
+        </div>
+
+        <div class="compact-actions">
+          <button
+            class="compact-run"
+            :disabled="switchingId === account.id || !account.has_json_info"
+            :title="!account.has_json_info ? 'JSON 为空' : '切换账号'"
+            @click="emit('run', account.id)"
+          >
+            {{ switchingId === account.id ? '切换中' : (isCurrent(account) ? '运行中' : '运行') }}
+          </button>
+          <button class="btn-icon btn-refresh" title="刷新额度" @click="emit('refresh', account.id)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button class="btn-icon btn-detail" title="详情" @click="emit('detail', account)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M12 16v-4"/>
+              <path d="M12 8h.01"/>
+            </svg>
+          </button>
+          <button class="btn-icon btn-edit" title="编辑" @click="emit('edit', account)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Table -->
+    <div v-else class="account-table-wrap">
+      <table class="account-table">
+        <thead>
+          <tr>
+            <th>账号</th>
+            <th>状态</th>
+            <th>额度一</th>
+            <th>额度二</th>
+            <th>上次检查</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="account in accounts"
+            :key="account.id"
+            :class="{ current: isCurrent(account), disabled: !account.has_json_info }"
+          >
+            <td>
+              <div class="table-account">
+                <strong :title="account.name">{{ account.name }}</strong>
+                <span :title="account.account_id || ''">{{ shortAccountId(account.account_id) }} · #{{ account.id }}</span>
+              </div>
+            </td>
+            <td>
+              <div class="table-status">
+                <span :class="['table-status-dot', statusClass(account)]"></span>
+                <span>{{ statusLabel(account) }}</span>
+                <span :class="['badge', getPlanClass(account.plan_type)]">{{ account.plan_type || 'unknown' }}</span>
+              </div>
+            </td>
+            <td>
+              <div v-if="account.primary_window_present" class="table-quota">
+                <small>{{ quotaWindowLabel(account.primary_window_minutes, 'primary') }}</small>
+                <div class="table-quota-line">
+                  <strong :class="`quota-text-${quotaTone(account.primary_used_percent)}`">{{ quotaText(account.primary_used_percent) }}</strong>
+                  <small>{{ formatResetTime(account.primary_reset_at) }}</small>
+                </div>
+                <div class="bar-track table-track">
+                  <div :class="['bar-fill', `fill-${quotaTone(account.primary_used_percent)}`]" :style="{ width: remaining(account.primary_used_percent) + '%' }"></div>
+                </div>
+              </div>
+              <span v-else class="table-quota-empty">-</span>
+            </td>
+            <td>
+              <div v-if="account.secondary_window_present" class="table-quota">
+                <small>{{ quotaWindowLabel(account.secondary_window_minutes, 'secondary') }}</small>
+                <div class="table-quota-line">
+                  <strong :class="`quota-text-${quotaTone(account.secondary_used_percent)}`">{{ quotaText(account.secondary_used_percent) }}</strong>
+                  <small>{{ formatResetTime(account.secondary_reset_at) }}</small>
+                </div>
+                <div class="bar-track table-track">
+                  <div :class="['bar-fill', `fill-${quotaTone(account.secondary_used_percent)}`]" :style="{ width: remaining(account.secondary_used_percent) + '%' }"></div>
+                </div>
+              </div>
+              <span v-else class="table-quota-empty">-</span>
+            </td>
+            <td>
+              <div class="table-checked" :title="account.last_quota_error || ''">
+                <span>{{ formatCheckedTime(account.last_quota_checked_at) }}</span>
+                <small v-if="account.last_quota_error">
+                  {{ errorReasonLabel(account) }} · {{ account.last_quota_error }}
+                </small>
+              </div>
+            </td>
+            <td>
+              <div class="table-actions">
+                <button
+                  class="btn-icon btn-run-icon"
+                  :disabled="switchingId === account.id || !account.has_json_info"
+                  :title="!account.has_json_info ? 'JSON 为空' : '切换账号'"
+                  @click="emit('run', account.id)"
+                >
+                  <svg v-if="switchingId === account.id" class="spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                  </svg>
+                  <svg v-else width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                    <polygon points="6 3 20 12 6 21 6 3"/>
+                  </svg>
+                </button>
+                <button class="btn-icon btn-refresh" title="刷新额度" @click="emit('refresh', account.id)">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                  </svg>
+                </button>
+                <button class="btn-icon btn-profile" title="刷新资料" @click="emit('profile', account.id)">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="8" r="4"/>
+                    <path d="M4 21a8 8 0 0 1 16 0"/>
+                  </svg>
+                </button>
+                <button class="btn-icon btn-detail" title="详情" @click="emit('detail', account)">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"/>
+                    <path d="M12 16v-4"/>
+                    <path d="M12 8h.01"/>
+                  </svg>
+                </button>
+                <button class="btn-icon btn-edit" title="编辑" @click="emit('edit', account)">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                  </svg>
+                </button>
+                <button class="btn-icon btn-delete" title="删除" @click="emit('delete', account.id)">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  </svg>
+                </button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>
 
@@ -227,35 +516,376 @@ function isCurrent(account: Account): boolean {
 .card-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 18px;
+  gap: 16px;
+}
+
+/* ── Table ────────────────────────────── */
+.account-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.account-table {
+  width: 100%;
+  min-width: 1280px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.account-table th {
+  padding: 11px 14px;
+  background: #f8fafc;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: left;
+  letter-spacing: 0;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.account-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-light);
+  color: var(--text);
+  font-size: 12px;
+  vertical-align: middle;
+}
+
+.account-table tr:last-child td {
+  border-bottom: none;
+}
+
+.account-table tr.current {
+  background: #ecfdf5;
+}
+
+.account-table tr.disabled {
+  opacity: 0.62;
+}
+
+.account-table tr:hover {
+  background: #f8fafc;
+}
+
+.account-table th:nth-child(1),
+.account-table td:nth-child(1) {
+  width: 18%;
+}
+
+.account-table th:nth-child(2),
+.account-table td:nth-child(2) {
+  width: 13%;
+}
+
+.account-table th:nth-child(3),
+.account-table td:nth-child(3),
+.account-table th:nth-child(4),
+.account-table td:nth-child(4) {
+  width: 13%;
+}
+
+.account-table th:nth-child(5),
+.account-table td:nth-child(5) {
+  width: 17%;
+}
+
+.account-table th:nth-child(6),
+.account-table td:nth-child(6) {
+  width: 236px;
+}
+
+.table-account,
+.table-checked {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.table-account strong,
+.table-checked span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.table-account span,
+.table-checked small,
+.table-quota small {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.table-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.table-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+}
+
+.status-ok {
+  background: #10b981;
+}
+
+.status-current {
+  background: var(--primary);
+}
+
+.status-error,
+.status-empty {
+  background: #ef4444;
+}
+
+.status-warning {
+  background: #f59e0b;
+}
+
+.table-quota {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.table-quota-empty {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.table-quota-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.table-quota-line strong {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.table-track {
+  height: 5px;
+}
+
+.bar-fill.fill-high {
+  background: #10b981;
+}
+
+.bar-fill.fill-medium {
+  background: #f59e0b;
+}
+
+.bar-fill.fill-low {
+  background: #ef4444;
+}
+
+.quota-text-high {
+  color: #059669;
+}
+
+.quota-text-medium {
+  color: #d97706;
+}
+
+.quota-text-low {
+  color: #dc2626;
+}
+
+.table-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  width: 100%;
+}
+
+.table-actions .btn-icon {
+  width: 30px;
+  height: 30px;
+}
+
+.btn-run-icon {
+  color: var(--primary);
+}
+
+.btn-run-icon:hover:not(:disabled) {
+  background: var(--primary-light);
+  border-color: #c7d2fe;
+}
+
+/* ── Compact ──────────────────────────── */
+.compact-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.compact-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  min-height: 66px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.compact-row:hover {
+  border-color: #cbd5e1;
+  box-shadow: var(--shadow-sm);
+}
+
+.compact-row.current {
+  border-color: rgba(16, 185, 129, 0.55);
+  background: #ecfdf5;
+}
+
+.compact-row.disabled {
+  opacity: 0.62;
+}
+
+.compact-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.compact-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.compact-title strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-current {
+  padding: 2px 6px;
+  border: 1px solid #a7f3d0;
+  border-radius: 999px;
+  background: var(--success-light);
+  color: #047857;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.compact-sub {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.compact-quotas,
+.compact-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.compact-quota {
+  min-width: 54px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+}
+
+.compact-quota span {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.compact-quota strong {
+  display: block;
+  margin-top: 2px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.compact-run {
+  height: 32px;
+  min-width: 66px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.compact-run:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.compact-run:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* ── Card ─────────────────────────────── */
 .card {
   position: relative;
   background: var(--surface);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   overflow: hidden;
-  transition: all 0.3s var(--ease-out);
+  transition: border-color 0.2s var(--ease-out), box-shadow 0.2s var(--ease-out), transform 0.2s var(--ease-out);
   box-shadow: var(--shadow-sm);
+  min-height: 302px;
+  display: flex;
+  flex-direction: column;
 }
 
 .card:hover {
-  border-color: #c7d2fe;
-  box-shadow: var(--shadow-md), 0 0 0 1px rgba(99, 102, 241, 0.06);
+  border-color: #cbd5e1;
+  box-shadow: var(--shadow-md);
   transform: translateY(-2px);
 }
 
 /* Current active card */
 .card-active {
-  border-color: #a7f3d0;
-  box-shadow: var(--shadow-md), 0 0 0 1px rgba(16, 185, 129, 0.15), 0 0 20px rgba(16, 185, 129, 0.06);
+  border-color: rgba(16, 185, 129, 0.62);
+  box-shadow: var(--shadow-md), 0 0 0 2px rgba(16, 185, 129, 0.1);
 }
 
 .card-active:hover {
-  border-color: #6ee7b7;
-  box-shadow: var(--shadow-md), 0 0 0 1px rgba(16, 185, 129, 0.2), 0 0 24px rgba(16, 185, 129, 0.1);
+  border-color: rgba(16, 185, 129, 0.78);
+  box-shadow: var(--shadow-md), 0 0 0 2px rgba(16, 185, 129, 0.14);
 }
 
 .card-active .card-accent {
@@ -263,101 +893,146 @@ function isCurrent(account: Account): boolean {
   opacity: 1;
 }
 
-.active-indicator {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 6px 14px;
-  background: linear-gradient(90deg, #ecfdf5, #d1fae5);
-  color: #059669;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
 .card-accent {
   height: 3px;
-  background: linear-gradient(90deg, var(--primary), var(--accent));
-  opacity: 0;
-  transition: opacity 0.3s var(--ease-out);
+  background: var(--border-light);
+  transition: background 0.2s var(--ease-out);
 }
 
 .card:hover .card-accent {
-  opacity: 1;
+  background: linear-gradient(90deg, var(--primary), var(--accent));
 }
 
 /* ── Card header ──────────────────────── */
 .card-header {
-  padding: 18px 20px 0;
+  padding: 16px 18px 0;
 }
 
 .card-title-row {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
   min-width: 0;
 }
 
-.card-title-row h3 {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text);
-  margin: 0;
-  letter-spacing: -0.01em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.account-title {
   min-width: 0;
   flex: 1;
 }
 
-.card-date {
-  display: block;
-  font-size: 12px;
+.account-title h3 {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0;
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-id,
+.card-meta {
   color: var(--text-tertiary);
-  margin-top: 3px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.account-id {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card-tags {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+  max-width: 45%;
+}
+
+.card-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.status-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.current-tag {
+  background: var(--success-light);
+  color: #047857;
+  border: 1px solid #a7f3d0;
 }
 
 /* ── Badge ────────────────────────────── */
 .badge {
   display: inline-flex;
   align-items: center;
-  padding: 2px 10px;
-  border-radius: 20px;
+  justify-content: center;
+  padding: 3px 9px;
+  border-radius: 999px;
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
+  line-height: 1;
   flex-shrink: 0;
 }
 
 .plan-free {
   background: #f1f5f9;
   color: #64748b;
+  border: 1px solid #e2e8f0;
 }
 
 .plan-plus {
   background: #eff6ff;
   color: #3b82f6;
+  border: 1px solid #bfdbfe;
 }
 
 .plan-pro {
   background: #faf5ff;
   color: #9333ea;
+  border: 1px solid #e9d5ff;
 }
 
 /* ── Card body ────────────────────────── */
 .card-body {
-  padding: 16px 20px;
+  padding: 16px 18px;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 12px;
+  flex: 1;
 }
 
 .quota-block {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 6px;
+  padding: 10px 11px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #fafbfc;
 }
 
 .quota-head {
@@ -368,24 +1043,23 @@ function isCurrent(account: Account): boolean {
 
 .quota-label {
   font-size: 12px;
-  font-weight: 500;
-  color: var(--text-tertiary);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  font-weight: 700;
+  color: var(--text-secondary);
+  letter-spacing: 0;
 }
 
 .quota-pct {
-  font-size: 22px;
+  font-size: 13px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   line-height: 1;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
 }
 
 /* ── Progress bar ─────────────────────── */
 .bar-track {
-  height: 7px;
-  background: var(--border-light);
+  height: 6px;
+  background: #e5e7eb;
   border-radius: 4px;
   overflow: hidden;
 }
@@ -394,15 +1068,29 @@ function isCurrent(account: Account): boolean {
   position: relative;
   height: 100%;
   border-radius: 4px;
-  transition: width 0.6s var(--ease-out);
+  background: #10b981;
+  transition: width 0.3s var(--ease-out);
   min-width: 2px;
 }
 
-.bar-glow {
-  position: absolute;
-  inset: 0;
-  border-radius: 4px;
-  background: linear-gradient(180deg, rgba(255,255,255,0.35) 0%, transparent 100%);
+.quota-medium .bar-fill {
+  background: #f59e0b;
+}
+
+.quota-low .bar-fill {
+  background: #ef4444;
+}
+
+.quota-high .quota-pct {
+  color: #059669;
+}
+
+.quota-medium .quota-pct {
+  color: #d97706;
+}
+
+.quota-low .quota-pct {
+  color: #dc2626;
 }
 
 .quota-reset {
@@ -414,20 +1102,31 @@ function isCurrent(account: Account): boolean {
 .quota-status {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  padding: 8px 10px;
+  gap: 5px;
+  padding: 9px 10px;
   border-radius: var(--radius-sm);
-  background: var(--border-light);
+  border: 1px solid var(--border-light);
+  background: var(--surface);
   color: var(--text-tertiary);
   font-size: 11px;
   line-height: 1.35;
 }
 
 .quota-status-error {
+  border-color: #fecaca;
   background: var(--danger-light);
   color: var(--danger);
 }
 
+.quota-status-line,
+.quota-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.quota-error span,
 .quota-error {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -435,19 +1134,26 @@ function isCurrent(account: Account): boolean {
   font-weight: 600;
 }
 
+.quota-error-reason {
+  flex-shrink: 0;
+  color: #b91c1c;
+}
+
 /* ── Card footer ──────────────────────── */
 .card-footer {
-  padding: 12px 20px;
+  padding: 12px 18px;
   border-top: 1px solid var(--border-light);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  background: linear-gradient(180deg, #fafbfc 0%, #f8fafc 100%);
+  gap: 10px;
+  background: #fafafa;
 }
 
 .btn-group {
   display: flex;
-  gap: 6px;
+  gap: 5px;
+  flex-shrink: 0;
 }
 
 /* ── Buttons ──────────────────────────── */
@@ -455,21 +1161,22 @@ function isCurrent(account: Account): boolean {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  padding: 8px 18px;
-  background: linear-gradient(135deg, var(--primary), var(--primary-hover));
+  min-width: 92px;
+  justify-content: center;
+  padding: 8px 14px;
+  background: var(--primary);
   color: #fff;
   border: none;
   border-radius: var(--radius-sm);
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 700;
   cursor: pointer;
   transition: all 0.2s var(--ease-out);
-  box-shadow: 0 2px 6px rgba(99, 102, 241, 0.2);
+  box-shadow: none;
 }
 
 .btn-run:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+  background: var(--primary-hover);
 }
 
 .btn-run:active:not(:disabled) {
@@ -482,8 +1189,8 @@ function isCurrent(account: Account): boolean {
 }
 
 .btn-icon {
-  width: 34px;
-  height: 34px;
+  width: 32px;
+  height: 32px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface);
@@ -513,11 +1220,11 @@ function isCurrent(account: Account): boolean {
   color: #0d9488;
 }
 
-.btn-reauth { color: var(--success); }
-.btn-reauth:hover:not(:disabled) {
-  background: var(--success-light);
-  border-color: #bbf7d0;
-  color: #059669;
+.btn-detail { color: #475569; }
+.btn-detail:hover:not(:disabled) {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+  color: #0f172a;
 }
 
 .btn-edit { color: var(--warning); }
@@ -540,55 +1247,22 @@ function isCurrent(account: Account): boolean {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 100px 20px;
+  padding: 96px 20px;
   text-align: center;
 }
 
-.empty-illustration {
-  margin-bottom: 24px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-}
-
-.empty-circle {
-  width: 88px;
-  height: 88px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, var(--primary-light), #e0e7ff);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  animation: float 3s ease-in-out infinite;
-}
-
-.empty-circle-inner {
-  width: 60px;
-  height: 60px;
-  border-radius: 50%;
-  background: var(--surface);
+.empty-mark {
+  width: 72px;
+  height: 72px;
+  border-radius: var(--radius-sm);
+  border: 1px solid #c7d2fe;
+  background: var(--primary-light);
   color: var(--primary);
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: var(--shadow);
+  margin-bottom: 20px;
 }
-
-.empty-dots {
-  display: flex;
-  gap: 6px;
-}
-
-.empty-dots span {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--border);
-}
-
-.empty-dots span:nth-child(2) { animation: dot-pulse 1.5s ease-in-out 0.2s infinite; }
-.empty-dots span:nth-child(3) { animation: dot-pulse 1.5s ease-in-out 0.4s infinite; }
 
 .empty-state h3 {
   font-size: 18px;
@@ -621,16 +1295,6 @@ function isCurrent(account: Account): boolean {
   to { transform: rotate(360deg); }
 }
 
-@keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-6px); }
-}
-
-@keyframes dot-pulse {
-  0%, 100% { opacity: 0.3; transform: scale(1); }
-  50% { opacity: 1; transform: scale(1.2); }
-}
-
 @media (max-width: 980px) {
   .card-grid {
     grid-template-columns: repeat(2, 1fr);
@@ -640,6 +1304,21 @@ function isCurrent(account: Account): boolean {
 @media (max-width: 640px) {
   .card-grid {
     grid-template-columns: 1fr;
+  }
+
+  .compact-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .compact-quotas,
+  .compact-actions {
+    justify-content: space-between;
+  }
+
+  .compact-quota,
+  .compact-run {
+    flex: 1;
   }
 
   .card-footer {
@@ -653,7 +1332,11 @@ function isCurrent(account: Account): boolean {
   }
 
   .btn-group {
-    justify-content: flex-end;
+    justify-content: space-between;
+  }
+
+  .btn-icon {
+    flex: 1;
   }
 }
 </style>

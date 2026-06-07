@@ -8,7 +8,7 @@ use base64::{
     Engine as _,
 };
 use rand_core::{OsRng, RngCore};
-use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,20 +27,22 @@ use tauri::{
 
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
-    plan_type: String,
-    rate_limit: RateLimit,
+    plan_type: Option<String>,
+    rate_limit: Option<RateLimit>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RateLimit {
-    primary_window: Window,
-    secondary_window: Window,
+    primary_window: Option<Window>,
+    secondary_window: Option<Window>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Window {
-    used_percent: i32,
-    reset_at: i64,
+    used_percent: Option<i32>,
+    limit_window_seconds: Option<i64>,
+    reset_after_seconds: Option<i64>,
+    reset_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -48,8 +50,12 @@ pub struct QuotaInfo {
     pub plan_type: String,
     pub primary_used_percent: i32,
     pub primary_reset_at: i64,
+    pub primary_window_minutes: Option<i64>,
+    pub primary_window_present: bool,
     pub secondary_used_percent: i32,
     pub secondary_reset_at: i64,
+    pub secondary_window_minutes: Option<i64>,
+    pub secondary_window_present: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -65,6 +71,58 @@ pub struct MigrationStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OperationLog {
+    pub id: i64,
+    pub level: String,
+    pub action: String,
+    pub account_id: Option<i64>,
+    pub account_name: String,
+    pub account_identifier: String,
+    pub stage: String,
+    pub message: String,
+    pub details: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexAppSpeed {
+    Standard,
+    Fast,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexAppSpeedConfig {
+    pub speed: CodexAppSpeed,
+    pub config_path: String,
+    pub global_state_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexProjectVisibilityStatus {
+    pub project_path: String,
+    pub config_path: String,
+    pub is_trusted: bool,
+    pub changed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AccountHealthItem {
+    pub key: String,
+    pub label: String,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AccountHealthReport {
+    pub account_id: i64,
+    pub checked_at: String,
+    pub summary_status: String,
+    pub items: Vec<AccountHealthItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Account {
     pub id: i64,
     pub name: String,
@@ -74,8 +132,12 @@ pub struct Account {
     pub plan_type: String,
     pub primary_used_percent: i32,
     pub primary_reset_at: i64,
+    pub primary_window_minutes: Option<i64>,
+    pub primary_window_present: bool,
     pub secondary_used_percent: i32,
     pub secondary_reset_at: i64,
+    pub secondary_window_minutes: Option<i64>,
+    pub secondary_window_present: bool,
     pub last_quota_checked_at: String,
     pub last_quota_error: String,
     pub created_at: String,
@@ -90,18 +152,46 @@ struct BackupAccount {
     plan_type: String,
     primary_used_percent: i32,
     primary_reset_at: i64,
+    #[serde(default)]
+    primary_window_minutes: Option<i64>,
+    #[serde(default = "default_quota_window_present")]
+    primary_window_present: bool,
     secondary_used_percent: i32,
     secondary_reset_at: i64,
+    #[serde(default)]
+    secondary_window_minutes: Option<i64>,
+    #[serde(default = "default_quota_window_present")]
+    secondary_window_present: bool,
     #[serde(default)]
     last_quota_checked_at: String,
     #[serde(default)]
     last_quota_error: String,
 }
 
+fn default_quota_window_present() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct BackupPayload {
     version: u32,
     accounts: Vec<BackupAccount>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BackupPreview {
+    pub version: u32,
+    pub total_accounts: usize,
+    pub duplicate_accounts: usize,
+    pub new_accounts: usize,
+    pub account_names: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ImportBackupResult {
+    pub imported: usize,
+    pub skipped: usize,
+    pub updated: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +250,16 @@ const CODEX_OAUTH_SCOPES: &str = "openid profile email offline_access";
 const CODEX_OAUTH_ORIGINATOR: &str = "codex_vscode";
 const CODEX_OAUTH_CALLBACK_PORT: u16 = 1455;
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
+const CODEX_CONFIG_FILE: &str = "config.toml";
+const CODEX_GLOBAL_STATE_FILE: &str = ".codex-global-state.json";
+const CODEX_DESKTOP_SECTION: &str = "desktop";
+const CODEX_SERVICE_TIER_KEY: &str = "default-service-tier";
+const CODEX_PRIORITY_SERVICE_TIER: &str = "priority";
+const CODEX_ATOM_STATE_KEY: &str = "electron-persisted-atom-state";
+const CODEX_USER_CHANGED_TIER_KEY: &str = "has-user-changed-service-tier";
+const CODEX_PROJECTS_SECTION_PREFIX: &str = "projects.";
+const CODEX_TRUST_LEVEL_KEY: &str = "trust_level";
+const CODEX_TRUSTED_LEVEL: &str = "trusted";
 
 static OAUTH_STATE: Mutex<Option<OAuthState>> = Mutex::new(None);
 
@@ -176,6 +276,324 @@ fn get_auth_path() -> Result<std::path::PathBuf, String> {
     Ok(std::path::PathBuf::from(home)
         .join(".codex")
         .join("auth.json"))
+}
+
+fn get_codex_home_path() -> Result<std::path::PathBuf, String> {
+    Ok(std::path::PathBuf::from(get_home_dir()?).join(".codex"))
+}
+
+fn get_codex_config_path() -> Result<std::path::PathBuf, String> {
+    Ok(get_codex_home_path()?.join(CODEX_CONFIG_FILE))
+}
+
+fn get_codex_global_state_path() -> Result<std::path::PathBuf, String> {
+    Ok(get_codex_home_path()?.join(CODEX_GLOBAL_STATE_FILE))
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    line.split('#').next().unwrap_or(line).trim()
+}
+
+fn toml_section_name(line: &str) -> Option<&str> {
+    let trimmed = strip_toml_comment(line);
+    trimmed
+        .strip_prefix('[')
+        .and_then(|item| item.strip_suffix(']'))
+        .map(str::trim)
+}
+
+fn toml_string_value_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let trimmed = strip_toml_comment(line);
+    let (left, right) = trimmed.split_once('=')?;
+    if left.trim() != key {
+        return None;
+    }
+    Some(right.trim().trim_matches('"'))
+}
+
+fn normalize_service_tier_speed(value: Option<&str>) -> CodexAppSpeed {
+    match value {
+        Some("fast") | Some("priority") | Some("flex") => CodexAppSpeed::Fast,
+        _ => CodexAppSpeed::Standard,
+    }
+}
+
+fn read_service_tier_from_config(content: &str) -> Option<String> {
+    let mut in_desktop = false;
+    for line in content.lines() {
+        if let Some(section) = toml_section_name(line) {
+            in_desktop = section == CODEX_DESKTOP_SECTION;
+            continue;
+        }
+        if in_desktop {
+            if let Some(value) = toml_string_value_for_key(line, CODEX_SERVICE_TIER_KEY) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn service_tier_line() -> String {
+    format!(
+        "{} = \"{}\"",
+        CODEX_SERVICE_TIER_KEY, CODEX_PRIORITY_SERVICE_TIER
+    )
+}
+
+fn trusted_project_line() -> String {
+    format!("{} = \"{}\"", CODEX_TRUST_LEVEL_KEY, CODEX_TRUSTED_LEVEL)
+}
+
+fn project_section_header(project_path: &str) -> String {
+    format!("[projects.'{}']", project_path.replace('\'', "\\'"))
+}
+
+fn normalize_project_path_for_match(path: &str) -> String {
+    let normalized = path
+        .replace('/', "\\")
+        .trim()
+        .trim_end_matches('\\')
+        .to_string();
+    if cfg!(target_os = "windows") {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn section_project_path(section: &str) -> Option<String> {
+    let raw = section.strip_prefix(CODEX_PROJECTS_SECTION_PREFIX)?.trim();
+    let value = if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+        raw[1..raw.len() - 1].to_string()
+    } else if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+        raw[1..raw.len() - 1].replace("\\\\", "\\")
+    } else {
+        raw.to_string()
+    };
+    Some(value)
+}
+
+fn toml_value_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let trimmed = strip_toml_comment(line);
+    let (left, right) = trimmed.split_once('=')?;
+    if left.trim() != key {
+        return None;
+    }
+    Some(right.trim().trim_matches('"'))
+}
+
+fn is_project_trusted_in_config(content: &str, project_path: &str) -> bool {
+    let target = normalize_project_path_for_match(project_path);
+    let mut in_target = false;
+
+    for line in content.lines() {
+        if let Some(section) = toml_section_name(line) {
+            in_target = section_project_path(section)
+                .map(|path| normalize_project_path_for_match(&path) == target)
+                .unwrap_or(false);
+            continue;
+        }
+
+        if in_target {
+            if let Some(value) = toml_value_for_key(line, CODEX_TRUST_LEVEL_KEY) {
+                return value == CODEX_TRUSTED_LEVEL;
+            }
+        }
+    }
+
+    false
+}
+
+fn codex_config_toml_with_trusted_project(content: &str, project_path: &str) -> (String, bool) {
+    // Guardrail: project visibility repair is only allowed to add or set
+    // [projects.'...'].trust_level = "trusted" for the requested path.
+    if is_project_trusted_in_config(content, project_path) {
+        return (content.to_string(), false);
+    }
+
+    let target = normalize_project_path_for_match(project_path);
+    let mut output: Vec<String> = Vec::new();
+    let mut in_target = false;
+    let mut target_found = false;
+    let mut trust_written = false;
+
+    for line in content.lines() {
+        if let Some(section) = toml_section_name(line) {
+            if in_target && !trust_written {
+                output.push(trusted_project_line());
+                trust_written = true;
+            }
+            in_target = section_project_path(section)
+                .map(|path| normalize_project_path_for_match(&path) == target)
+                .unwrap_or(false);
+            target_found |= in_target;
+            output.push(line.to_string());
+            continue;
+        }
+
+        if in_target && toml_value_for_key(line, CODEX_TRUST_LEVEL_KEY).is_some() {
+            output.push(trusted_project_line());
+            trust_written = true;
+            continue;
+        }
+
+        output.push(line.to_string());
+    }
+
+    if in_target && !trust_written {
+        output.push(trusted_project_line());
+    }
+
+    if !target_found {
+        if !output.is_empty() && output.last().is_some_and(|line| !line.trim().is_empty()) {
+            output.push(String::new());
+        }
+        output.push(project_section_header(project_path));
+        output.push(trusted_project_line());
+    }
+
+    let mut next = output.join("\n");
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    (next, true)
+}
+
+// Guardrail: this app manages official Codex accounts. Do not add provider,
+// proxy, base_url, or model-provider settings here. Fast/standard may only
+// touch [desktop].default-service-tier and must preserve all other config.toml
+// content such as model, MCP servers, memories, features, plugins, and projects.
+fn codex_config_toml_with_speed(content: &str, speed: &CodexAppSpeed) -> String {
+    let mut output: Vec<String> = Vec::new();
+    let mut in_desktop = false;
+    let mut desktop_found = false;
+    let mut tier_written = false;
+
+    for line in content.lines() {
+        if let Some(section) = toml_section_name(line) {
+            if in_desktop && matches!(speed, CodexAppSpeed::Fast) && !tier_written {
+                output.push(service_tier_line());
+                tier_written = true;
+            }
+            in_desktop = section == CODEX_DESKTOP_SECTION;
+            desktop_found |= in_desktop;
+            output.push(line.to_string());
+            continue;
+        }
+
+        if in_desktop && toml_string_value_for_key(line, CODEX_SERVICE_TIER_KEY).is_some() {
+            if matches!(speed, CodexAppSpeed::Fast) && !tier_written {
+                output.push(service_tier_line());
+                tier_written = true;
+            }
+            continue;
+        }
+
+        output.push(line.to_string());
+    }
+
+    if in_desktop && matches!(speed, CodexAppSpeed::Fast) && !tier_written {
+        output.push(service_tier_line());
+    }
+
+    if !desktop_found && matches!(speed, CodexAppSpeed::Fast) {
+        if !output.is_empty() && output.last().is_some_and(|line| !line.trim().is_empty()) {
+            output.push(String::new());
+        }
+        output.push(format!("[{}]", CODEX_DESKTOP_SECTION));
+        output.push(service_tier_line());
+    }
+
+    let mut next = output.join("\n");
+    if !next.is_empty() {
+        next.push('\n');
+    }
+    next
+}
+
+fn read_codex_app_speed_from_path(path: &std::path::Path) -> Result<CodexAppSpeed, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(CodexAppSpeed::Standard),
+        Err(e) => return Err(format!("读取 Codex config.toml 失败: {}", e)),
+    };
+    Ok(normalize_service_tier_speed(
+        read_service_tier_from_config(&content).as_deref(),
+    ))
+}
+
+fn sync_codex_global_state(path: &std::path::Path, speed: &CodexAppSpeed) -> Result<(), String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+        Err(e) => return Err(format!("读取 Codex 全局状态失败: {}", e)),
+    };
+    let mut state = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let atom_state = state
+        .entry(CODEX_ATOM_STATE_KEY.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !atom_state.is_object() {
+        *atom_state = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let atom_state = atom_state
+        .as_object_mut()
+        .ok_or_else(|| "Codex 全局状态格式异常".to_string())?;
+    let tier_value = match speed {
+        CodexAppSpeed::Fast => serde_json::Value::String(CODEX_PRIORITY_SERVICE_TIER.to_string()),
+        CodexAppSpeed::Standard => serde_json::Value::Null,
+    };
+    atom_state.insert(CODEX_SERVICE_TIER_KEY.to_string(), tier_value);
+    atom_state.insert(
+        CODEX_USER_CHANGED_TIER_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
+    }
+    let next = serde_json::to_string_pretty(&serde_json::Value::Object(state))
+        .map_err(|e| format!("序列化 Codex 全局状态失败: {}", e))?;
+    std::fs::write(path, next).map_err(|e| format!("写入 Codex 全局状态失败: {}", e))
+}
+
+fn write_codex_app_speed_to_path(
+    config_path: &std::path::Path,
+    global_state_path: &std::path::Path,
+    speed: CodexAppSpeed,
+) -> Result<CodexAppSpeedConfig, String> {
+    // Guardrail: keep this as a surgical [desktop].default-service-tier update.
+    // Do not rewrite official-mode config.toml into a provider/proxy config.
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取 Codex config.toml 失败: {}", e)),
+    };
+    let current_service_tier = read_service_tier_from_config(&content);
+    let should_update_config = match speed {
+        CodexAppSpeed::Fast => {
+            normalize_service_tier_speed(current_service_tier.as_deref()) != CodexAppSpeed::Fast
+        }
+        CodexAppSpeed::Standard => current_service_tier.is_some(),
+    };
+    if should_update_config {
+        let next = codex_config_toml_with_speed(&content, &speed);
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
+        }
+        std::fs::write(config_path, next)
+            .map_err(|e| format!("写入 Codex config.toml 失败: {}", e))?;
+    }
+    sync_codex_global_state(global_state_path, &speed)?;
+    Ok(CodexAppSpeedConfig {
+        speed,
+        config_path: config_path.to_string_lossy().to_string(),
+        global_state_path: global_state_path.to_string_lossy().to_string(),
+    })
 }
 
 fn get_database_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
@@ -213,6 +631,20 @@ fn open_accounts_db(app: &AppHandle) -> Result<Connection, String> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS operation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            level TEXT NOT NULL,
+            action TEXT NOT NULL,
+            account_id INTEGER,
+            account_name TEXT DEFAULT '',
+            account_identifier TEXT DEFAULT '',
+            stage TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at ON operation_logs(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_operation_logs_account_id ON operation_logs(account_id);
         ",
     )
     .map_err(|e| format!("Failed to initialize database: {}", e))?;
@@ -233,6 +665,30 @@ fn open_accounts_db(app: &AppHandle) -> Result<Connection, String> {
         "accounts",
         "last_quota_error",
         "ALTER TABLE accounts ADD COLUMN last_quota_error TEXT DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "accounts",
+        "primary_window_minutes",
+        "ALTER TABLE accounts ADD COLUMN primary_window_minutes INTEGER",
+    )?;
+    ensure_column(
+        &conn,
+        "accounts",
+        "primary_window_present",
+        "ALTER TABLE accounts ADD COLUMN primary_window_present INTEGER DEFAULT 1",
+    )?;
+    ensure_column(
+        &conn,
+        "accounts",
+        "secondary_window_minutes",
+        "ALTER TABLE accounts ADD COLUMN secondary_window_minutes INTEGER",
+    )?;
+    ensure_column(
+        &conn,
+        "accounts",
+        "secondary_window_present",
+        "ALTER TABLE accounts ADD COLUMN secondary_window_present INTEGER DEFAULT 1",
     )?;
 
     Ok(conn)
@@ -263,7 +719,7 @@ fn ensure_column(
 }
 
 fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
-    let account_id: String = row.get(13)?;
+    let account_id: String = row.get(17)?;
     Ok(Account {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -277,13 +733,104 @@ fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         plan_type: row.get(4)?,
         primary_used_percent: row.get(5)?,
         primary_reset_at: row.get(6)?,
-        secondary_used_percent: row.get(7)?,
-        secondary_reset_at: row.get(8)?,
-        last_quota_checked_at: row.get(9)?,
-        last_quota_error: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        primary_window_minutes: row.get(7)?,
+        primary_window_present: row.get::<_, i64>(8)? != 0,
+        secondary_used_percent: row.get(9)?,
+        secondary_reset_at: row.get(10)?,
+        secondary_window_minutes: row.get(11)?,
+        secondary_window_present: row.get::<_, i64>(12)? != 0,
+        last_quota_checked_at: row.get(13)?,
+        last_quota_error: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
+}
+
+fn operation_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationLog> {
+    Ok(OperationLog {
+        id: row.get(0)?,
+        level: row.get(1)?,
+        action: row.get(2)?,
+        account_id: row.get(3)?,
+        account_name: row.get(4)?,
+        account_identifier: row.get(5)?,
+        stage: row.get(6)?,
+        message: row.get(7)?,
+        details: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn truncate_log_text(value: &str, max_chars: usize) -> String {
+    let mut output: String = value.chars().take(max_chars).collect();
+    if value.chars().count() > max_chars {
+        output.push_str("...");
+    }
+    output
+}
+
+fn account_log_context(conn: &Connection, id: i64) -> (String, String) {
+    conn.query_row(
+        "
+        SELECT name, COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+        FROM accounts
+        WHERE id = ?1
+        ",
+        params![id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )
+    .unwrap_or_else(|_| (format!("#{}", id), String::new()))
+}
+
+fn insert_operation_log(
+    conn: &Connection,
+    level: &str,
+    action: &str,
+    account_id: Option<i64>,
+    account_name: &str,
+    account_identifier: &str,
+    stage: &str,
+    message: &str,
+    details: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "
+        INSERT INTO operation_logs (
+            level, action, account_id, account_name, account_identifier,
+            stage, message, details
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ",
+        params![
+            level,
+            action,
+            account_id,
+            account_name,
+            account_identifier,
+            stage,
+            truncate_log_text(message, 1000),
+            truncate_log_text(details, 6000),
+        ],
+    )
+    .map_err(|e| format!("Failed to write operation log: {}", e))?;
+    Ok(())
+}
+
+fn quota_log_details(
+    status: &str,
+    content_type: &str,
+    content_encoding: &str,
+    elapsed_ms: u128,
+    body_preview: &str,
+) -> String {
+    serde_json::json!({
+        "status": status,
+        "content_type": content_type,
+        "content_encoding": content_encoding,
+        "elapsed_ms": elapsed_ms,
+        "body_preview": body_preview,
+    })
+    .to_string()
 }
 
 fn credential_key(id: i64) -> String {
@@ -436,6 +983,44 @@ fn account_stub_from_json(json_info: &str) -> String {
         .unwrap_or_else(|| "{}".to_string())
 }
 
+fn health_item(
+    key: &str,
+    label: &str,
+    status: &str,
+    message: impl Into<String>,
+) -> AccountHealthItem {
+    AccountHealthItem {
+        key: key.to_string(),
+        label: label.to_string(),
+        status: status.to_string(),
+        message: message.into(),
+    }
+}
+
+fn health_summary_status(items: &[AccountHealthItem]) -> String {
+    if items.iter().any(|item| item.status == "error") {
+        "error".to_string()
+    } else if items.iter().any(|item| item.status == "warn") {
+        "warn".to_string()
+    } else {
+        "ok".to_string()
+    }
+}
+
+fn jwt_expiration_message(token: &str) -> String {
+    decode_jwt_payload_value(token)
+        .and_then(|payload| payload.get("exp").and_then(|value| value.as_i64()))
+        .map(|exp| {
+            let remaining = exp - chrono_like_now_timestamp();
+            if remaining <= 0 {
+                "已过期".to_string()
+            } else {
+                format!("约 {} 分钟后过期", remaining / 60)
+            }
+        })
+        .unwrap_or_else(|| "无法读取过期时间".to_string())
+}
+
 fn require_json_string(
     value: &serde_json::Value,
     pointer: &str,
@@ -563,6 +1148,31 @@ fn chrono_like_now_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+fn codex_last_refresh_string() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string()
+}
+
+fn codex_auth_json(
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+    account_id: &str,
+) -> Result<String, String> {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "OPENAI_API_KEY": serde_json::Value::Null,
+        "last_refresh": codex_last_refresh_string(),
+        "tokens": {
+            "access_token": access_token,
+            "account_id": account_id,
+            "id_token": id_token,
+            "refresh_token": refresh_token
+        }
+    }))
+    .map_err(|e| format!("Failed to serialize auth JSON: {}", e))
+}
+
 fn random_base64url_token() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -623,6 +1233,30 @@ fn query_param(url: &str, key: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn build_codex_oauth_url(
+    redirect_uri: &str,
+    code_challenge: &str,
+    state: &str,
+    force_account_selection: bool,
+) -> String {
+    let mut url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator={}",
+        CODEX_AUTH_ENDPOINT,
+        percent_encode(CODEX_OAUTH_CLIENT_ID),
+        percent_encode(redirect_uri),
+        percent_encode(CODEX_OAUTH_SCOPES),
+        percent_encode(code_challenge),
+        percent_encode(state),
+        percent_encode(CODEX_OAUTH_ORIGINATOR),
+    );
+
+    if force_account_selection {
+        url.push_str("&prompt=login&max_age=0");
+    }
+
+    url
 }
 
 fn callback_response_html() -> &'static str {
@@ -938,8 +1572,11 @@ async fn refresh_auth_json_if_needed(
             serde_json::Value::String(id_token.to_string()),
         );
     }
-    value["last_refresh"] =
-        serde_json::Value::Number(serde_json::Number::from(chrono_like_now_timestamp()));
+    value["OPENAI_API_KEY"] = serde_json::Value::Null;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("auth_mode");
+    }
+    value["last_refresh"] = serde_json::Value::String(codex_last_refresh_string());
 
     let updated = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("Failed to serialize refreshed auth JSON: {}", e))?;
@@ -998,33 +1635,32 @@ async fn refresh_token_to_auth_json(refresh_token: &str) -> Result<String, Strin
     let account_id = access_token_account_id(&access_token)
         .ok_or_else(|| "Cannot detect account_id from refreshed access_token".to_string())?;
 
-    serde_json::to_string_pretty(&serde_json::json!({
-        "auth_mode": "chatgpt",
-        "tokens": {
-            "id_token": id_token,
-            "access_token": access_token,
-            "refresh_token": next_refresh_token,
-            "account_id": account_id
-        },
-        "last_refresh": chrono_like_now_timestamp()
-    }))
-    .map_err(|e| format!("Failed to serialize auth JSON: {}", e))
+    codex_auth_json(&id_token, &access_token, next_refresh_token, &account_id)
 }
 
 fn access_token_to_auth_json(access_token: &str) -> Result<String, String> {
     let account_id = access_token_account_id(access_token)
         .ok_or_else(|| "Cannot detect account_id from access_token".to_string())?;
-    serde_json::to_string_pretty(&serde_json::json!({
-        "auth_mode": "chatgpt",
-        "tokens": {
-            "id_token": "",
-            "access_token": access_token,
-            "refresh_token": "",
-            "account_id": account_id
-        },
-        "last_refresh": chrono_like_now_timestamp()
-    }))
-    .map_err(|e| format!("Failed to serialize auth JSON: {}", e))
+    codex_auth_json("", access_token, "", &account_id)
+}
+
+// Guardrail: account switching is auth-only. Keep the on-disk shape compatible
+// with official Codex ~/.codex/auth.json and never use this path to change
+// ~/.codex/config.toml, providers, proxies, models, MCP, memories, or projects.
+fn canonicalize_auth_json(json_info: &str) -> Result<String, String> {
+    let value = parse_auth_json(json_info)?;
+    let id_token = value
+        .pointer("/tokens/id_token")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let access_token = require_json_string(&value, "/tokens/access_token", "tokens.access_token")?;
+    let refresh_token = value
+        .pointer("/tokens/refresh_token")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let account_id = require_json_string(&value, "/tokens/account_id", "tokens.account_id")?;
+
+    codex_auth_json(id_token, &access_token, refresh_token, &account_id)
 }
 
 async fn normalize_auth_input(input: &str) -> Result<String, String> {
@@ -1064,9 +1700,7 @@ async fn normalize_auth_input(input: &str) -> Result<String, String> {
                     );
                 }
             }
-            parse_auth_json(&serde_json::to_string(&value).unwrap_or_default())?;
-            return serde_json::to_string_pretty(&value)
-                .map_err(|e| format!("Failed to serialize auth JSON: {}", e));
+            return canonicalize_auth_json(&serde_json::to_string(&value).unwrap_or_default());
         }
     }
 
@@ -1369,52 +2003,163 @@ fn restart_codex_process() -> Result<(), String> {
 
 // ── Tauri commands ────────────────────────────────────────────────────
 
-#[command]
-async fn fetch_quota(access_token: String) -> Result<QuotaInfo, String> {
+#[derive(Debug)]
+struct QuotaFetchError {
+    message: String,
+    details: String,
+}
+
+fn header_to_string(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn body_preview(bytes: &[u8], max_chars: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    truncate_log_text(&text, max_chars)
+}
+
+fn quota_used_percent(window: Option<&Window>) -> i32 {
+    window
+        .and_then(|item| item.used_percent)
+        .unwrap_or(0)
+        .clamp(0, 100)
+}
+
+fn quota_reset_time(window: Option<&Window>) -> i64 {
+    let Some(window) = window else {
+        return 0;
+    };
+    if let Some(reset_at) = window.reset_at {
+        return reset_at.max(0);
+    }
+    if let Some(reset_after_seconds) = window.reset_after_seconds {
+        if reset_after_seconds >= 0 {
+            return chrono_like_now_timestamp() + reset_after_seconds;
+        }
+    }
+    0
+}
+
+fn quota_window_minutes(window: Option<&Window>) -> Option<i64> {
+    let seconds = window?.limit_window_seconds?;
+    if seconds <= 0 {
+        return None;
+    }
+    Some((seconds + 59) / 60)
+}
+
+async fn fetch_quota_internal(access_token: String) -> Result<QuotaInfo, QuotaFetchError> {
     let token = access_token.trim();
     if token.is_empty() {
-        return Err("Access token is empty".to_string());
+        return Err(QuotaFetchError {
+            message: "Access token is empty".to_string(),
+            details: String::new(),
+        });
     }
-    let auth_header = HeaderValue::from_str(&format!("Bearer {}", token))
-        .map_err(|e| format!("Invalid access token for Authorization header: {}", e))?;
+    let auth_header =
+        HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| QuotaFetchError {
+            message: format!("Invalid access token for Authorization header: {}", e),
+            details: String::new(),
+        })?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", error_chain(&e)))?;
-    let response = client
+        .map_err(|e| QuotaFetchError {
+            message: format!("Failed to create HTTP client: {}", error_chain(&e)),
+            details: String::new(),
+        })?;
+    let started_at = std::time::Instant::now();
+    let mut request = client
         .get("https://chatgpt.com/backend-api/wham/usage")
         .header(AUTHORIZATION, auth_header)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", error_chain(&e)))?;
+        .header(ACCEPT, "application/json")
+        .header(REFERER, "https://chatgpt.com/")
+        .header(USER_AGENT, "Mozilla/5.0");
+    if let Some(account_id) = access_token_account_id(token) {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+    let response = request.send().await.map_err(|e| QuotaFetchError {
+        message: format!("Request failed: {}", error_chain(&e)),
+        details: serde_json::json!({
+            "elapsed_ms": started_at.elapsed().as_millis(),
+        })
+        .to_string(),
+    })?;
 
-    if !response.status().is_success() {
-        return Err(format!("API returned status: {}", response.status()));
+    let status = response.status();
+    let content_type = header_to_string(response.headers(), reqwest::header::CONTENT_TYPE);
+    let content_encoding = header_to_string(response.headers(), reqwest::header::CONTENT_ENCODING);
+    let elapsed_ms = started_at.elapsed().as_millis();
+    let status_text = status.to_string();
+    let body = response.bytes().await.map_err(|e| QuotaFetchError {
+        message: format!("Failed to read response body: {}", error_chain(&e)),
+        details: quota_log_details(
+            &status_text,
+            &content_type,
+            &content_encoding,
+            elapsed_ms,
+            "",
+        ),
+    })?;
+    let preview = body_preview(&body, 1200);
+    let details = quota_log_details(
+        &status_text,
+        &content_type,
+        &content_encoding,
+        elapsed_ms,
+        &preview,
+    );
+
+    if !status.is_success() {
+        return Err(QuotaFetchError {
+            message: format!("API returned status: {}", status),
+            details,
+        });
     }
 
-    let api_response: ApiResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    let api_response: ApiResponse = serde_json::from_slice(&body).map_err(|e| QuotaFetchError {
+        message: format!("Failed to parse response JSON: {}", e),
+        details,
+    })?;
+    let rate_limit = api_response.rate_limit.as_ref();
+    let primary_window = rate_limit.and_then(|item| item.primary_window.as_ref());
+    let secondary_window = rate_limit.and_then(|item| item.secondary_window.as_ref());
 
     Ok(QuotaInfo {
-        plan_type: api_response.plan_type,
-        primary_used_percent: api_response.rate_limit.primary_window.used_percent,
-        primary_reset_at: api_response.rate_limit.primary_window.reset_at,
-        secondary_used_percent: api_response.rate_limit.secondary_window.used_percent,
-        secondary_reset_at: api_response.rate_limit.secondary_window.reset_at,
+        plan_type: api_response
+            .plan_type
+            .unwrap_or_else(|| "unknown".to_string()),
+        primary_used_percent: quota_used_percent(primary_window),
+        primary_reset_at: quota_reset_time(primary_window),
+        primary_window_minutes: quota_window_minutes(primary_window),
+        primary_window_present: primary_window.is_some(),
+        secondary_used_percent: quota_used_percent(secondary_window),
+        secondary_reset_at: quota_reset_time(secondary_window),
+        secondary_window_minutes: quota_window_minutes(secondary_window),
+        secondary_window_present: secondary_window.is_some(),
     })
 }
 
-async fn fetch_quota_with_token(access_token: &str) -> Result<QuotaInfo, String> {
-    fetch_quota(access_token.to_string()).await
+#[command]
+async fn fetch_quota(access_token: String) -> Result<QuotaInfo, String> {
+    fetch_quota_internal(access_token)
+        .await
+        .map_err(|e| e.message)
 }
 
 #[command]
 fn start_codex_oauth_login(
     app: AppHandle,
     open_browser: Option<bool>,
+    force_account_selection: Option<bool>,
 ) -> Result<OAuthStartResponse, String> {
     if let Some(existing) = OAUTH_STATE
         .lock()
@@ -1440,15 +2185,11 @@ fn start_codex_oauth_login(
         CODEX_OAUTH_CALLBACK_PORT
     );
     let challenge = code_challenge(&code_verifier);
-    let auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state={}&originator={}",
-        CODEX_AUTH_ENDPOINT,
-        percent_encode(CODEX_OAUTH_CLIENT_ID),
-        percent_encode(&redirect_uri),
-        percent_encode(CODEX_OAUTH_SCOPES),
-        percent_encode(&challenge),
-        percent_encode(&state),
-        percent_encode(CODEX_OAUTH_ORIGINATOR),
+    let auth_url = build_codex_oauth_url(
+        &redirect_uri,
+        &challenge,
+        &state,
+        force_account_selection.unwrap_or(true),
     );
     let listener = TcpListener::bind(("127.0.0.1", CODEX_OAUTH_CALLBACK_PORT)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -1521,10 +2262,9 @@ fn save_oauth_account(
 ) -> Result<i64, String> {
     parse_auth_json(auth_json)?;
     let conn = open_accounts_db(app)?;
-    let account_id = identity
-        .account_id
-        .as_deref()
-        .ok_or_else(|| "OAuth login did not return a ChatGPT account id".to_string())?;
+    if identity.account_id.as_deref().is_none() {
+        return Err("OAuth login did not return a ChatGPT account id".to_string());
+    }
     let name = identity
         .email
         .as_deref()
@@ -1532,32 +2272,15 @@ fn save_oauth_account(
         .unwrap_or("Codex OAuth Account");
     let plan_type = identity.plan_type.as_deref().unwrap_or("unknown");
 
-    let existing_id = conn
-        .query_row(
-            "
-            SELECT id
-            FROM accounts
-            WHERE COALESCE(json_extract(json_info, '$.tokens.account_id'), '') = ?1
-            LIMIT 1
-            ",
-            params![account_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .ok();
-
-    let id = if let Some(id) = existing_id {
-        id
-    } else {
-        conn.execute(
-            "
-            INSERT INTO accounts (name, activation_date, json_info, plan_type, updated_at)
-            VALUES (?1, '', '{}', ?2, datetime('now'))
-            ",
-            params![name, plan_type],
-        )
-        .map_err(|e| format!("Failed to add OAuth account: {}", e))?;
-        conn.last_insert_rowid()
-    };
+    conn.execute(
+        "
+        INSERT INTO accounts (name, activation_date, json_info, plan_type, updated_at)
+        VALUES (?1, '', '{}', ?2, datetime('now'))
+        ",
+        params![name, plan_type],
+    )
+    .map_err(|e| format!("Failed to add OAuth account: {}", e))?;
+    let id = conn.last_insert_rowid();
 
     let key = credential_key(id);
     save_account_secret(&key, auth_json)?;
@@ -1639,17 +2362,7 @@ async fn save_oauth_tokens(
         .clone()
         .ok_or_else(|| "OAuth login succeeded, but account id could not be detected".to_string())?;
 
-    let auth_json = serde_json::json!({
-        "auth_mode": "chatgpt",
-        "tokens": {
-            "id_token": id_token,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "account_id": account_id
-        },
-        "last_refresh": chrono_like_now_timestamp()
-    })
-    .to_string();
+    let auth_json = codex_auth_json(&id_token, &access_token, &refresh_token, &account_id)?;
     let id = save_oauth_account(&app, &auth_json, &identity)?;
     if let Err(e) = refresh_account_quota(app, id).await {
         eprintln!("Failed to fetch initial OAuth quota: {}", e);
@@ -1715,7 +2428,9 @@ fn list_accounts(app: AppHandle) -> Result<Vec<Account>, String> {
                    CASE WHEN credential_key IS NOT NULL AND credential_key != '' THEN 1 ELSE 0 END AS has_json_info,
                    plan_type,
                    primary_used_percent, primary_reset_at,
+                   primary_window_minutes, primary_window_present,
                    secondary_used_percent, secondary_reset_at,
+                   secondary_window_minutes, secondary_window_present,
                    last_quota_checked_at, last_quota_error,
                    created_at, updated_at,
                    COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
@@ -1734,6 +2449,66 @@ fn list_accounts(app: AppHandle) -> Result<Vec<Account>, String> {
         accounts.push(row.map_err(|e| format!("Failed to read account: {}", e))?);
     }
     Ok(accounts)
+}
+
+#[command]
+fn list_operation_logs(
+    app: AppHandle,
+    account_id: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Vec<OperationLog>, String> {
+    let conn = open_accounts_db(&app)?;
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+
+    let mut logs = Vec::new();
+    if let Some(account_id) = account_id {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, level, action, account_id, account_name, account_identifier,
+                       stage, message, details, created_at
+                FROM operation_logs
+                WHERE account_id = ?1
+                ORDER BY id DESC
+                LIMIT ?2
+                ",
+            )
+            .map_err(|e| format!("Failed to prepare operation log query: {}", e))?;
+        let rows = stmt
+            .query_map(params![account_id, limit], operation_log_from_row)
+            .map_err(|e| format!("Failed to query operation logs: {}", e))?;
+        for row in rows {
+            logs.push(row.map_err(|e| format!("Failed to read operation log: {}", e))?);
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, level, action, account_id, account_name, account_identifier,
+                       stage, message, details, created_at
+                FROM operation_logs
+                ORDER BY id DESC
+                LIMIT ?1
+                ",
+            )
+            .map_err(|e| format!("Failed to prepare operation log query: {}", e))?;
+        let rows = stmt
+            .query_map(params![limit], operation_log_from_row)
+            .map_err(|e| format!("Failed to query operation logs: {}", e))?;
+        for row in rows {
+            logs.push(row.map_err(|e| format!("Failed to read operation log: {}", e))?);
+        }
+    }
+
+    Ok(logs)
+}
+
+#[command]
+fn clear_operation_logs(app: AppHandle) -> Result<(), String> {
+    let conn = open_accounts_db(&app)?;
+    conn.execute("DELETE FROM operation_logs", [])
+        .map_err(|e| format!("Failed to clear operation logs: {}", e))?;
+    Ok(())
 }
 
 #[command]
@@ -1802,7 +2577,9 @@ async fn refresh_account_profile(app: AppHandle, id: i64) -> Result<Account, Str
                    CASE WHEN credential_key IS NOT NULL AND credential_key != '' THEN 1 ELSE 0 END AS has_json_info,
                    plan_type,
                    primary_used_percent, primary_reset_at,
+                   primary_window_minutes, primary_window_present,
                    secondary_used_percent, secondary_reset_at,
+                   secondary_window_minutes, secondary_window_present,
                    last_quota_checked_at, last_quota_error,
                    created_at, updated_at,
                    COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
@@ -2040,16 +2817,24 @@ fn delete_account(app: AppHandle, id: i64) -> Result<(), String> {
 }
 
 #[command]
-fn export_encrypted_backup(app: AppHandle, password: String) -> Result<String, String> {
+fn export_encrypted_backup(
+    app: AppHandle,
+    password: String,
+    account_ids: Option<Vec<i64>>,
+) -> Result<String, String> {
     let conn = open_accounts_db(&app)?;
     migrate_plaintext_credentials(&conn)?;
+    let filter_ids: Option<std::collections::HashSet<i64>> =
+        account_ids.map(|items| items.into_iter().collect());
 
     let mut stmt = conn
         .prepare(
             "
             SELECT id, name, activation_date, plan_type,
                    primary_used_percent, primary_reset_at,
+                   primary_window_minutes, primary_window_present,
                    secondary_used_percent, secondary_reset_at,
+                   secondary_window_minutes, secondary_window_present,
                    last_quota_checked_at, last_quota_error,
                    credential_key
             FROM accounts
@@ -2067,11 +2852,15 @@ fn export_encrypted_backup(app: AppHandle, password: String) -> Result<String, S
                 row.get::<_, String>(3)?,
                 row.get::<_, i32>(4)?,
                 row.get::<_, i64>(5)?,
-                row.get::<_, i32>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, String>(10)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(7)? != 0,
+                row.get::<_, i32>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, i64>(11)? != 0,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
             ))
         })
         .map_err(|e| format!("Failed to query backup accounts: {}", e))?;
@@ -2079,18 +2868,27 @@ fn export_encrypted_backup(app: AppHandle, password: String) -> Result<String, S
     let mut accounts = Vec::new();
     for row in rows {
         let (
-            _id,
+            id,
             name,
             activation_date,
             plan_type,
             primary_used_percent,
             primary_reset_at,
+            primary_window_minutes,
+            primary_window_present,
             secondary_used_percent,
             secondary_reset_at,
+            secondary_window_minutes,
+            secondary_window_present,
             last_quota_checked_at,
             last_quota_error,
             key,
         ) = row.map_err(|e| format!("Failed to read backup account: {}", e))?;
+        if let Some(filter_ids) = &filter_ids {
+            if !filter_ids.contains(&id) {
+                continue;
+            }
+        }
         if key.is_empty() {
             continue;
         }
@@ -2102,8 +2900,12 @@ fn export_encrypted_backup(app: AppHandle, password: String) -> Result<String, S
             plan_type,
             primary_used_percent,
             primary_reset_at,
+            primary_window_minutes,
+            primary_window_present,
             secondary_used_percent,
             secondary_reset_at,
+            secondary_window_minutes,
+            secondary_window_present,
             last_quota_checked_at,
             last_quota_error,
         });
@@ -2118,12 +2920,10 @@ fn export_encrypted_backup(app: AppHandle, password: String) -> Result<String, S
     )
 }
 
-#[command]
-async fn import_encrypted_backup(
-    app: AppHandle,
-    backup_text: String,
-    password: String,
-) -> Result<usize, String> {
+async fn normalized_backup_accounts(
+    backup_text: &str,
+    password: &str,
+) -> Result<(u32, Vec<BackupAccount>), String> {
     let payload = decrypt_backup_payload(&backup_text, &password)?;
     if payload.version != 1 {
         return Err("Unsupported backup payload version".to_string());
@@ -2138,65 +2938,248 @@ async fn import_encrypted_backup(
             .map_err(|e| format!("Invalid account JSON in backup: {}", e))?;
         normalized_accounts.push(account);
     }
+    Ok((payload.version, normalized_accounts))
+}
+
+fn existing_account_ids(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+            FROM accounts
+            WHERE COALESCE(json_extract(json_info, '$.tokens.account_id'), '') != ''
+            ORDER BY id ASC
+            ",
+        )
+        .map_err(|e| format!("Failed to prepare existing account lookup: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("Failed to query existing accounts: {}", e))?;
+
+    let mut existing = std::collections::HashMap::new();
+    for row in rows {
+        let (id, account_id) =
+            row.map_err(|e| format!("Failed to read existing account lookup: {}", e))?;
+        existing.entry(account_id).or_insert(id);
+    }
+    Ok(existing)
+}
+
+fn insert_backup_account(
+    conn: &Connection,
+    account: &BackupAccount,
+    imported_credentials: &mut Vec<(i64, String)>,
+) -> Result<(), String> {
+    conn.execute(
+        "
+        INSERT INTO accounts (
+            name, activation_date, json_info, plan_type,
+            primary_used_percent, primary_reset_at,
+            primary_window_minutes, primary_window_present,
+            secondary_used_percent, secondary_reset_at,
+            secondary_window_minutes, secondary_window_present,
+            last_quota_checked_at, last_quota_error,
+            updated_at
+        )
+        VALUES (?1, ?2, '{}', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'))
+        ",
+        params![
+            account.name,
+            account.activation_date,
+            account.plan_type,
+            account.primary_used_percent,
+            account.primary_reset_at,
+            account.primary_window_minutes,
+            if account.primary_window_present { 1 } else { 0 },
+            account.secondary_used_percent,
+            account.secondary_reset_at,
+            account.secondary_window_minutes,
+            if account.secondary_window_present {
+                1
+            } else {
+                0
+            },
+            account.last_quota_checked_at,
+            account.last_quota_error,
+        ],
+    )
+    .map_err(|e| format!("Failed to import account: {}", e))?;
+
+    let id = conn.last_insert_rowid();
+    let key = credential_key(id);
+    if let Err(e) = save_account_secret(&key, &account.json_info) {
+        let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
+        return Err(e);
+    }
+    imported_credentials.push((id, key.clone()));
+
+    if let Err(e) = conn.execute(
+        "
+        UPDATE accounts
+        SET credential_key = ?1, json_info = ?2, updated_at = datetime('now')
+        WHERE id = ?3
+        ",
+        params![key, account_stub_from_json(&account.json_info), id],
+    ) {
+        delete_account_secret(&key);
+        let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
+        return Err(format!("Failed to attach imported credential: {}", e));
+    }
+    Ok(())
+}
+
+fn merge_backup_account(conn: &Connection, id: i64, account: &BackupAccount) -> Result<(), String> {
+    let key = match conn.query_row(
+        "SELECT credential_key FROM accounts WHERE id = ?1",
+        params![id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(key) if !key.is_empty() => key,
+        Ok(_) => credential_key(id),
+        Err(e) => return Err(format!("Failed to find account for merge: {}", e)),
+    };
+    save_account_secret(&key, &account.json_info)?;
+    conn.execute(
+        "
+        UPDATE accounts
+        SET name = ?1,
+            activation_date = ?2,
+            credential_key = ?3,
+            json_info = ?4,
+            plan_type = ?5,
+            primary_used_percent = ?6,
+            primary_reset_at = ?7,
+            primary_window_minutes = ?8,
+            primary_window_present = ?9,
+            secondary_used_percent = ?10,
+            secondary_reset_at = ?11,
+            secondary_window_minutes = ?12,
+            secondary_window_present = ?13,
+            last_quota_checked_at = ?14,
+            last_quota_error = ?15,
+            updated_at = datetime('now')
+        WHERE id = ?16
+        ",
+        params![
+            account.name,
+            account.activation_date,
+            key,
+            account_stub_from_json(&account.json_info),
+            account.plan_type,
+            account.primary_used_percent,
+            account.primary_reset_at,
+            account.primary_window_minutes,
+            if account.primary_window_present { 1 } else { 0 },
+            account.secondary_used_percent,
+            account.secondary_reset_at,
+            account.secondary_window_minutes,
+            if account.secondary_window_present {
+                1
+            } else {
+                0
+            },
+            account.last_quota_checked_at,
+            account.last_quota_error,
+            id,
+        ],
+    )
+    .map_err(|e| format!("Failed to merge account: {}", e))?;
+    Ok(())
+}
+
+#[command]
+async fn preview_encrypted_backup(
+    app: AppHandle,
+    backup_text: String,
+    password: String,
+) -> Result<BackupPreview, String> {
+    let (version, accounts) = normalized_backup_accounts(&backup_text, &password).await?;
+    let conn = open_accounts_db(&app)?;
+    let existing = existing_account_ids(&conn)?;
+    let duplicate_accounts = accounts
+        .iter()
+        .filter(|account| {
+            extract_account_id(&account.json_info)
+                .as_ref()
+                .map(|account_id| existing.contains_key(account_id))
+                .unwrap_or(false)
+        })
+        .count();
+    let account_names = accounts
+        .iter()
+        .take(8)
+        .map(|account| account.name.clone())
+        .collect();
+
+    Ok(BackupPreview {
+        version,
+        total_accounts: accounts.len(),
+        duplicate_accounts,
+        new_accounts: accounts.len().saturating_sub(duplicate_accounts),
+        account_names,
+    })
+}
+
+#[command]
+async fn import_encrypted_backup(
+    app: AppHandle,
+    backup_text: String,
+    password: String,
+    strategy: Option<String>,
+) -> Result<ImportBackupResult, String> {
+    let (_, normalized_accounts) = normalized_backup_accounts(&backup_text, &password).await?;
 
     let conn = open_accounts_db(&app)?;
+    let mut existing = existing_account_ids(&conn)?;
     let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut updated = 0usize;
     let mut imported_credentials: Vec<(i64, String)> = Vec::new();
+    let strategy = strategy.unwrap_or_else(|| "add".to_string());
 
     for account in normalized_accounts {
-        if let Err(e) = conn.execute(
-            "
-            INSERT INTO accounts (
-                name, activation_date, json_info, plan_type,
-                primary_used_percent, primary_reset_at,
-                secondary_used_percent, secondary_reset_at,
-                last_quota_checked_at, last_quota_error,
-                updated_at
-            )
-            VALUES (?1, ?2, '{}', ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
-            ",
-            params![
-                account.name,
-                account.activation_date,
-                account.plan_type,
-                account.primary_used_percent,
-                account.primary_reset_at,
-                account.secondary_used_percent,
-                account.secondary_reset_at,
-                account.last_quota_checked_at,
-                account.last_quota_error,
-            ],
-        ) {
-            cleanup_imported_accounts(&conn, &imported_credentials);
-            return Err(format!("Failed to import account: {}", e));
-        }
+        let account_id = extract_account_id(&account.json_info);
+        let existing_id = account_id
+            .as_ref()
+            .and_then(|item| existing.get(item).copied());
+        let result = match (strategy.as_str(), existing_id) {
+            ("skip_duplicates", Some(_)) => {
+                skipped += 1;
+                Ok(())
+            }
+            ("merge_by_account_id", Some(id)) => {
+                merge_backup_account(&conn, id, &account).map(|_| {
+                    updated += 1;
+                })
+            }
+            ("add" | "skip_duplicates" | "merge_by_account_id", _) => {
+                insert_backup_account(&conn, &account, &mut imported_credentials).map(|_| {
+                    imported += 1;
+                    if let Some(account_id) = account_id {
+                        existing
+                            .entry(account_id)
+                            .or_insert(conn.last_insert_rowid());
+                    }
+                })
+            }
+            _ => Err("Unsupported import strategy".to_string()),
+        };
 
-        let id = conn.last_insert_rowid();
-        let key = credential_key(id);
-        if let Err(e) = save_account_secret(&key, &account.json_info) {
-            let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
+        if let Err(e) = result {
             cleanup_imported_accounts(&conn, &imported_credentials);
             return Err(e);
         }
-        imported_credentials.push((id, key.clone()));
-
-        if let Err(e) = conn.execute(
-            "
-            UPDATE accounts
-            SET credential_key = ?1, json_info = ?2, updated_at = datetime('now')
-            WHERE id = ?3
-            ",
-            params![key, account_stub_from_json(&account.json_info), id],
-        ) {
-            delete_account_secret(&key);
-            let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
-            cleanup_imported_accounts(&conn, &imported_credentials);
-            return Err(format!("Failed to attach imported credential: {}", e));
-        }
-        imported += 1;
     }
 
-    Ok(imported)
+    Ok(ImportBackupResult {
+        imported,
+        skipped,
+        updated,
+    })
 }
 
 fn cleanup_imported_accounts(conn: &Connection, imported_credentials: &[(i64, String)]) {
@@ -2208,8 +3191,20 @@ fn cleanup_imported_accounts(conn: &Connection, imported_credentials: &[(i64, St
 
 #[command]
 async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, String> {
-    let access_token = {
+    let (account_name, account_identifier, access_token) = {
         let conn = open_accounts_db(&app)?;
+        let (account_name, account_identifier) = account_log_context(&conn, id);
+        let _ = insert_operation_log(
+            &conn,
+            "info",
+            "refresh_quota",
+            Some(id),
+            &account_name,
+            &account_identifier,
+            "start",
+            "开始刷新额度",
+            "",
+        );
         let key = account_secret_key(&conn, id)?;
         let json_info = read_account_secret(&key)?;
         let refreshed_json = match refresh_auth_json_if_needed(&json_info, false).await {
@@ -2230,30 +3225,230 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
                 updated_json
             }
             Err(e) => {
+                let _ = insert_operation_log(
+                    &conn,
+                    "error",
+                    "refresh_quota",
+                    Some(id),
+                    &account_name,
+                    &account_identifier,
+                    "refresh_token",
+                    &e,
+                    "",
+                );
                 mark_quota_error(&conn, id, &e)?;
                 return Err(e);
             }
         };
         match extract_access_token(&refreshed_json) {
-            Ok(token) => token,
+            Ok(token) => (account_name, account_identifier, token),
             Err(e) => {
+                let _ = insert_operation_log(
+                    &conn,
+                    "error",
+                    "refresh_quota",
+                    Some(id),
+                    &account_name,
+                    &account_identifier,
+                    "extract_access_token",
+                    &e,
+                    "",
+                );
                 mark_quota_error(&conn, id, &e)?;
                 return Err(e);
             }
         }
     };
 
-    match fetch_quota_with_token(&access_token).await {
+    match fetch_quota_internal(access_token).await {
         Ok(quota) => {
-            update_account_quota(app, id, quota.clone())?;
+            update_account_quota(app.clone(), id, quota.clone())?;
+            let conn = open_accounts_db(&app)?;
+            let details = serde_json::json!({
+                "plan_type": quota.plan_type,
+                "primary_used_percent": quota.primary_used_percent,
+                "primary_reset_at": quota.primary_reset_at,
+                "primary_window_minutes": quota.primary_window_minutes,
+                "primary_window_present": quota.primary_window_present,
+                "secondary_used_percent": quota.secondary_used_percent,
+                "secondary_reset_at": quota.secondary_reset_at,
+                "secondary_window_minutes": quota.secondary_window_minutes,
+                "secondary_window_present": quota.secondary_window_present,
+            })
+            .to_string();
+            let _ = insert_operation_log(
+                &conn,
+                "info",
+                "refresh_quota",
+                Some(id),
+                &account_name,
+                &account_identifier,
+                "quota_api",
+                "额度刷新成功",
+                &details,
+            );
             Ok(quota)
         }
         Err(e) => {
             let conn = open_accounts_db(&app)?;
-            mark_quota_error(&conn, id, &e)?;
-            Err(e)
+            let _ = insert_operation_log(
+                &conn,
+                "error",
+                "refresh_quota",
+                Some(id),
+                &account_name,
+                &account_identifier,
+                "quota_api",
+                &e.message,
+                &e.details,
+            );
+            mark_quota_error(&conn, id, &e.message)?;
+            Err(e.message)
         }
     }
+}
+
+#[command]
+async fn check_account_health(app: AppHandle, id: i64) -> Result<AccountHealthReport, String> {
+    let mut items = Vec::new();
+    let mut can_check_quota = true;
+
+    let secret_result = {
+        let conn = open_accounts_db(&app)?;
+        match account_secret_key(&conn, id) {
+            Ok(key) => read_account_secret(&key),
+            Err(e) => Err(e),
+        }
+    };
+
+    match secret_result {
+        Ok(json_info) => {
+            items.push(health_item(
+                "credential",
+                "凭据读取",
+                "ok",
+                "系统凭据库可读取",
+            ));
+
+            match serde_json::from_str::<serde_json::Value>(&json_info) {
+                Ok(value) => {
+                    items.push(health_item("json", "JSON 结构", "ok", "auth.json 可解析"));
+
+                    let access_token = value
+                        .pointer("/tokens/access_token")
+                        .and_then(|item| item.as_str())
+                        .filter(|item| !item.trim().is_empty());
+                    let refresh_token = value
+                        .pointer("/tokens/refresh_token")
+                        .and_then(|item| item.as_str())
+                        .filter(|item| !item.trim().is_empty());
+                    let account_id = value
+                        .pointer("/tokens/account_id")
+                        .and_then(|item| item.as_str())
+                        .filter(|item| !item.trim().is_empty());
+                    let id_token = value
+                        .pointer("/tokens/id_token")
+                        .and_then(|item| item.as_str())
+                        .filter(|item| !item.trim().is_empty());
+
+                    if let Some(access_token) = access_token {
+                        items.push(health_item("access_token", "Access Token", "ok", "存在"));
+                        if is_token_expired(access_token) {
+                            items.push(health_item(
+                                "access_token_expiry",
+                                "Access Token 有效期",
+                                "warn",
+                                jwt_expiration_message(access_token),
+                            ));
+                        } else {
+                            items.push(health_item(
+                                "access_token_expiry",
+                                "Access Token 有效期",
+                                "ok",
+                                jwt_expiration_message(access_token),
+                            ));
+                        }
+                    } else {
+                        can_check_quota = false;
+                        items.push(health_item("access_token", "Access Token", "error", "缺失"));
+                    }
+
+                    if refresh_token.is_some() {
+                        items.push(health_item(
+                            "refresh_token",
+                            "Refresh Token",
+                            "ok",
+                            "存在，可在过期时刷新",
+                        ));
+                    } else {
+                        items.push(health_item(
+                            "refresh_token",
+                            "Refresh Token",
+                            "warn",
+                            "缺失，access token 过期后需要重新授权",
+                        ));
+                    }
+
+                    if let Some(account_id) = account_id {
+                        items.push(health_item("account_id", "Account ID", "ok", account_id));
+                    } else {
+                        can_check_quota = false;
+                        items.push(health_item("account_id", "Account ID", "error", "缺失"));
+                    }
+
+                    if id_token.is_some() {
+                        items.push(health_item("id_token", "ID Token", "ok", "存在"));
+                    } else {
+                        items.push(health_item(
+                            "id_token",
+                            "ID Token",
+                            "warn",
+                            "缺失，不影响切换但资料识别可能不完整",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    can_check_quota = false;
+                    items.push(health_item(
+                        "json",
+                        "JSON 结构",
+                        "error",
+                        format!("解析失败: {}", e),
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            can_check_quota = false;
+            items.push(health_item("credential", "凭据读取", "error", e));
+        }
+    }
+
+    if can_check_quota {
+        match refresh_account_quota(app.clone(), id).await {
+            Ok(_) => items.push(health_item(
+                "quota_api",
+                "Quota/API",
+                "ok",
+                "额度接口调用成功",
+            )),
+            Err(e) => items.push(health_item("quota_api", "Quota/API", "error", e)),
+        }
+    } else {
+        items.push(health_item(
+            "quota_api",
+            "Quota/API",
+            "warn",
+            "本地凭据不完整，已跳过网络检查",
+        ));
+    }
+
+    Ok(AccountHealthReport {
+        account_id: id,
+        checked_at: codex_last_refresh_string(),
+        summary_status: health_summary_status(&items),
+        items,
+    })
 }
 
 #[command]
@@ -2292,19 +3487,27 @@ fn update_account_quota(app: AppHandle, id: i64, quota: QuotaInfo) -> Result<(),
                 plan_type = ?1,
                 primary_used_percent = ?2,
                 primary_reset_at = ?3,
-                secondary_used_percent = ?4,
-                secondary_reset_at = ?5,
+                primary_window_minutes = ?4,
+                primary_window_present = ?5,
+                secondary_used_percent = ?6,
+                secondary_reset_at = ?7,
+                secondary_window_minutes = ?8,
+                secondary_window_present = ?9,
                 last_quota_checked_at = datetime('now'),
                 last_quota_error = '',
                 updated_at = datetime('now')
-            WHERE id = ?6
+            WHERE id = ?10
             ",
             params![
                 quota.plan_type,
                 quota.primary_used_percent,
                 quota.primary_reset_at,
+                quota.primary_window_minutes,
+                if quota.primary_window_present { 1 } else { 0 },
                 quota.secondary_used_percent,
                 quota.secondary_reset_at,
+                quota.secondary_window_minutes,
+                if quota.secondary_window_present { 1 } else { 0 },
                 id
             ],
         )
@@ -2349,11 +3552,13 @@ fn set_setting(app: AppHandle, key: String, value: String) -> Result<(), String>
 
 #[command]
 async fn switch_account(json_info: String, restart_codex: Option<bool>) -> Result<(), String> {
+    // Guardrail: switching accounts writes only ~/.codex/auth.json. Any
+    // config.toml repair or speed setting must stay behind explicit commands.
     if json_info.trim().is_empty() {
         return Err("JSON info is empty, aborting switch".to_string());
     }
 
-    parse_auth_json(&json_info)?;
+    let json_info = canonicalize_auth_json(&json_info)?;
 
     let should_restart = restart_codex.unwrap_or(true);
     if should_restart {
@@ -2377,11 +3582,12 @@ async fn switch_account(json_info: String, restart_codex: Option<bool>) -> Resul
 
 #[command]
 async fn write_auth_json(json_info: String) -> Result<(), String> {
+    // Guardrail: direct auth writes must not mutate ~/.codex/config.toml.
     if json_info.trim().is_empty() {
         return Err("JSON info is empty".to_string());
     }
 
-    parse_auth_json(&json_info)?;
+    let json_info = canonicalize_auth_json(&json_info)?;
 
     let auth_path = get_auth_path()?;
     if let Some(parent) = auth_path.parent() {
@@ -2406,6 +3612,77 @@ async fn read_auth_json() -> Result<String, String> {
 }
 
 #[command]
+async fn get_current_account_record_id(app: AppHandle) -> Result<Option<i64>, String> {
+    let current_json = read_auth_json().await?;
+    let current_value = serde_json::from_str::<serde_json::Value>(&current_json)
+        .map_err(|e| format!("Invalid current auth.json: {}", e))?;
+    let current_access_token = current_value
+        .pointer("/tokens/access_token")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.trim().is_empty());
+    let current_account_id = current_value
+        .pointer("/tokens/account_id")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.trim().is_empty());
+
+    let Some(current_access_token) = current_access_token else {
+        return Ok(None);
+    };
+
+    let conn = open_accounts_db(&app)?;
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, credential_key,
+                   COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+            FROM accounts
+            WHERE credential_key IS NOT NULL AND credential_key != ''
+            ORDER BY id DESC
+            ",
+        )
+        .map_err(|e| format!("Failed to prepare current account query: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to query current account candidates: {}", e))?;
+
+    let mut account_id_matches = Vec::new();
+    for row in rows {
+        let (id, key, account_id) =
+            row.map_err(|e| format!("Failed to read current account candidate: {}", e))?;
+        if current_account_id == Some(account_id.as_str()) {
+            account_id_matches.push(id);
+        }
+        let Ok(secret) = read_account_secret(&key) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&secret) else {
+            continue;
+        };
+        let Some(access_token) = value
+            .pointer("/tokens/access_token")
+            .and_then(|item| item.as_str())
+        else {
+            continue;
+        };
+        if access_token == current_access_token {
+            return Ok(Some(id));
+        }
+    }
+
+    if account_id_matches.len() == 1 {
+        Ok(account_id_matches.first().copied())
+    } else {
+        Ok(None)
+    }
+}
+
+#[command]
 async fn get_codex_auth_path() -> Result<String, String> {
     let auth_path = get_auth_path()?;
     Ok(auth_path.to_string_lossy().to_string())
@@ -2424,6 +3701,92 @@ async fn get_storage_paths(app: AppHandle) -> Result<StoragePaths, String> {
         app_data_dir: app_data_dir.to_string_lossy().to_string(),
         database_path: database_path.to_string_lossy().to_string(),
         auth_json_path: auth_json_path.to_string_lossy().to_string(),
+    })
+}
+
+#[command]
+async fn get_codex_app_speed_config() -> Result<CodexAppSpeedConfig, String> {
+    let config_path = get_codex_config_path()?;
+    let global_state_path = get_codex_global_state_path()?;
+    let speed = read_codex_app_speed_from_path(&config_path)?;
+    Ok(CodexAppSpeedConfig {
+        speed,
+        config_path: config_path.to_string_lossy().to_string(),
+        global_state_path: global_state_path.to_string_lossy().to_string(),
+    })
+}
+
+#[command]
+async fn set_codex_app_speed(speed: CodexAppSpeed) -> Result<CodexAppSpeedConfig, String> {
+    let config_path = get_codex_config_path()?;
+    let global_state_path = get_codex_global_state_path()?;
+    write_codex_app_speed_to_path(&config_path, &global_state_path, speed)
+}
+
+fn default_project_visibility_path() -> String {
+    std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+#[command]
+async fn get_codex_project_visibility_status(
+    project_path: Option<String>,
+) -> Result<CodexProjectVisibilityStatus, String> {
+    let project_path = project_path
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(default_project_visibility_path);
+    if project_path.trim().is_empty() {
+        return Err("Project path is empty".to_string());
+    }
+
+    let config_path = get_codex_config_path()?;
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取 Codex config.toml 失败: {}", e)),
+    };
+
+    let is_trusted = is_project_trusted_in_config(&content, &project_path);
+    Ok(CodexProjectVisibilityStatus {
+        project_path,
+        config_path: config_path.to_string_lossy().to_string(),
+        is_trusted,
+        changed: false,
+    })
+}
+
+#[command]
+async fn repair_codex_project_visibility(
+    project_path: String,
+) -> Result<CodexProjectVisibilityStatus, String> {
+    if project_path.trim().is_empty() {
+        return Err("Project path is empty".to_string());
+    }
+
+    let config_path = get_codex_config_path()?;
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取 Codex config.toml 失败: {}", e)),
+    };
+    let (next, changed) = codex_config_toml_with_trusted_project(&content, &project_path);
+
+    if changed {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
+        }
+        std::fs::write(&config_path, next)
+            .map_err(|e| format!("写入 Codex config.toml 失败: {}", e))?;
+    }
+
+    Ok(CodexProjectVisibilityStatus {
+        project_path,
+        config_path: config_path.to_string_lossy().to_string(),
+        is_trusted: true,
+        changed,
     })
 }
 
@@ -2506,15 +3869,19 @@ pub fn run() {
             cancel_codex_oauth_login,
             complete_codex_oauth_login,
             list_accounts,
+            list_operation_logs,
+            clear_operation_logs,
             refresh_account_profile,
             add_account,
             update_account,
             delete_account,
             export_encrypted_backup,
+            preview_encrypted_backup,
             import_encrypted_backup,
             get_migration_status,
             migrate_plaintext_accounts,
             refresh_account_quota,
+            check_account_health,
             switch_account_by_id,
             update_account_quota,
             get_setting,
@@ -2522,8 +3889,13 @@ pub fn run() {
             switch_account,
             write_auth_json,
             read_auth_json,
+            get_current_account_record_id,
             get_codex_auth_path,
             get_storage_paths,
+            get_codex_app_speed_config,
+            set_codex_app_speed,
+            get_codex_project_visibility_status,
+            repair_codex_project_visibility,
             open_storage_folder,
             open_codex_auth_folder,
             is_codex_running,
@@ -2581,6 +3953,29 @@ mod tests {
     }
 
     #[test]
+    fn canonical_auth_json_matches_codex_oauth_shape() {
+        let canonical = canonicalize_auth_json(&sample_auth_json()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+
+        assert!(parsed.get("auth_mode").is_none());
+        assert!(parsed.get("OPENAI_API_KEY").unwrap().is_null());
+        assert!(parsed
+            .get("last_refresh")
+            .and_then(|item| item.as_str())
+            .unwrap()
+            .ends_with('Z'));
+        assert_eq!(parsed.pointer("/tokens/account_id").unwrap(), "account-123");
+        assert_eq!(
+            parsed.pointer("/tokens/access_token").unwrap(),
+            "access-token"
+        );
+        assert_eq!(
+            parsed.pointer("/tokens/refresh_token").unwrap(),
+            "refresh-token"
+        );
+    }
+
+    #[test]
     fn token_expiration_uses_jwt_exp_with_refresh_skew() {
         let now = chrono_like_now_timestamp();
 
@@ -2589,6 +3984,105 @@ mod tests {
         )));
         assert!(is_token_expired(&sample_jwt_with_exp(now - 60)));
         assert!(is_token_expired("not-a-jwt"));
+    }
+
+    #[test]
+    fn oauth_url_can_force_account_selection() {
+        let auth_url = build_codex_oauth_url(
+            "http://localhost:1455/auth/callback",
+            "challenge",
+            "state",
+            true,
+        );
+
+        assert!(auth_url.contains("prompt=login"));
+        assert!(auth_url.contains("max_age=0"));
+
+        let reusable_url = build_codex_oauth_url(
+            "http://localhost:1455/auth/callback",
+            "challenge",
+            "state",
+            false,
+        );
+
+        assert!(!reusable_url.contains("prompt=login"));
+        assert!(!reusable_url.contains("max_age=0"));
+    }
+
+    #[test]
+    fn codex_speed_config_toggles_desktop_service_tier() {
+        let original = r#"[model]
+name = "gpt-5"
+
+[desktop]
+theme = "system"
+default-service-tier = "priority"
+
+[other]
+enabled = true
+"#;
+        let standard = codex_config_toml_with_speed(original, &CodexAppSpeed::Standard);
+
+        assert!(standard.contains("[desktop]"));
+        assert!(standard.contains("theme = \"system\""));
+        assert!(!standard.contains("default-service-tier"));
+        assert!(standard.contains("[other]"));
+
+        let fast = codex_config_toml_with_speed(&standard, &CodexAppSpeed::Fast);
+
+        let tier_index = fast.find("default-service-tier = \"priority\"").unwrap();
+        let other_index = fast.find("[other]").unwrap();
+        assert!(tier_index < other_index);
+        assert_eq!(
+            read_service_tier_from_config(&fast).as_deref(),
+            Some(CODEX_PRIORITY_SERVICE_TIER)
+        );
+    }
+
+    #[test]
+    fn project_visibility_repair_only_touches_target_project() {
+        let original = r#"model = "gpt-5.5"
+
+[features]
+goals = true
+
+[projects.'D:\project\old']
+trust_level = "trusted"
+
+[projects.'D:\project\rust\codex_account_manager']
+trust_level = "untrusted"
+
+[memories]
+use_memories = true
+"#;
+        let (next, changed) = codex_config_toml_with_trusted_project(
+            original,
+            r#"d:\project\rust\codex_account_manager"#,
+        );
+
+        assert!(changed);
+        assert!(next.contains("model = \"gpt-5.5\""));
+        assert!(next.contains("[features]\ngoals = true"));
+        assert!(next.contains("[memories]\nuse_memories = true"));
+        assert!(next.contains("[projects.'D:\\project\\old']\ntrust_level = \"trusted\""));
+        assert!(is_project_trusted_in_config(
+            &next,
+            r#"D:\project\rust\codex_account_manager"#
+        ));
+        assert!(!next.contains("provider"));
+        assert!(!next.contains("base_url"));
+    }
+
+    #[test]
+    fn project_visibility_repair_appends_missing_project() {
+        let original = r#"[features]
+goals = true
+"#;
+        let (next, changed) = codex_config_toml_with_trusted_project(original, r#"D:\project\new"#);
+
+        assert!(changed);
+        assert!(next.contains("[features]\ngoals = true"));
+        assert!(next.contains("[projects.'D:\\project\\new']\ntrust_level = \"trusted\""));
     }
 
     #[test]
@@ -2602,8 +4096,12 @@ mod tests {
                 plan_type: "plus".to_string(),
                 primary_used_percent: 12,
                 primary_reset_at: 123,
+                primary_window_minutes: Some(300),
+                primary_window_present: true,
                 secondary_used_percent: 34,
                 secondary_reset_at: 456,
+                secondary_window_minutes: Some(10080),
+                secondary_window_present: true,
                 last_quota_checked_at: "2026-06-06 12:00:00".to_string(),
                 last_quota_error: String::new(),
             }],

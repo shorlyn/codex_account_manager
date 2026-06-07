@@ -1,15 +1,17 @@
 import { ref, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import type { Account, QuotaInfo } from '../types';
+import type { Account, AccountViewMode, BatchRefreshProgress, BatchRefreshResult, QuotaInfo } from '../types';
 
 const REFRESH_INTERVAL_SETTING = 'refreshInterval';
 const RESTART_CODEX_SETTING = 'restartCodexOnSwitch';
+const ACCOUNT_VIEW_MODE_SETTING = 'accountViewMode';
 
 const accounts = ref<Account[]>([]);
 const loading = ref(false);
 const switchingId = ref<number | null>(null);
-const currentAccountId = ref<string | null>(null);
+const currentAccountRecordId = ref<number | null>(null);
 const restartCodexOnSwitch = ref(true);
+const accountViewMode = ref<AccountViewMode>('cards');
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 const refreshInterval = ref(0);
 
@@ -26,11 +28,9 @@ async function loadAccounts(): Promise<void> {
 
 async function loadCurrentAccount(): Promise<void> {
   try {
-    const authJson = await invoke<string>('read_auth_json');
-    const parsed = JSON.parse(authJson);
-    currentAccountId.value = parsed.tokens?.account_id || null;
+    currentAccountRecordId.value = await invoke<number | null>('get_current_account_record_id');
   } catch {
-    currentAccountId.value = null;
+    currentAccountRecordId.value = null;
   }
 }
 
@@ -109,6 +109,44 @@ async function refreshAllQuotas(): Promise<void> {
   await loadAccounts();
 }
 
+async function refreshQuotaBatch(
+  accountIds: number[],
+  onProgress?: (progress: BatchRefreshProgress) => void,
+): Promise<BatchRefreshResult> {
+  const idSet = new Set(accountIds);
+  let success = 0;
+  let failed = 0;
+  let skipped = 0;
+  let done = 0;
+  const selectedAccounts = accounts.value.filter(account => idSet.has(account.id));
+  const total = selectedAccounts.length;
+  const failures: BatchRefreshResult['failures'] = [];
+
+  for (const account of selectedAccounts) {
+    onProgress?.({ done, total, currentName: account.name });
+    if (!account.has_json_info) {
+      skipped += 1;
+      done += 1;
+      onProgress?.({ done, total, currentName: account.name });
+      continue;
+    }
+    try {
+      await refreshQuotaById(account.id);
+      success += 1;
+    } catch (e) {
+      const error = String(e);
+      failed += 1;
+      failures.push({ id: account.id, name: account.name, error });
+      console.warn(`Failed to refresh quota for account ${account.name}:`, e);
+    }
+    done += 1;
+    onProgress?.({ done, total, currentName: account.name });
+  }
+
+  await loadAccounts();
+  return { success, failed, skipped, failures };
+}
+
 async function switchAccount(accountId: number, restartCodex = restartCodexOnSwitch.value): Promise<void> {
   const account = accounts.value.find(a => a.id === accountId);
   if (!account) throw new Error('Account not found');
@@ -181,6 +219,28 @@ async function setRestartCodexOnSwitch(value: boolean): Promise<void> {
   }
 }
 
+async function loadAccountViewMode(defaultValue: AccountViewMode = 'cards'): Promise<void> {
+  try {
+    const saved = await invoke<string | null>('get_setting', { key: ACCOUNT_VIEW_MODE_SETTING });
+    accountViewMode.value = saved === 'table' || saved === 'cards' || saved === 'compact' ? saved : defaultValue;
+  } catch (e) {
+    console.warn('Failed to load account view mode setting:', e);
+    accountViewMode.value = defaultValue;
+  }
+}
+
+async function setAccountViewMode(value: AccountViewMode): Promise<void> {
+  accountViewMode.value = value;
+  try {
+    await invoke('set_setting', {
+      key: ACCOUNT_VIEW_MODE_SETTING,
+      value,
+    });
+  } catch (e) {
+    console.warn('Failed to save account view mode setting:', e);
+  }
+}
+
 function stopAutoRefresh(): void {
   if (refreshTimer) {
     clearInterval(refreshTimer);
@@ -197,8 +257,9 @@ export function useAccounts() {
     accounts,
     loading,
     switchingId,
-    currentAccountId,
+    currentAccountRecordId,
     restartCodexOnSwitch,
+    accountViewMode,
     refreshInterval,
     loadAccounts,
     loadCurrentAccount,
@@ -208,11 +269,14 @@ export function useAccounts() {
     refreshQuota,
     refreshProfile,
     refreshAllQuotas,
+    refreshQuotaBatch,
     switchAccount,
     loadRefreshInterval,
     setRefreshInterval,
     loadRestartCodexOnSwitch,
     setRestartCodexOnSwitch,
+    loadAccountViewMode,
+    setAccountViewMode,
     startAutoRefresh,
     stopAutoRefresh,
   };

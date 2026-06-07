@@ -1,18 +1,32 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue';
+import { computed, ref, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAccounts } from './composables/useAccounts';
 import AccountList from './components/AccountList.vue';
 import AccountDialog from './components/AccountDialog.vue';
-import type { Account, MigrationStatus, StoragePaths } from './types';
+import type {
+  Account,
+  AccountHealthReport,
+  BackupPreview,
+  CodexAppSpeed,
+  CodexAppSpeedConfig,
+  CodexProjectVisibilityStatus,
+  BatchRefreshFailure,
+  BatchRefreshProgress,
+  ImportBackupResult,
+  ImportBackupStrategy,
+  MigrationStatus,
+  OperationLog,
+  StoragePaths,
+} from './types';
 
 const {
-  accounts, loading, switchingId, currentAccountId, refreshInterval,
+  accounts, loading, switchingId, currentAccountRecordId, refreshInterval, accountViewMode,
   restartCodexOnSwitch,
   loadAccounts, loadCurrentAccount, addAccount, updateAccount, deleteAccount,
-  refreshQuota, refreshProfile, switchAccount, loadRefreshInterval, setRefreshInterval,
-  loadRestartCodexOnSwitch, setRestartCodexOnSwitch,
+  refreshQuota, refreshProfile, refreshQuotaBatch, switchAccount, loadRefreshInterval, setRefreshInterval,
+  loadRestartCodexOnSwitch, setRestartCodexOnSwitch, loadAccountViewMode, setAccountViewMode,
 } = useAccounts();
 
 const showDialog = ref(false);
@@ -25,6 +39,15 @@ const showStorageDetails = ref(false);
 const savingAccount = ref(false);
 const migratingAccounts = ref(false);
 const oauthAdding = ref(false);
+const showToolsMenu = ref(false);
+const codexAppSpeed = ref<CodexAppSpeed>('standard');
+const codexSpeedSaving = ref(false);
+const batchRefreshing = ref(false);
+const batchRefreshProgress = ref<BatchRefreshProgress | null>(null);
+const batchRefreshFailures = ref<BatchRefreshFailure[]>([]);
+const detailAccountId = ref<number | null>(null);
+const healthCheckingId = ref<number | null>(null);
+const healthReports = ref<Record<number, AccountHealthReport>>({});
 const showOauthDialog = ref(false);
 const oauthLoginId = ref('');
 const oauthUrl = ref('');
@@ -33,6 +56,16 @@ const oauthError = ref('');
 const oauthUrlCopied = ref(false);
 const oauthTimedOut = ref(false);
 const importInput = ref<HTMLInputElement | null>(null);
+const importBackupText = ref('');
+const importPassword = ref('');
+const importPreview = ref<BackupPreview | null>(null);
+const importStrategy = ref<ImportBackupStrategy>('add');
+const importingBackup = ref(false);
+const showImportPreviewDialog = ref(false);
+const showOperationLogs = ref(false);
+const operationLogs = ref<OperationLog[]>([]);
+const operationLogsLoading = ref(false);
+const operationLogAccountId = ref<number | null>(null);
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 let unlistenOauth: UnlistenFn | null = null;
 let unlistenOauthTimeout: UnlistenFn | null = null;
@@ -44,6 +77,341 @@ const intervalOptions = [
   { label: '15 分钟', value: 15 },
   { label: '30 分钟', value: 30 },
 ];
+
+type AccountFilterStatus = 'all' | 'current' | 'usable' | 'unavailable' | 'authInvalid' | 'quotaLimited' | 'queryFailed' | 'empty';
+type AccountSortBy = 'created_at' | 'name' | 'primary_remaining' | 'secondary_remaining' | 'primary_reset' | 'secondary_reset' | 'last_checked';
+type AccountSortDirection = 'asc' | 'desc';
+type ErrorReasonKey = 'missing_json' | 'auth' | 'billing' | 'forbidden' | 'rate_limit' | 'network' | 'parse' | 'other';
+
+interface ErrorReason {
+  key: ErrorReasonKey;
+  label: string;
+}
+
+const searchQuery = ref('');
+const accountFilterStatus = ref<AccountFilterStatus>('all');
+const accountSortBy = ref<AccountSortBy>('created_at');
+const accountSortDirection = ref<AccountSortDirection>('desc');
+
+const filterOptions: Array<{ label: string; value: AccountFilterStatus }> = [
+  { label: '全部', value: 'all' },
+  { label: '当前', value: 'current' },
+  { label: '可用', value: 'usable' },
+  { label: '不可用', value: 'unavailable' },
+  { label: '授权无效', value: 'authInvalid' },
+  { label: '额度受限', value: 'quotaLimited' },
+  { label: '查询失败', value: 'queryFailed' },
+  { label: '无凭据', value: 'empty' },
+];
+
+const sortOptions: Array<{ label: string; value: AccountSortBy }> = [
+  { label: '创建时间', value: 'created_at' },
+  { label: '账号名称', value: 'name' },
+  { label: '额度一剩余', value: 'primary_remaining' },
+  { label: '额度二剩余', value: 'secondary_remaining' },
+  { label: '额度一重置', value: 'primary_reset' },
+  { label: '额度二重置', value: 'secondary_reset' },
+  { label: '最近检查', value: 'last_checked' },
+];
+
+function quotaRemaining(used: number): number {
+  return Math.max(0, Math.min(100, 100 - used));
+}
+
+function quotaWindowLabel(minutes: number | null, fallback: 'primary' | 'secondary', compact = false): string {
+  if (!minutes || minutes <= 0) {
+    return fallback === 'secondary' ? (compact ? '周' : '周额度') : (compact ? '5h' : '5 小时额度');
+  }
+
+  const hourMinutes = 60;
+  const dayMinutes = 24 * hourMinutes;
+  const weekMinutes = 7 * dayMinutes;
+  if (minutes >= 28 * dayMinutes && minutes <= 31 * dayMinutes) return compact ? '月' : '月额度';
+  if (minutes >= weekMinutes - 1) {
+    const weeks = Math.ceil(minutes / weekMinutes);
+    return weeks <= 1 ? (compact ? '周' : '周额度') : `${weeks} 周额度`;
+  }
+  if (minutes >= dayMinutes - 1) return `${Math.ceil(minutes / dayMinutes)}d 额度`;
+  if (minutes >= hourMinutes) return `${Math.ceil(minutes / hourMinutes)}h 额度`;
+  return `${Math.ceil(minutes)}m 额度`;
+}
+
+function quotaSummaryLabel(accounts: Account[], field: 'primary' | 'secondary'): string {
+  const minutes = Array.from(new Set(
+    accounts
+      .map(account => field === 'primary' ? account.primary_window_minutes : account.secondary_window_minutes)
+      .filter((value): value is number => typeof value === 'number' && value > 0),
+  ));
+  if (minutes.length === 1) return quotaWindowLabel(minutes[0], field, true);
+  return field === 'primary' ? '额度一' : '额度二';
+}
+
+function formatResetTime(timestamp: number): string {
+  if (!timestamp) return '-';
+  const d = new Date(timestamp * 1000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function formatCheckedTime(value: string): string {
+  if (!value) return '尚未检查';
+  return value.replace('T', ' ');
+}
+
+function hasQuotaError(account: Account): boolean {
+  return Boolean(account.last_quota_error?.trim());
+}
+
+function extractHttpStatus(error: string): number | null {
+  const explicitMatch = error.match(/\b(?:http\s*status|status(?:\s*code)?|code|http)\D*(\d{3})\b/i);
+  if (explicitMatch) return Number(explicitMatch[1]);
+  const standaloneMatch = error.match(/\b([45]\d{2})\b/);
+  return standaloneMatch ? Number(standaloneMatch[1]) : null;
+}
+
+function accountErrorReason(account: Account): ErrorReason | null {
+  if (!account.has_json_info) {
+    return { key: 'missing_json', label: '无凭据' };
+  }
+
+  const rawError = account.last_quota_error?.trim();
+  if (!rawError) return null;
+
+  const error = rawError.toLowerCase();
+  const status = extractHttpStatus(rawError);
+
+  if (
+    status === 401
+    || error.includes('unauthorized')
+    || error.includes('auth')
+    || error.includes('token')
+    || error.includes('refresh')
+    || error.includes('授权')
+    || error.includes('登录')
+  ) {
+    return { key: 'auth', label: '401 授权无效' };
+  }
+
+  if (
+    status === 402
+    || error.includes('payment required')
+    || error.includes('billing')
+    || error.includes('insufficient_quota')
+    || error.includes('quota exceeded')
+    || error.includes('额度')
+    || error.includes('付款')
+  ) {
+    return { key: 'billing', label: '402 额度/付款' };
+  }
+
+  if (status === 403 || error.includes('forbidden') || error.includes('permission') || error.includes('权限')) {
+    return { key: 'forbidden', label: '403 权限拒绝' };
+  }
+
+  if (status === 429 || error.includes('rate limit') || error.includes('too many requests') || error.includes('频率')) {
+    return { key: 'rate_limit', label: '429 频率限制' };
+  }
+
+  if (
+    error.includes('timeout')
+    || error.includes('network')
+    || error.includes('connection')
+    || error.includes('dns')
+    || error.includes('timed out')
+    || error.includes('网络')
+    || error.includes('超时')
+  ) {
+    return { key: 'network', label: '网络/超时' };
+  }
+
+  if (error.includes('json') || error.includes('parse') || error.includes('解析')) {
+    return { key: 'parse', label: '数据解析' };
+  }
+
+  return { key: 'other', label: status ? `${status} 其他错误` : '其他错误' };
+}
+
+function isAuthInvalid(account: Account): boolean {
+  const reason = accountErrorReason(account);
+  return reason?.key === 'auth';
+}
+
+function isQuotaLimited(account: Account): boolean {
+  const reason = accountErrorReason(account);
+  if (reason?.key === 'billing' || reason?.key === 'forbidden' || reason?.key === 'rate_limit') return true;
+  if (!account.has_json_info || hasQuotaError(account)) return false;
+  const primaryEmpty = account.primary_window_present && quotaRemaining(account.primary_used_percent) <= 0;
+  const secondaryEmpty = account.secondary_window_present && quotaRemaining(account.secondary_used_percent) <= 0;
+  return primaryEmpty || secondaryEmpty;
+}
+
+function isQuotaQueryFailed(account: Account): boolean {
+  const reason = accountErrorReason(account);
+  return reason?.key === 'network' || reason?.key === 'parse' || reason?.key === 'other';
+}
+
+function isAccountUnavailable(account: Account): boolean {
+  const reason = accountErrorReason(account);
+  return reason?.key === 'missing_json' || reason?.key === 'auth';
+}
+
+function isAccountUsable(account: Account): boolean {
+  return account.has_json_info && !isAccountUnavailable(account) && !isQuotaLimited(account);
+}
+
+function accountMatchesStatus(account: Account, status: AccountFilterStatus): boolean {
+  if (status === 'all') return true;
+  if (status === 'current') return currentAccountRecordId.value === account.id;
+  if (status === 'usable') return isAccountUsable(account);
+  if (status === 'unavailable') return isAccountUnavailable(account);
+  if (status === 'authInvalid') return isAuthInvalid(account);
+  if (status === 'quotaLimited') return isQuotaLimited(account);
+  if (status === 'queryFailed') return isQuotaQueryFailed(account);
+  if (status === 'empty') return !account.has_json_info;
+  return true;
+}
+
+function dateValue(value: string): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value.includes('T') ? value : value.replace(' ', 'T'));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sortValue(account: Account, sortBy: AccountSortBy): number | string {
+  if (sortBy === 'name') return account.name.toLowerCase();
+  if (sortBy === 'primary_remaining') return quotaRemaining(account.primary_used_percent);
+  if (sortBy === 'secondary_remaining') return quotaRemaining(account.secondary_used_percent);
+  if (sortBy === 'primary_reset') return account.primary_reset_at || 0;
+  if (sortBy === 'secondary_reset') return account.secondary_reset_at || 0;
+  if (sortBy === 'last_checked') return dateValue(account.last_quota_checked_at);
+  return dateValue(account.created_at);
+}
+
+const currentAccount = computed(() => {
+  if (currentAccountRecordId.value === null) return null;
+  return accounts.value.find(account => account.id === currentAccountRecordId.value) ?? null;
+});
+
+const detailAccount = computed(() => {
+  if (detailAccountId.value === null) return null;
+  return accounts.value.find(account => account.id === detailAccountId.value) ?? null;
+});
+
+const accountStats = computed(() => {
+  const usableAccounts = accounts.value.filter(isAccountUsable);
+  const current = currentAccount.value;
+  const errorReasonCounts = new Map<string, { label: string; count: number }>();
+  const unavailable = accounts.value.filter(isAccountUnavailable).length;
+  const quotaLimited = accounts.value.filter(isQuotaLimited).length;
+  const queryFailed = accounts.value.filter(isQuotaQueryFailed).length;
+
+  accounts.value.forEach((account) => {
+    const reason = accountErrorReason(account);
+    if (!reason) return;
+    const existing = errorReasonCounts.get(reason.key);
+    if (existing) {
+      existing.count += 1;
+    } else {
+      errorReasonCounts.set(reason.key, { label: reason.label, count: 1 });
+    }
+  });
+
+  return {
+    total: accounts.value.length,
+    usable: usableAccounts.length,
+    unavailable,
+    quotaLimited,
+    queryFailed,
+    issueCount: unavailable + quotaLimited + queryFailed,
+    authInvalid: accounts.value.filter(isAuthInvalid).length,
+    errorReasons: Array.from(errorReasonCounts.values()),
+    currentName: current?.name ?? '未切换',
+    currentPrimaryRemaining: current ? quotaRemaining(current.primary_used_percent) : null,
+    currentSecondaryRemaining: current ? quotaRemaining(current.secondary_used_percent) : null,
+    currentPrimaryLabel: current ? quotaWindowLabel(current.primary_window_minutes, 'primary', true) : '额度一',
+    currentSecondaryLabel: current ? quotaWindowLabel(current.secondary_window_minutes, 'secondary', true) : '额度二',
+    currentSecondaryVisible: current?.secondary_window_present ?? true,
+    totalPrimaryLabel: quotaSummaryLabel(usableAccounts, 'primary'),
+    totalSecondaryLabel: quotaSummaryLabel(usableAccounts, 'secondary'),
+    totalPrimaryRemaining: usableAccounts
+      .filter(account => account.primary_window_present)
+      .reduce((sum, account) => sum + quotaRemaining(account.primary_used_percent), 0),
+    totalSecondaryRemaining: usableAccounts
+      .filter(account => account.secondary_window_present)
+      .reduce((sum, account) => sum + quotaRemaining(account.secondary_used_percent), 0),
+    hasSecondaryQuota: usableAccounts.some(account => account.secondary_window_present),
+  };
+});
+
+const filteredAccounts = computed(() => {
+  const query = searchQuery.value.trim().toLowerCase();
+  const direction = accountSortDirection.value === 'asc' ? 1 : -1;
+
+  return accounts.value
+    .filter((account) => {
+      if (!accountMatchesStatus(account, accountFilterStatus.value)) return false;
+      if (!query) return true;
+      return [
+        account.name,
+        account.account_id ?? '',
+        account.plan_type,
+        String(account.id),
+      ].some(value => value.toLowerCase().includes(query));
+    })
+    .slice()
+    .sort((a, b) => {
+      const left = sortValue(a, accountSortBy.value);
+      const right = sortValue(b, accountSortBy.value);
+      if (typeof left === 'string' || typeof right === 'string') {
+        return String(left).localeCompare(String(right), 'zh-Hans-CN') * direction;
+      }
+      if (left === right) return b.id - a.id;
+      return (left - right) * direction;
+    });
+});
+
+const filteredRefreshableIds = computed(() =>
+  filteredAccounts.value
+    .filter(account => account.has_json_info)
+    .map(account => account.id),
+);
+
+const hasActiveAccountFilters = computed(() =>
+  Boolean(searchQuery.value.trim()) || accountFilterStatus.value !== 'all',
+);
+
+const detailHealthItems = computed(() => {
+  const account = detailAccount.value;
+  if (!account) return [];
+  return [
+    {
+      label: '凭据',
+      ok: account.has_json_info,
+      text: account.has_json_info ? '已保存' : '缺失',
+    },
+    {
+      label: '账号 ID',
+      ok: Boolean(account.account_id),
+      text: account.account_id ? '已识别' : '未识别',
+    },
+    {
+      label: '额度接口',
+      ok: !account.last_quota_error,
+      text: account.last_quota_error ? '最近失败' : '正常',
+    },
+    {
+      label: '当前运行',
+      ok: currentAccountRecordId.value === account.id,
+      text: currentAccountRecordId.value === account.id ? '是' : '否',
+    },
+  ];
+});
+
+const detailHealthReport = computed(() => {
+  const account = detailAccount.value;
+  if (!account) return null;
+  return healthReports.value[account.id] ?? null;
+});
 
 onMounted(async () => {
   unlistenOauth = await listen<{ loginId?: string }>('codex-oauth-login-completed', async (event) => {
@@ -64,6 +432,8 @@ onMounted(async () => {
   await loadMigrationStatus();
   await loadRefreshInterval(10);
   await loadRestartCodexOnSwitch(true);
+  await loadAccountViewMode('cards');
+  await loadCodexAppSpeed();
 });
 
 onUnmounted(() => {
@@ -92,7 +462,8 @@ async function addAccountWithOAuth() {
   oauthAdding.value = true;
   try {
     const started = await invoke<{ loginId: string; authUrl: string }>('start_codex_oauth_login', {
-      openBrowser: true,
+      openBrowser: false,
+      forceAccountSelection: true,
     });
     oauthLoginId.value = started.loginId;
     oauthUrl.value = started.authUrl;
@@ -132,11 +503,6 @@ async function closeOauthDialog() {
 
 async function retryOauthLogin() {
   await closeOauthDialog();
-  await addAccountWithOAuth();
-}
-
-async function reauthorizeAccount(account: Account) {
-  showMessage(`正在为 ${account.name} 重新授权...`);
   await addAccountWithOAuth();
 }
 
@@ -189,6 +555,29 @@ async function loadStoragePaths() {
   }
 }
 
+async function loadCodexAppSpeed() {
+  try {
+    const config = await invoke<CodexAppSpeedConfig>('get_codex_app_speed_config');
+    codexAppSpeed.value = config.speed;
+  } catch (e) {
+    showMessage(`读取 Codex 速度失败: ${e}`, 'error');
+  }
+}
+
+async function changeCodexAppSpeed(speed: CodexAppSpeed) {
+  if (codexAppSpeed.value === speed || codexSpeedSaving.value) return;
+  codexSpeedSaving.value = true;
+  try {
+    const config = await invoke<CodexAppSpeedConfig>('set_codex_app_speed', { speed });
+    codexAppSpeed.value = config.speed;
+    showMessage(config.speed === 'fast' ? '已切换为 Fast 模式' : '已切换为标准模式');
+  } catch (e) {
+    showMessage(`切换速度失败: ${e}`, 'error');
+  } finally {
+    codexSpeedSaving.value = false;
+  }
+}
+
 async function copyText(text: string, label: string) {
   try {
     await navigator.clipboard.writeText(text);
@@ -207,6 +596,7 @@ async function copyText(text: string, label: string) {
 }
 
 async function openStorageFolder() {
+  showToolsMenu.value = false;
   try {
     await invoke('open_storage_folder');
     showMessage('已打开账号库目录');
@@ -216,6 +606,7 @@ async function openStorageFolder() {
 }
 
 async function openAuthFolder() {
+  showToolsMenu.value = false;
   try {
     await invoke('open_codex_auth_folder');
     showMessage('已打开当前账号目录');
@@ -240,6 +631,31 @@ async function handleSave(data: { name: string; activationDate: string; jsonInfo
     showMessage(`保存失败: ${e}`, 'error');
   } finally {
     savingAccount.value = false;
+  }
+}
+
+async function repairProjectVisibility() {
+  showToolsMenu.value = false;
+  try {
+    const status = await invoke<CodexProjectVisibilityStatus>('get_codex_project_visibility_status', {
+      projectPath: null,
+    });
+    const projectPath = prompt(
+      '请输入要修复为 trusted 的 Codex 项目路径。此操作只会新增或修正该项目的 trust_level，不会修改 provider、MCP、模型或内存配置。',
+      status.project_path,
+    );
+    if (!projectPath?.trim()) return;
+
+    const repaired = await invoke<CodexProjectVisibilityStatus>('repair_codex_project_visibility', {
+      projectPath: projectPath.trim(),
+    });
+    showMessage(
+      repaired.changed
+        ? `项目可见性已修复: ${repaired.project_path}`
+        : `项目已经是 trusted: ${repaired.project_path}`,
+    );
+  } catch (e) {
+    showMessage(`修复项目可见性失败: ${e}`, 'error');
   }
 }
 
@@ -276,19 +692,33 @@ function downloadTextFile(fileName: string, text: string) {
   URL.revokeObjectURL(url);
 }
 
-async function exportBackup() {
+async function exportBackup(accountIds?: number[]) {
+  showToolsMenu.value = false;
   const password = prompt('请输入备份密码（至少 8 位）。导入时需要同一个密码。');
   if (!password) return;
   try {
-    const backupText = await invoke<string>('export_encrypted_backup', { password });
+    const backupText = await invoke<string>('export_encrypted_backup', {
+      password,
+      accountIds: accountIds && accountIds.length > 0 ? accountIds : null,
+    });
     downloadTextFile(backupFileName(), backupText);
-    showMessage('加密备份已导出');
+    showMessage(`加密备份已导出（${accountIds?.length || accounts.value.length} 个账号）`);
   } catch (e) {
     showMessage(`导出备份失败: ${e}`, 'error');
   }
 }
 
+async function exportFilteredBackup() {
+  const ids = filteredAccounts.value.filter(account => account.has_json_info).map(account => account.id);
+  if (ids.length === 0) {
+    showMessage('当前筛选结果里没有可导出的账号', 'error');
+    return;
+  }
+  await exportBackup(ids);
+}
+
 function openImportBackup() {
+  showToolsMenu.value = false;
   importInput.value?.click();
 }
 
@@ -303,16 +733,48 @@ async function importBackup(e: Event) {
 
   try {
     const backupText = await file.text();
-    const count = await invoke<number>('import_encrypted_backup', { backupText, password });
-    await loadAccounts();
-    await loadMigrationStatus();
-    showMessage(`已导入 ${count} 个账号`);
+    const preview = await invoke<BackupPreview>('preview_encrypted_backup', { backupText, password });
+    importBackupText.value = backupText;
+    importPassword.value = password;
+    importPreview.value = preview;
+    importStrategy.value = preview.duplicate_accounts > 0 ? 'skip_duplicates' : 'add';
+    showImportPreviewDialog.value = true;
   } catch (err) {
-    showMessage(`导入备份失败: ${err}`, 'error');
+    showMessage(`读取备份失败: ${err}`, 'error');
   }
 }
 
+async function confirmImportBackup() {
+  if (!importPreview.value) return;
+  importingBackup.value = true;
+  try {
+    const result = await invoke<ImportBackupResult>('import_encrypted_backup', {
+      backupText: importBackupText.value,
+      password: importPassword.value,
+      strategy: importStrategy.value,
+    });
+    await loadAccounts();
+    await loadMigrationStatus();
+    closeImportPreviewDialog();
+    showMessage(`导入完成：新增 ${result.imported}，更新 ${result.updated}，跳过 ${result.skipped}`);
+  } catch (err) {
+    showMessage(`导入备份失败: ${err}`, 'error');
+  } finally {
+    importingBackup.value = false;
+  }
+}
+
+function closeImportPreviewDialog() {
+  showImportPreviewDialog.value = false;
+  importBackupText.value = '';
+  importPassword.value = '';
+  importPreview.value = null;
+  importStrategy.value = 'add';
+  importingBackup.value = false;
+}
+
 async function migrateOldAccounts() {
+  showToolsMenu.value = false;
   const pending = migrationStatus.value?.pending_plaintext_accounts ?? 0;
   if (pending <= 0) return;
   if (!confirm(`检测到 ${pending} 个旧账号仍在数据库明文保存。现在迁移到系统凭据库吗？`)) return;
@@ -355,6 +817,68 @@ async function handleRefreshProfile(id: number) {
   catch (e) { showMessage(`资料刷新失败: ${e}`, 'error'); }
 }
 
+function resetAccountFilters() {
+  searchQuery.value = '';
+  accountFilterStatus.value = 'all';
+  accountSortBy.value = 'created_at';
+  accountSortDirection.value = 'desc';
+}
+
+function toggleSortDirection() {
+  accountSortDirection.value = accountSortDirection.value === 'desc' ? 'asc' : 'desc';
+}
+
+async function refreshFilteredAccounts() {
+  const ids = filteredRefreshableIds.value;
+  if (ids.length === 0) {
+    showMessage('当前筛选结果里没有可刷新的账号', 'error');
+    return;
+  }
+
+  batchRefreshing.value = true;
+  batchRefreshFailures.value = [];
+  batchRefreshProgress.value = { done: 0, total: ids.length, currentName: '' };
+  try {
+    const result = await refreshQuotaBatch(ids, (progress) => {
+      batchRefreshProgress.value = progress;
+    });
+    batchRefreshFailures.value = result.failures;
+    showMessage(
+      `批量刷新完成：成功 ${result.success}，失败 ${result.failed}，跳过 ${result.skipped}`,
+      result.failed > 0 ? 'error' : 'success',
+    );
+  } catch (e) {
+    showMessage(`批量刷新失败: ${e}`, 'error');
+  } finally {
+    batchRefreshing.value = false;
+    batchRefreshProgress.value = null;
+  }
+}
+
+async function runAccountHealthCheck(accountId: number) {
+  healthCheckingId.value = accountId;
+  try {
+    const report = await invoke<AccountHealthReport>('check_account_health', { id: accountId });
+    healthReports.value = {
+      ...healthReports.value,
+      [accountId]: report,
+    };
+    await loadAccounts();
+    showMessage(
+      report.summary_status === 'ok'
+        ? '账号健康检查通过'
+        : report.summary_status === 'warn'
+          ? '账号健康检查完成，有警告'
+          : '账号健康检查发现问题',
+      report.summary_status === 'error' ? 'error' : 'success',
+    );
+  } catch (e) {
+    showMessage(`账号健康检查失败: ${e}`, 'error');
+  } finally {
+    healthCheckingId.value = null;
+  }
+}
+
 async function handleIntervalChange(e: Event) {
   await setRefreshInterval(Number((e.target as HTMLSelectElement).value));
 }
@@ -362,10 +886,97 @@ async function handleIntervalChange(e: Event) {
 async function handleRestartToggle(e: Event) {
   await setRestartCodexOnSwitch((e.target as HTMLInputElement).checked);
 }
+
+function toggleStorageDetails() {
+  showToolsMenu.value = false;
+  showStorageDetails.value = !showStorageDetails.value;
+}
+
+function formatLogDetails(details: string): string {
+  if (!details.trim()) return '';
+  try {
+    return JSON.stringify(JSON.parse(details), null, 2);
+  } catch {
+    return details;
+  }
+}
+
+function logLevelLabel(level: string): string {
+  if (level === 'error') return '错误';
+  if (level === 'warn') return '警告';
+  return '信息';
+}
+
+function logActionLabel(action: string): string {
+  if (action === 'refresh_quota') return '刷新额度';
+  if (action === 'switch_account') return '切换账号';
+  if (action === 'oauth_login') return 'OAuth 登录';
+  return action;
+}
+
+function logAccountLabel(log: OperationLog): string {
+  const name = log.account_name || (log.account_id ? `#${log.account_id}` : '系统');
+  return log.account_identifier ? `${name} · ${log.account_identifier}` : name;
+}
+
+async function loadOperationLogs() {
+  operationLogsLoading.value = true;
+  try {
+    operationLogs.value = await invoke<OperationLog[]>('list_operation_logs', {
+      accountId: operationLogAccountId.value,
+      limit: 200,
+    });
+  } catch (e) {
+    showMessage(`读取日志失败: ${e}`, 'error');
+  } finally {
+    operationLogsLoading.value = false;
+  }
+}
+
+async function openOperationLogs(accountId: number | null = null) {
+  showToolsMenu.value = false;
+  operationLogAccountId.value = accountId;
+  showOperationLogs.value = true;
+  await loadOperationLogs();
+}
+
+function closeOperationLogs() {
+  showOperationLogs.value = false;
+}
+
+async function changeOperationLogAccount(e: Event) {
+  const value = (e.target as HTMLSelectElement).value;
+  operationLogAccountId.value = value ? Number(value) : null;
+  await loadOperationLogs();
+}
+
+async function clearOperationLogs() {
+  if (!confirm('确定清空所有操作日志吗？')) return;
+  try {
+    await invoke('clear_operation_logs');
+    await loadOperationLogs();
+    showMessage('操作日志已清空');
+  } catch (e) {
+    showMessage(`清空日志失败: ${e}`, 'error');
+  }
+}
+
+function openDetailDrawer(account: Account) {
+  detailAccountId.value = account.id;
+}
+
+function closeDetailDrawer() {
+  detailAccountId.value = null;
+}
+
+function editDetailAccount(account: Account) {
+  closeDetailDrawer();
+  openEditDialog(account);
+}
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" @click="showToolsMenu = false">
     <!-- Header -->
     <header class="header">
       <div class="header-bg"></div>
@@ -391,9 +1002,9 @@ async function handleRestartToggle(e: Event) {
               <option v-for="opt in intervalOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
             </select>
           </div>
-          <label class="restart-toggle" title="关闭后切换账号只写入 auth.json，不会结束或重启 Codex">
+          <label class="restart-toggle" title="开启：写入 auth.json 并重启 Codex，当前运行环境立即生效。关闭：仅写入 auth.json，下次启动生效。">
             <input type="checkbox" :checked="restartCodexOnSwitch" @change="handleRestartToggle" />
-            <span>切换后重启 Codex</span>
+            <span>立即生效（重启 Codex）</span>
           </label>
           <button class="btn-add btn-oauth" :disabled="oauthAdding" @click="addAccountWithOAuth">
             <svg v-if="oauthAdding" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
@@ -447,7 +1058,7 @@ async function handleRestartToggle(e: Event) {
             </div>
           </div>
 
-          <div class="storage-actions">
+          <div class="storage-actions" @click.stop>
             <button
               v-if="migrationStatus && migrationStatus.pending_plaintext_accounts > 0"
               class="btn-storage-warning"
@@ -456,12 +1067,6 @@ async function handleRestartToggle(e: Event) {
             >
               {{ migratingAccounts ? '迁移中...' : `迁移旧账号 (${migrationStatus.pending_plaintext_accounts})` }}
             </button>
-            <button class="btn-storage-primary" @click="exportBackup">
-              导出加密备份
-            </button>
-            <button class="btn-storage" @click="openImportBackup">
-              导入备份
-            </button>
             <input
               ref="importInput"
               class="backup-input"
@@ -469,15 +1074,40 @@ async function handleRestartToggle(e: Event) {
               accept="application/json,.json"
               @change="importBackup"
             />
-            <button class="btn-storage-primary" @click="openStorageFolder">
-              打开账号库目录
-            </button>
-            <button class="btn-storage" @click="openAuthFolder">
-              打开当前账号目录
-            </button>
-            <button class="btn-storage" @click="showStorageDetails = !showStorageDetails">
-              {{ showStorageDetails ? '收起' : '详情' }}
-            </button>
+            <div class="tools-menu-wrap">
+              <button class="btn-storage-primary btn-tools" @click="showToolsMenu = !showToolsMenu">
+                <span>工具</span>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="6 9 12 15 18 9"/>
+                </svg>
+              </button>
+              <div v-if="showToolsMenu" class="tools-menu">
+                <button @click="() => exportBackup()">
+                  <span>导出全部账号</span>
+                </button>
+                <button @click="exportFilteredBackup">
+                  <span>导出当前筛选结果</span>
+                </button>
+                <button @click="openImportBackup">
+                  <span>导入备份</span>
+                </button>
+                <button @click="openStorageFolder">
+                  <span>打开账号库目录</span>
+                </button>
+                <button @click="openAuthFolder">
+                  <span>打开当前账号目录</span>
+                </button>
+                <button @click="repairProjectVisibility">
+                  <span>修复项目可见性</span>
+                </button>
+                <button @click="() => openOperationLogs()">
+                  <span>查看操作日志</span>
+                </button>
+                <button @click="toggleStorageDetails">
+                  <span>{{ showStorageDetails ? '收起存储详情' : '查看存储详情' }}</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -501,19 +1131,364 @@ async function handleRestartToggle(e: Event) {
         </div>
       </section>
 
+      <section class="overview-panel">
+        <div class="stat-grid">
+          <div class="stat-item">
+            <span class="stat-label">当前账号</span>
+            <strong :title="accountStats.currentName">{{ accountStats.currentName }}</strong>
+            <small v-if="accountStats.currentPrimaryRemaining !== null">
+              {{ accountStats.currentPrimaryLabel }} {{ accountStats.currentPrimaryRemaining }}%
+              <template v-if="accountStats.currentSecondaryVisible">
+                · {{ accountStats.currentSecondaryLabel }} {{ accountStats.currentSecondaryRemaining }}%
+              </template>
+            </small>
+            <small v-else>尚未写入当前 auth.json</small>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">账号数量</span>
+            <strong>{{ accountStats.total }}</strong>
+            <small>可用 {{ accountStats.usable }} 个</small>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">总剩余额度</span>
+            <strong>{{ accountStats.totalPrimaryLabel }} {{ accountStats.totalPrimaryRemaining }}%</strong>
+            <small v-if="accountStats.hasSecondaryQuota">{{ accountStats.totalSecondaryLabel }} {{ accountStats.totalSecondaryRemaining }}%</small>
+            <small v-else>无第二额度窗口</small>
+          </div>
+          <div class="stat-item stat-warn">
+            <span class="stat-label">状态问题</span>
+            <strong>{{ accountStats.issueCount }}</strong>
+            <small
+              v-if="accountStats.issueCount > 0"
+              class="stat-error-reasons"
+              :title="accountStats.errorReasons.map(item => `${item.label} ${item.count} 个`).join(' · ')"
+            >
+              不可用 {{ accountStats.unavailable }} · 额度受限 {{ accountStats.quotaLimited }} · 查询失败 {{ accountStats.queryFailed }}
+            </small>
+            <small v-else>没有问题</small>
+          </div>
+        </div>
+
+        <div class="overview-controls">
+          <div class="segmented" title="Codex 桌面速度">
+            <button
+              :class="{ active: codexAppSpeed === 'standard' }"
+              :disabled="codexSpeedSaving"
+              @click="changeCodexAppSpeed('standard')"
+            >
+              标准
+            </button>
+            <button
+              :class="{ active: codexAppSpeed === 'fast' }"
+              :disabled="codexSpeedSaving"
+              @click="changeCodexAppSpeed('fast')"
+            >
+              Fast
+            </button>
+          </div>
+          <div class="segmented view-segmented" title="账号展示方式">
+            <button :class="{ active: accountViewMode === 'cards' }" @click="setAccountViewMode('cards')">
+              卡片
+            </button>
+            <button :class="{ active: accountViewMode === 'compact' }" @click="setAccountViewMode('compact')">
+              紧凑
+            </button>
+            <button :class="{ active: accountViewMode === 'table' }" @click="setAccountViewMode('table')">
+              表格
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="account-toolbar">
+        <div class="toolbar-main">
+          <div class="account-search">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"/>
+              <path d="m21 21-4.3-4.3"/>
+            </svg>
+            <input
+              v-model="searchQuery"
+              type="search"
+              placeholder="搜索账号名、account_id、记录 ID"
+            />
+          </div>
+
+          <div class="toolbar-selects">
+            <label>
+              <span>状态</span>
+              <select v-model="accountFilterStatus">
+                <option v-for="option in filterOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+            <label>
+              <span>排序</span>
+              <select v-model="accountSortBy">
+                <option v-for="option in sortOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
+            <button class="btn-toolbar-icon" :title="accountSortDirection === 'desc' ? '降序' : '升序'" @click="toggleSortDirection">
+              <svg v-if="accountSortDirection === 'desc'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 5v14"/>
+                <path d="m19 12-7 7-7-7"/>
+              </svg>
+              <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 19V5"/>
+                <path d="m5 12 7-7 7 7"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="toolbar-actions">
+          <span class="toolbar-result">
+            {{ filteredAccounts.length }} / {{ accounts.length }} 个账号
+          </span>
+          <button
+            class="btn-toolbar"
+            :disabled="batchRefreshing || filteredRefreshableIds.length === 0"
+            @click="refreshFilteredAccounts"
+          >
+            <svg v-if="batchRefreshing" class="spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+              <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+            </svg>
+            <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+            {{
+              batchRefreshing && batchRefreshProgress
+                ? `刷新中 ${batchRefreshProgress.done}/${batchRefreshProgress.total}`
+                : `刷新筛选结果 (${filteredRefreshableIds.length})`
+            }}
+          </button>
+          <button v-if="hasActiveAccountFilters" class="btn-toolbar btn-toolbar-ghost" @click="resetAccountFilters">
+            清空
+          </button>
+        </div>
+      </section>
+
+      <section v-if="batchRefreshFailures.length > 0" class="batch-failures">
+        <div class="batch-failures-head">
+          <strong>批量刷新失败 {{ batchRefreshFailures.length }} 个</strong>
+          <button @click="batchRefreshFailures = []">清除</button>
+        </div>
+        <div class="batch-failure-list">
+          <div v-for="failure in batchRefreshFailures" :key="failure.id" class="batch-failure-item">
+            <span :title="failure.name">{{ failure.name }}</span>
+            <code :title="failure.error">{{ failure.error }}</code>
+          </div>
+        </div>
+      </section>
+
       <AccountList
-        :accounts="accounts"
+        :accounts="filteredAccounts"
         :loading="loading"
         :switching-id="switchingId"
-        :current-account-id="currentAccountId"
+        :current-account-record-id="currentAccountRecordId"
+        :view-mode="accountViewMode"
+        :empty-title="accounts.length === 0 ? '还没有账号' : '没有匹配的账号'"
+        :empty-description="accounts.length === 0 ? '使用 OAuth 登录或导入 auth.json 后，账号会出现在这里' : '调整搜索、筛选或排序条件后再查看'"
         @run="handleRun"
         @edit="openEditDialog"
         @delete="handleDelete"
         @refresh="handleRefresh"
         @profile="handleRefreshProfile"
-        @reauth="reauthorizeAccount"
+        @detail="openDetailDrawer"
       />
     </main>
+
+    <Transition name="drawer">
+      <div v-if="detailAccount" class="detail-backdrop" @click.self="closeDetailDrawer">
+        <aside class="detail-drawer">
+          <div class="detail-header">
+            <div>
+              <span class="detail-kicker">账号详情</span>
+              <h2 :title="detailAccount.name">{{ detailAccount.name }}</h2>
+            </div>
+            <button class="detail-close" @click="closeDetailDrawer" aria-label="关闭详情">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="detail-body">
+            <section class="detail-section">
+              <div class="detail-section-head">
+                <div class="detail-section-title">健康状态</div>
+                <button
+                  class="detail-mini-action"
+                  :disabled="healthCheckingId === detailAccount.id"
+                  @click="runAccountHealthCheck(detailAccount.id)"
+                >
+                  <svg v-if="healthCheckingId === detailAccount.id" class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+                    <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+                  </svg>
+                  {{ healthCheckingId === detailAccount.id ? '检查中' : '深度检查' }}
+                </button>
+              </div>
+              <div class="health-grid">
+                <div v-for="item in detailHealthItems" :key="item.label" :class="['health-item', { ok: item.ok }]">
+                  <span>{{ item.label }}</span>
+                  <strong>{{ item.text }}</strong>
+                </div>
+              </div>
+              <div v-if="detailHealthReport" class="health-report">
+                <div :class="['health-report-summary', detailHealthReport.summary_status]">
+                  <strong>
+                    {{
+                      detailHealthReport.summary_status === 'ok'
+                        ? '深度检查通过'
+                        : detailHealthReport.summary_status === 'warn'
+                          ? '深度检查有警告'
+                          : '深度检查发现问题'
+                    }}
+                  </strong>
+                  <span>{{ formatCheckedTime(detailHealthReport.checked_at) }}</span>
+                </div>
+                <div class="health-report-list">
+                  <div v-for="item in detailHealthReport.items" :key="item.key" :class="['health-report-row', item.status]">
+                    <span>{{ item.label }}</span>
+                    <strong>{{ item.message }}</strong>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="detail-section">
+              <div class="detail-section-title">额度</div>
+              <div class="detail-quota-grid">
+                <div v-if="detailAccount.primary_window_present" class="detail-quota-card">
+                  <span>{{ quotaWindowLabel(detailAccount.primary_window_minutes, 'primary') }}剩余</span>
+                  <strong>{{ quotaRemaining(detailAccount.primary_used_percent) }}%</strong>
+                  <small>重置 {{ formatResetTime(detailAccount.primary_reset_at) }}</small>
+                </div>
+                <div v-if="detailAccount.secondary_window_present" class="detail-quota-card">
+                  <span>{{ quotaWindowLabel(detailAccount.secondary_window_minutes, 'secondary') }}剩余</span>
+                  <strong>{{ quotaRemaining(detailAccount.secondary_used_percent) }}%</strong>
+                  <small>重置 {{ formatResetTime(detailAccount.secondary_reset_at) }}</small>
+                </div>
+              </div>
+            </section>
+
+            <section class="detail-section">
+              <div class="detail-section-title">基础信息</div>
+              <div class="detail-rows">
+                <div>
+                  <span>记录 ID</span>
+                  <code>#{{ detailAccount.id }}</code>
+                </div>
+                <div>
+                  <span>Account ID</span>
+                  <code>{{ detailAccount.account_id || '未识别' }}</code>
+                </div>
+                <div>
+                  <span>套餐</span>
+                  <code>{{ detailAccount.plan_type || 'unknown' }}</code>
+                </div>
+                <div>
+                  <span>开通日期</span>
+                  <code>{{ detailAccount.activation_date || '-' }}</code>
+                </div>
+                <div>
+                  <span>上次检查</span>
+                  <code>{{ formatCheckedTime(detailAccount.last_quota_checked_at) }}</code>
+                </div>
+                <div>
+                  <span>创建时间</span>
+                  <code>{{ detailAccount.created_at || '-' }}</code>
+                </div>
+                <div>
+                  <span>更新时间</span>
+                  <code>{{ detailAccount.updated_at || '-' }}</code>
+                </div>
+              </div>
+            </section>
+
+            <section v-if="detailAccount.last_quota_error" class="detail-section">
+              <div class="detail-section-title">最近错误</div>
+              <pre class="detail-error">{{ detailAccount.last_quota_error }}</pre>
+            </section>
+          </div>
+
+          <div class="detail-footer">
+            <button
+              class="btn-detail-primary"
+              :disabled="switchingId === detailAccount.id || !detailAccount.has_json_info"
+              @click="handleRun(detailAccount.id)"
+            >
+              {{ switchingId === detailAccount.id ? '切换中' : '运行此账号' }}
+            </button>
+            <button class="btn-detail-secondary" @click="handleRefresh(detailAccount.id)">
+              刷新额度
+            </button>
+            <button class="btn-detail-secondary" @click="openOperationLogs(detailAccount.id)">
+              日志
+            </button>
+            <button class="btn-detail-secondary" @click="editDetailAccount(detailAccount)">
+              编辑
+            </button>
+          </div>
+        </aside>
+      </div>
+    </Transition>
+
+    <Transition name="drawer">
+      <div v-if="showOperationLogs" class="detail-backdrop" @click.self="closeOperationLogs">
+        <aside class="log-drawer">
+          <div class="detail-header">
+            <div>
+              <span class="detail-kicker">诊断</span>
+              <h2>操作日志</h2>
+            </div>
+            <button class="detail-close" @click="closeOperationLogs" aria-label="关闭日志">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="log-toolbar">
+            <select :value="operationLogAccountId ?? ''" @change="changeOperationLogAccount">
+              <option value="">全部账号</option>
+              <option v-for="account in accounts" :key="account.id" :value="account.id">
+                {{ account.name }}
+              </option>
+            </select>
+            <button :disabled="operationLogsLoading" @click="loadOperationLogs">
+              {{ operationLogsLoading ? '刷新中' : '刷新' }}
+            </button>
+            <button class="log-clear" @click="clearOperationLogs">清空</button>
+          </div>
+
+          <div class="log-body">
+            <div v-if="operationLogsLoading" class="log-empty">读取日志中...</div>
+            <div v-else-if="operationLogs.length === 0" class="log-empty">还没有操作日志</div>
+            <template v-else>
+              <article
+                v-for="log in operationLogs"
+                :key="log.id"
+                :class="['log-item', `log-${log.level}`]"
+              >
+                <div class="log-item-head">
+                  <span class="log-level">{{ logLevelLabel(log.level) }}</span>
+                  <strong>{{ logActionLabel(log.action) }} · {{ log.stage }}</strong>
+                  <time>{{ formatCheckedTime(log.created_at) }}</time>
+                </div>
+                <p>{{ log.message }}</p>
+                <div class="log-account">{{ logAccountLabel(log) }}</div>
+                <pre v-if="log.details" class="log-details">{{ formatLogDetails(log.details) }}</pre>
+              </article>
+            </template>
+          </div>
+        </aside>
+      </div>
+    </Transition>
 
     <!-- Dialog -->
     <Transition name="dialog">
@@ -524,6 +1499,89 @@ async function handleRestartToggle(e: Event) {
         @save="handleSave"
         @close="closeDialog"
       />
+    </Transition>
+
+    <Transition name="dialog">
+      <div v-if="showImportPreviewDialog && importPreview" class="import-backdrop" @click.self="closeImportPreviewDialog">
+        <div class="import-dialog">
+          <div class="import-header">
+            <div>
+              <h2>导入备份预览</h2>
+              <p>确认导入策略后再写入账号库，重复判断基于 account_id。</p>
+            </div>
+            <button class="import-close" @click="closeImportPreviewDialog" aria-label="关闭">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="import-body">
+            <div class="import-stats">
+              <div>
+                <span>备份版本</span>
+                <strong>{{ importPreview.version }}</strong>
+              </div>
+              <div>
+                <span>账号总数</span>
+                <strong>{{ importPreview.total_accounts }}</strong>
+              </div>
+              <div>
+                <span>新增账号</span>
+                <strong>{{ importPreview.new_accounts }}</strong>
+              </div>
+              <div>
+                <span>重复账号</span>
+                <strong>{{ importPreview.duplicate_accounts }}</strong>
+              </div>
+            </div>
+
+            <div class="import-section">
+              <div class="import-section-title">导入策略</div>
+              <label class="import-strategy">
+                <input v-model="importStrategy" type="radio" value="add" />
+                <span>
+                  <strong>全部新增</strong>
+                  <small>即使 account_id 重复，也作为新记录导入。</small>
+                </span>
+              </label>
+              <label class="import-strategy">
+                <input v-model="importStrategy" type="radio" value="skip_duplicates" />
+                <span>
+                  <strong>跳过重复</strong>
+                  <small>重复 account_id 不导入，只新增缺失账号。</small>
+                </span>
+              </label>
+              <label class="import-strategy">
+                <input v-model="importStrategy" type="radio" value="merge_by_account_id" />
+                <span>
+                  <strong>合并更新</strong>
+                  <small>重复 account_id 会更新现有记录和凭据。</small>
+                </span>
+              </label>
+            </div>
+
+            <div v-if="importPreview.account_names.length > 0" class="import-section">
+              <div class="import-section-title">备份内账号</div>
+              <div class="import-name-list">
+                <span v-for="name in importPreview.account_names" :key="name">{{ name }}</span>
+                <small v-if="importPreview.total_accounts > importPreview.account_names.length">
+                  还有 {{ importPreview.total_accounts - importPreview.account_names.length }} 个账号
+                </small>
+              </div>
+            </div>
+          </div>
+
+          <div class="import-footer">
+            <button class="btn-detail-secondary" :disabled="importingBackup" @click="closeImportPreviewDialog">
+              取消
+            </button>
+            <button class="btn-detail-primary" :disabled="importingBackup" @click="confirmImportBackup">
+              {{ importingBackup ? '导入中' : '确认导入' }}
+            </button>
+          </div>
+        </div>
+      </div>
     </Transition>
 
     <Transition name="dialog">
@@ -753,6 +1811,7 @@ async function handleRestartToggle(e: Event) {
   flex: 1;
   padding: 24px 28px;
   overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* ── Storage panel ─────────────────────── */
@@ -812,6 +1871,47 @@ async function handleRestartToggle(e: Event) {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+
+.tools-menu-wrap {
+  position: relative;
+}
+
+.btn-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tools-menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 178px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+}
+
+.tools-menu button {
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tools-menu button:hover {
+  background: #f8fafc;
+  color: var(--text);
 }
 
 .btn-storage,
@@ -912,6 +2012,1008 @@ async function handleRestartToggle(e: Event) {
   margin: 12px 0 0;
   color: var(--text-tertiary);
   font-size: 12px;
+}
+
+/* ── Overview panel ───────────────────── */
+.overview-panel {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.stat-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stat-item {
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.stat-label {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.stat-item strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 5px;
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-item small {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stat-warn strong {
+  color: var(--danger);
+}
+
+.overview-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.segmented {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(62px, 1fr));
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+}
+
+.segmented button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.segmented button.active {
+  background: var(--surface);
+  color: var(--primary);
+  box-shadow: var(--shadow-xs);
+}
+
+.segmented button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.view-segmented {
+  grid-template-columns: repeat(3, minmax(54px, 1fr));
+}
+
+/* ── Account toolbar ──────────────────── */
+.account-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.toolbar-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.account-search {
+  min-width: 260px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+  color: var(--text-tertiary);
+}
+
+.account-search input {
+  min-width: 0;
+  width: 100%;
+  height: 34px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.account-search:focus-within {
+  border-color: var(--primary);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+.toolbar-selects,
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.toolbar-selects label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.toolbar-selects select {
+  height: 34px;
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.toolbar-selects select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+.btn-toolbar,
+.btn-toolbar-icon {
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-out);
+}
+
+.btn-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+}
+
+.btn-toolbar-icon {
+  width: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-toolbar:hover:not(:disabled),
+.btn-toolbar-icon:hover:not(:disabled) {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.btn-toolbar:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-toolbar-ghost {
+  color: var(--text-tertiary);
+}
+
+.toolbar-result {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.batch-failures {
+  margin: -4px 0 14px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  background: var(--danger-light);
+  overflow: hidden;
+}
+
+.batch-failures-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid #fecaca;
+}
+
+.batch-failures-head strong {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.batch-failures-head button {
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.batch-failure-list {
+  max-height: 150px;
+  overflow: auto;
+}
+
+.batch-failure-item {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(254, 202, 202, 0.75);
+}
+
+.batch-failure-item:last-child {
+  border-bottom: 0;
+}
+
+.batch-failure-item span,
+.batch-failure-item code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.batch-failure-item span {
+  color: var(--danger);
+  font-weight: 800;
+}
+
+.batch-failure-item code {
+  color: var(--text-secondary);
+  font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+}
+
+/* ── Detail drawer ────────────────────── */
+.detail-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 115;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(15, 23, 42, 0.28);
+}
+
+.detail-drawer {
+  width: 420px;
+  max-width: 94vw;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--shadow-xl);
+}
+
+.log-drawer {
+  width: 620px;
+  max-width: 96vw;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--shadow-xl);
+}
+
+.detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.detail-kicker {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.detail-header h2 {
+  overflow: hidden;
+  max-width: 320px;
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-close {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.detail-close:hover {
+  background: var(--border-light);
+  color: var(--text);
+}
+
+.detail-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 20px;
+}
+
+.detail-section + .detail-section {
+  margin-top: 18px;
+}
+
+.detail-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 9px;
+}
+
+.detail-section-title {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.detail-section > .detail-section-title {
+  margin-bottom: 9px;
+}
+
+.detail-section-head .detail-section-title {
+  margin-bottom: 0;
+}
+
+.detail-mini-action {
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.detail-mini-action:hover:not(:disabled) {
+  border-color: #c7d2fe;
+  background: var(--primary-light);
+}
+
+.detail-mini-action:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.health-grid,
+.detail-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.health-item,
+.detail-quota-card {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  background: var(--danger-light);
+}
+
+.health-item.ok {
+  border-color: #bbf7d0;
+  background: var(--success-light);
+}
+
+.health-item span,
+.detail-quota-card span {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.health-item strong,
+.detail-quota-card strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 14px;
+}
+
+.health-report {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.health-report-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border-light);
+  background: #f8fafc;
+}
+
+.health-report-summary.ok {
+  background: var(--success-light);
+}
+
+.health-report-summary.warn {
+  background: var(--warning-light);
+}
+
+.health-report-summary.error {
+  background: var(--danger-light);
+}
+
+.health-report-summary strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.health-report-summary span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.health-report-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.health-report-row {
+  display: grid;
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.health-report-row:last-child {
+  border-bottom: 0;
+}
+
+.health-report-row span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.health-report-row strong {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.health-report-row.ok strong {
+  color: #047857;
+}
+
+.health-report-row.warn strong {
+  color: #b45309;
+}
+
+.health-report-row.error strong {
+  color: var(--danger);
+}
+
+.detail-quota-card {
+  border-color: var(--border);
+  background: #f8fafc;
+}
+
+.detail-quota-card strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.detail-quota-card small {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.detail-rows {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.detail-rows div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 10px;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.detail-rows div:last-child {
+  border-bottom: 0;
+}
+
+.detail-rows span {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.detail-rows code {
+  overflow: hidden;
+  color: var(--text);
+  font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-error {
+  margin: 0;
+  padding: 10px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  background: var(--danger-light);
+  color: var(--danger);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.detail-footer {
+  display: flex;
+  gap: 8px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border-light);
+}
+
+.btn-detail-primary,
+.btn-detail-secondary {
+  height: 36px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.btn-detail-primary {
+  flex: 1;
+  border: 0;
+  background: var(--primary);
+  color: #fff;
+}
+
+.btn-detail-primary:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.btn-detail-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-detail-secondary {
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-light);
+  background: #f8fafc;
+}
+
+.log-toolbar select {
+  min-width: 0;
+  flex: 1;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.log-toolbar button {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.log-toolbar button:hover:not(:disabled) {
+  border-color: #cbd5e1;
+  background: #f1f5f9;
+}
+
+.log-toolbar button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.log-toolbar .log-clear {
+  color: var(--danger);
+}
+
+.log-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px;
+  background: #f8fafc;
+}
+
+.log-empty {
+  padding: 48px 12px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  text-align: center;
+}
+
+.log-item {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
+}
+
+.log-item + .log-item {
+  margin-top: 10px;
+}
+
+.log-error {
+  border-left-color: var(--danger);
+}
+
+.log-warn {
+  border-left-color: var(--warning);
+}
+
+.log-info {
+  border-left-color: var(--primary);
+}
+
+.log-item-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.log-level {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.log-error .log-level {
+  background: var(--danger-light);
+  color: var(--danger);
+}
+
+.log-warn .log-level {
+  background: var(--warning-light);
+  color: #b45309;
+}
+
+.log-item-head strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-item-head time {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-item p {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.log-account {
+  overflow: hidden;
+  margin-top: 6px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-details {
+  max-height: 260px;
+  overflow: auto;
+  margin: 10px 0 0;
+  padding: 10px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #0f172a;
+  color: #e2e8f0;
+  font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.drawer-enter-active,
+.drawer-leave-active {
+  transition: opacity 0.18s ease;
+}
+
+.drawer-enter-active .detail-drawer,
+.drawer-leave-active .detail-drawer {
+  transition: transform 0.18s ease;
+}
+
+.drawer-enter-from,
+.drawer-leave-to {
+  opacity: 0;
+}
+
+.drawer-enter-from .detail-drawer,
+.drawer-leave-to .detail-drawer {
+  transform: translateX(24px);
+}
+
+/* ── Import preview ───────────────────── */
+.import-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 125;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(6px);
+}
+
+.import-dialog {
+  width: 560px;
+  max-width: 94vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-xl);
+}
+
+.import-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.import-header h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 17px;
+}
+
+.import-header p {
+  margin: 6px 0 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.import-close {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.import-close:hover {
+  background: var(--border-light);
+  color: var(--text);
+}
+
+.import-body {
+  overflow-y: auto;
+  padding: 18px 22px;
+}
+
+.import-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.import-stats div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+}
+
+.import-stats span,
+.import-section-title {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.import-stats strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--text);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.import-section {
+  margin-top: 16px;
+}
+
+.import-section-title {
+  margin-bottom: 8px;
+}
+
+.import-strategy {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.import-strategy + .import-strategy {
+  margin-top: 8px;
+}
+
+.import-strategy input {
+  margin-top: 2px;
+  accent-color: var(--primary);
+}
+
+.import-strategy strong,
+.import-strategy small {
+  display: block;
+}
+
+.import-strategy strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.import-strategy small {
+  margin-top: 3px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.import-name-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.import-name-list span,
+.import-name-list small {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #f8fafc;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.import-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 22px;
+  border-top: 1px solid var(--border-light);
 }
 
 /* ── OAuth dialog ─────────────────────── */
@@ -1203,12 +3305,100 @@ async function handleRestartToggle(e: Event) {
     flex-wrap: wrap;
   }
 
+  .overview-panel {
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .overview-controls {
+    flex-direction: row;
+  }
+
+  .segmented {
+    flex: 1;
+  }
+
+  .account-toolbar,
+  .toolbar-main,
+  .toolbar-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .account-search {
+    min-width: 0;
+  }
+
+  .toolbar-selects {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 34px;
+  }
+
+  .toolbar-selects label {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .toolbar-selects select,
+  .btn-toolbar,
+  .btn-toolbar-icon {
+    width: 100%;
+  }
+
   .path-row {
     grid-template-columns: 1fr auto;
   }
 
   .path-label {
     grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 520px) {
+  .header-right,
+  .overview-controls {
+    align-items: stretch;
+    flex-direction: column;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .overview-controls .segmented {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  .overview-controls .view-segmented {
+    grid-template-columns: 1fr;
+  }
+
+  .overview-controls .segmented button {
+    min-width: 0;
+    padding-inline: 4px;
+  }
+
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-drawer {
+    width: 100vw;
+    max-width: 100vw;
+  }
+
+  .detail-quota-grid,
+  .health-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-footer {
+    flex-direction: column;
   }
 }
 </style>

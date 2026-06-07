@@ -9,8 +9,8 @@
     "beforeBuildCommand": "npm run build"
   },
   "bundle": {
-    "active": true,
-    "targets": ["app", "nsis"],
+    "active": false,
+    "targets": [],
     "icon": [
       "icons/icon.png",
       "icons/icon.icns",

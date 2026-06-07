@@ -418,6 +418,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "base64 0.22.1",
+ "chrono",
  "keyring",
  "rand_core 0.6.4",
  "reqwest 0.12.28",
