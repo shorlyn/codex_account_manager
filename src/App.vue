@@ -66,6 +66,7 @@ const showOperationLogs = ref(false);
 const operationLogs = ref<OperationLog[]>([]);
 const operationLogsLoading = ref(false);
 const operationLogAccountId = ref<number | null>(null);
+const operationLogErrorsOnly = ref(false);
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 let unlistenOauth: UnlistenFn | null = null;
 let unlistenOauthTimeout: UnlistenFn | null = null;
@@ -412,6 +413,12 @@ const detailHealthReport = computed(() => {
   if (!account) return null;
   return healthReports.value[account.id] ?? null;
 });
+
+const visibleOperationLogs = computed(() =>
+  operationLogErrorsOnly.value
+    ? operationLogs.value.filter(log => log.level === 'error')
+    : operationLogs.value,
+);
 
 onMounted(async () => {
   unlistenOauth = await listen<{ loginId?: string }>('codex-oauth-login-completed', async (event) => {
@@ -919,6 +926,34 @@ function logAccountLabel(log: OperationLog): string {
   return log.account_identifier ? `${name} · ${log.account_identifier}` : name;
 }
 
+function openFailureDetail(failure: BatchRefreshFailure) {
+  const account = accounts.value.find(item => item.id === failure.id);
+  if (account) {
+    openDetailDrawer(account);
+  } else {
+    detailAccountId.value = failure.id;
+  }
+}
+
+async function openFailureLogs(failure: BatchRefreshFailure) {
+  await openOperationLogs(failure.id);
+}
+
+function logCopyText(log: OperationLog): string {
+  const details = formatLogDetails(log.details);
+  return [
+    `[${logLevelLabel(log.level)}] ${logActionLabel(log.action)} · ${log.stage}`,
+    `时间: ${formatCheckedTime(log.created_at)}`,
+    `账号: ${logAccountLabel(log)}`,
+    `消息: ${log.message}`,
+    details ? `详情:\n${details}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+async function copyOperationLog(log: OperationLog) {
+  await copyText(logCopyText(log), '日志详情');
+}
+
 async function loadOperationLogs() {
   operationLogsLoading.value = true;
   try {
@@ -1281,6 +1316,10 @@ function editDetailAccount(account: Account) {
           <div v-for="failure in batchRefreshFailures" :key="failure.id" class="batch-failure-item">
             <span :title="failure.name">{{ failure.name }}</span>
             <code :title="failure.error">{{ failure.error }}</code>
+            <div class="batch-failure-actions">
+              <button @click="openFailureDetail(failure)">详情</button>
+              <button @click="openFailureLogs(failure)">日志</button>
+            </div>
           </div>
         </div>
       </section>
@@ -1463,15 +1502,21 @@ function editDetailAccount(account: Account) {
             <button :disabled="operationLogsLoading" @click="loadOperationLogs">
               {{ operationLogsLoading ? '刷新中' : '刷新' }}
             </button>
+            <label class="log-toggle">
+              <input v-model="operationLogErrorsOnly" type="checkbox" />
+              <span>只看错误</span>
+            </label>
             <button class="log-clear" @click="clearOperationLogs">清空</button>
           </div>
 
           <div class="log-body">
             <div v-if="operationLogsLoading" class="log-empty">读取日志中...</div>
-            <div v-else-if="operationLogs.length === 0" class="log-empty">还没有操作日志</div>
+            <div v-else-if="visibleOperationLogs.length === 0" class="log-empty">
+              {{ operationLogs.length === 0 ? '还没有操作日志' : '当前筛选没有日志' }}
+            </div>
             <template v-else>
               <article
-                v-for="log in operationLogs"
+                v-for="log in visibleOperationLogs"
                 :key="log.id"
                 :class="['log-item', `log-${log.level}`]"
               >
@@ -1479,6 +1524,7 @@ function editDetailAccount(account: Account) {
                   <span class="log-level">{{ logLevelLabel(log.level) }}</span>
                   <strong>{{ logActionLabel(log.action) }} · {{ log.stage }}</strong>
                   <time>{{ formatCheckedTime(log.created_at) }}</time>
+                  <button class="log-copy" @click="copyOperationLog(log)">复制</button>
                 </div>
                 <p>{{ log.message }}</p>
                 <div class="log-account">{{ logAccountLabel(log) }}</div>
@@ -2294,7 +2340,8 @@ function editDetailAccount(account: Account) {
 
 .batch-failure-item {
   display: grid;
-  grid-template-columns: minmax(120px, 0.28fr) minmax(0, 1fr);
+  grid-template-columns: minmax(120px, 0.26fr) minmax(0, 1fr) auto;
+  align-items: center;
   gap: 10px;
   padding: 8px 12px;
   border-bottom: 1px solid rgba(254, 202, 202, 0.75);
@@ -2320,6 +2367,29 @@ function editDetailAccount(account: Account) {
 .batch-failure-item code {
   color: var(--text-secondary);
   font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+}
+
+.batch-failure-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.batch-failure-actions button {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--danger);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.batch-failure-actions button:hover {
+  border-color: #fca5a5;
+  background: #fff;
 }
 
 /* ── Detail drawer ────────────────────── */
@@ -2719,6 +2789,27 @@ function editDetailAccount(account: Account) {
   color: var(--danger);
 }
 
+.log-toggle {
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.log-toggle input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--primary);
+}
+
 .log-body {
   flex: 1;
   overflow-y: auto;
@@ -2760,7 +2851,7 @@ function editDetailAccount(account: Account) {
 
 .log-item-head {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 8px;
 }
@@ -2796,6 +2887,23 @@ function editDetailAccount(account: Account) {
   color: var(--text-tertiary);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+.log-copy {
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.log-copy:hover {
+  border-color: #c7d2fe;
+  color: var(--primary);
 }
 
 .log-item p {
