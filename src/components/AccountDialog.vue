@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { computed, ref, watch } from 'vue';
 import type { Account } from '../types';
 
 const props = defineProps<{
   account?: Account | null;
   saving?: boolean;
+  initialJsonInfo?: string;
+  loadingJson?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -17,14 +19,27 @@ const activationDate = ref('');
 const jsonInfo = ref('');
 const jsonError = ref('');
 const jsonValid = ref(false);
-const isEdit = !!props.account;
+const isEdit = computed(() => !!props.account);
 
-onMounted(() => {
-  if (props.account) {
-    name.value = props.account.name;
-    activationDate.value = props.account.activation_date || '';
-  }
-});
+watch(
+  () => props.account,
+  (account) => {
+    name.value = account?.name || '';
+    activationDate.value = account?.activation_date || '';
+    jsonError.value = '';
+    jsonValid.value = false;
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.initialJsonInfo,
+  (value) => {
+    jsonInfo.value = value || '';
+    validateJson();
+  },
+  { immediate: true },
+);
 
 function validateJson(): boolean {
   jsonError.value = '';
@@ -63,6 +78,7 @@ function validateJson(): boolean {
 
 function handleSave() {
   if (!name.value.trim()) return;
+  if (props.loadingJson) return;
   if (!validateJson()) return;
   emit('save', {
     name: name.value.trim(),
@@ -87,19 +103,13 @@ function formatJson() {
 <template>
   <div class="backdrop" @click="handleBackdrop">
     <div class="dialog">
-      <!-- Header -->
       <div class="dialog-header">
-        <div class="dialog-title">
-          <div class="dialog-icon">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
-              <circle cx="9" cy="7" r="4"/>
-              <line x1="19" y1="8" x2="19" y2="14"/>
-              <line x1="22" y1="11" x2="16" y2="11"/>
-            </svg>
-          </div>
-          <h2>{{ isEdit ? '编辑账号' : '添加账号' }}</h2>
+        <div class="traffic-lights" aria-hidden="true">
+          <span class="traffic-red"></span>
+          <span class="traffic-yellow"></span>
+          <span class="traffic-green"></span>
         </div>
+        <h2>{{ isEdit ? '编辑账号' : '添加账号' }}</h2>
         <button class="close-btn" @click="emit('close')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
             <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
@@ -107,22 +117,39 @@ function formatJson() {
         </button>
       </div>
 
-      <!-- Body -->
       <div class="dialog-body">
-        <div class="field">
-          <label>账号名称 <span class="req">*</span></label>
-          <input v-model="name" type="text" placeholder="例如: My Account" @keyup.enter="handleSave" />
-        </div>
+        <section class="dialog-section basic-section">
+          <div class="section-head">
+            <span>基本信息</span>
+          </div>
+          <div class="field">
+            <label>账号名称 <span class="req">*</span></label>
+            <input v-model="name" type="text" placeholder="例如: My Account" @keyup.enter="handleSave" />
+          </div>
+          <div class="field">
+            <label>开通时间</label>
+            <input v-model="activationDate" type="date" />
+          </div>
+          <div v-if="account" class="readonly-grid">
+            <div>
+              <span>记录 ID</span>
+              <strong>#{{ account.id }}</strong>
+            </div>
+            <div>
+              <span>账号类型</span>
+              <strong>{{ account.plan_type || 'unknown' }}</strong>
+            </div>
+            <div class="readonly-wide">
+              <span>账号标识</span>
+              <strong :title="account.account_id || ''">{{ account.account_id || '未识别' }}</strong>
+            </div>
+          </div>
+        </section>
 
-        <div class="field">
-          <label>开通时间</label>
-          <input v-model="activationDate" type="date" />
-        </div>
-
-        <div class="field">
-          <div class="field-top">
-            <label>Auth JSON</label>
-            <button class="fmt-btn" @click="formatJson" :disabled="!jsonInfo.trim()">
+        <section class="dialog-section auth-section">
+          <div class="section-head">
+            <span>auth.json</span>
+            <button class="fmt-btn" @click="formatJson" :disabled="props.loadingJson || !jsonInfo.trim()">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
               </svg>
@@ -132,7 +159,8 @@ function formatJson() {
           <textarea
             v-model="jsonInfo"
             rows="10"
-            :placeholder="isEdit ? '留空则不修改；可粘贴 auth.json、access_token 或 refresh_token...' : '粘贴 auth.json、access_token 或 refresh_token...'"
+            :disabled="props.loadingJson"
+            :placeholder="props.loadingJson ? '正在读取已保存的 auth.json...' : (isEdit ? '留空则不修改；可粘贴 auth.json、access_token 或 refresh_token...' : '粘贴 auth.json、access_token 或 refresh_token...')"
             @input="validateJson()"
           ></textarea>
           <div class="field-msg">
@@ -149,17 +177,16 @@ function formatJson() {
               格式正确
             </span>
           </div>
-        </div>
+        </section>
       </div>
 
-      <!-- Footer -->
       <div class="dialog-footer">
         <button class="btn-cancel" @click="emit('close')">取消</button>
-        <button class="btn-save" :disabled="!name.trim() || props.saving" @click="handleSave">
+        <button class="btn-save" :disabled="!name.trim() || props.saving || props.loadingJson" @click="handleSave">
           <svg v-if="props.saving" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
             <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
           </svg>
-          {{ props.saving ? '保存中...' : (isEdit ? '保存' : '添加') }}
+          {{ props.saving ? '保存中...' : (props.loadingJson ? '读取中...' : (isEdit ? '保存' : '添加')) }}
         </button>
       </div>
     </div>
@@ -332,6 +359,11 @@ textarea {
 
 textarea:hover { border-color: #cbd5e1; }
 
+textarea:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
 textarea:focus {
   outline: none;
   border-color: var(--primary);
@@ -417,5 +449,404 @@ textarea::placeholder {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* Refined editor dialog */
+.backdrop {
+  background: rgba(16, 24, 39, 0.32);
+  backdrop-filter: blur(10px);
+}
+
+.dialog {
+  width: min(720px, 94vw);
+  border: 1px solid rgba(219, 228, 238, 0.92);
+  border-radius: 12px;
+  box-shadow: var(--shadow-xl);
+}
+
+.dialog-header {
+  padding: 16px 18px;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbfd 100%);
+}
+
+.dialog-icon {
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(79, 99, 232, 0.18);
+  border-radius: var(--radius-sm);
+  background: var(--primary-light);
+}
+
+.dialog-header h2 {
+  font-size: 16px;
+  font-weight: 850;
+}
+
+.dialog-body {
+  padding: 18px;
+  gap: 14px;
+  background: #fff;
+}
+
+.field label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+input[type="text"],
+input[type="date"],
+textarea {
+  border-color: var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+input[type="text"],
+input[type="date"] {
+  height: 38px;
+  padding: 0 12px;
+  font-weight: 700;
+}
+
+textarea {
+  min-height: 300px;
+  padding: 12px;
+  background: #101827;
+  color: #e5edf7;
+  font-size: 12px;
+  line-height: 1.58;
+  caret-color: #a5b4fc;
+}
+
+textarea::placeholder {
+  color: #7f8da3;
+}
+
+textarea:hover {
+  border-color: #b8c6d8;
+}
+
+textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+.fmt-btn {
+  min-height: 28px;
+  border: 1px solid rgba(79, 99, 232, 0.18);
+  background: #fff;
+  font-weight: 850;
+}
+
+.dialog-footer {
+  padding: 14px 18px;
+  background: var(--surface-soft);
+}
+
+.btn-cancel,
+.btn-save {
+  min-height: 36px;
+  padding: 0 16px;
+  font-weight: 850;
+}
+
+.btn-save {
+  background: var(--primary);
+  box-shadow: 0 10px 22px rgba(79, 99, 232, 0.16);
+}
+
+.btn-save:hover:not(:disabled) {
+  background: var(--primary-hover);
+  box-shadow: 0 14px 30px rgba(79, 99, 232, 0.2);
+}
+
+/* ── macOS polish pass ────────────────── */
+.backdrop {
+  background: rgba(23, 32, 51, 0.26);
+  backdrop-filter: blur(12px);
+}
+
+.dialog {
+  width: min(900px, 94vw);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 22px 64px rgba(23, 32, 51, 0.18), 0 1px 2px rgba(23, 32, 51, 0.08);
+}
+
+.dialog-header {
+  position: relative;
+  min-height: 44px;
+  justify-content: center;
+  padding: 0 44px;
+  border-bottom-color: var(--border);
+  background: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+}
+
+.dialog-header h2 {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.traffic-lights {
+  position: absolute;
+  left: 16px;
+  top: 50%;
+  display: inline-flex;
+  gap: 7px;
+  transform: translateY(-50%);
+}
+
+.traffic-lights span {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px rgba(23, 32, 51, 0.08);
+}
+
+.traffic-red {
+  background: #ff5f57;
+}
+
+.traffic-yellow {
+  background: #febc2e;
+}
+
+.traffic-green {
+  background: #28c840;
+}
+
+.close-btn {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  color: var(--text-tertiary);
+}
+
+.dialog-body {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.9fr) minmax(360px, 1.4fr);
+  gap: 0;
+  padding: 0;
+  background: #fff;
+}
+
+.dialog-section {
+  min-width: 0;
+  padding: 18px;
+}
+
+.basic-section {
+  border-right: 1px solid var(--border-light);
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 28px;
+  margin-bottom: 12px;
+}
+
+.section-head span {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.field {
+  margin-bottom: 14px;
+}
+
+.field label {
+  margin-bottom: 6px;
+  color: #6e7b91;
+  font-size: 12px;
+  font-weight: 760;
+}
+
+input[type="text"],
+input[type="date"] {
+  height: 36px;
+  padding: 0 11px;
+  border-color: var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+input:hover {
+  border-color: #c7d1df;
+}
+
+input:focus,
+textarea:focus {
+  border-color: rgba(79, 107, 255, 0.66);
+  box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+.readonly-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-light);
+}
+
+.readonly-grid div {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.readonly-wide {
+  grid-column: 1 / -1;
+}
+
+.readonly-grid span,
+.readonly-grid strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.readonly-grid span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.readonly-grid strong {
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.auth-section {
+  display: flex;
+  min-height: 430px;
+  flex-direction: column;
+}
+
+textarea {
+  flex: 1;
+  min-height: 340px;
+  padding: 12px 13px;
+  border-color: #1f2a3b;
+  border-radius: 10px;
+  background: #111827;
+  color: #e7edf5;
+  font-family: 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.58;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+textarea:hover {
+  border-color: #2d3a4f;
+}
+
+textarea::placeholder {
+  color: #8290a5;
+}
+
+.fmt-btn {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.fmt-btn:hover:not(:disabled) {
+  border-color: rgba(79, 107, 255, 0.26);
+  background: var(--primary-light);
+}
+
+.field-msg {
+  min-height: 20px;
+  margin-top: 8px;
+}
+
+.msg-err,
+.msg-ok {
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.msg-ok {
+  color: var(--success);
+}
+
+.msg-err {
+  color: var(--danger);
+}
+
+.dialog-footer {
+  min-height: 58px;
+  padding: 11px 16px;
+  border-top-color: var(--border);
+  background: #fbfdff;
+}
+
+.btn-cancel,
+.btn-save {
+  min-height: 34px;
+  padding: 0 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.btn-cancel {
+  background: #fff;
+  color: var(--text-secondary);
+}
+
+.btn-save {
+  border-color: transparent;
+  background: var(--primary);
+  box-shadow: 0 10px 20px rgba(79, 107, 255, 0.16);
+}
+
+.btn-save:hover:not(:disabled) {
+  background: var(--primary-hover);
+  box-shadow: 0 14px 26px rgba(79, 107, 255, 0.2);
+}
+
+@media (max-width: 760px) {
+  .dialog {
+    width: min(94vw, 540px);
+  }
+
+  .dialog-body {
+    grid-template-columns: 1fr;
+  }
+
+  .basic-section {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-light);
+  }
+
+  .auth-section {
+    min-height: 360px;
+  }
+
+  textarea {
+    min-height: 260px;
+  }
 }
 </style>

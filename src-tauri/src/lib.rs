@@ -8,15 +8,21 @@ use base64::{
     Engine as _,
 };
 use rand_core::{OsRng, RngCore};
-use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, REFERER, USER_AGENT};
+use reqwest::header::{
+    HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT,
+};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::sync::Mutex;
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tauri::{
     command,
     menu::{Menu, MenuItem},
@@ -128,11 +134,57 @@ pub struct CodexFeatureStatus {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexProxyState {
+    pub enabled: bool,
+    pub port: u16,
+    pub base_url: String,
+    pub active_account_id: Option<i64>,
+    pub active_account_name: String,
+    pub config_installed: bool,
+    pub config_path: String,
+    pub last_error: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodexProjectVisibilityStatus {
     pub project_path: String,
     pub config_path: String,
     pub is_trusted: bool,
     pub changed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexSessionVisibilityStatus {
+    pub codex_home: String,
+    pub state_db_path: String,
+    pub session_index_path: String,
+    pub target_provider: String,
+    pub scanned_rollout_files: usize,
+    pub mismatched_rollout_files: usize,
+    pub mismatched_sqlite_records: usize,
+    pub missing_sqlite_records: usize,
+    pub missing_session_index_entries: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexSessionVisibilityRepairFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexSessionVisibilityRepairReport {
+    pub codex_home: String,
+    pub state_db_path: String,
+    pub session_index_path: String,
+    pub target_provider: String,
+    pub backup_dir: String,
+    pub scanned_rollout_files: usize,
+    pub rewritten_rollout_files: usize,
+    pub sqlite_records_updated: usize,
+    pub sqlite_records_inserted: usize,
+    pub session_index_entries_added: usize,
+    pub failed_rollout_files: Vec<CodexSessionVisibilityRepairFailure>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -216,6 +268,20 @@ pub struct Account {
     pub updated_at: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CodexHotSwitchResult {
+    pub status: String,
+    pub message: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SwitchAccountResult {
+    pub restarted: bool,
+    pub auth_json_path: String,
+    pub hot_switch: CodexHotSwitchResult,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct BackupAccount {
     name: String,
@@ -276,14 +342,6 @@ struct EncryptedBackup {
     ciphertext: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CredentialManifest {
-    format: String,
-    version: u32,
-    part_prefix: String,
-    parts: usize,
-}
-
 #[derive(Debug, Clone)]
 struct OAuthState {
     login_id: String,
@@ -302,6 +360,15 @@ pub struct OAuthStartResponse {
     pub auth_url: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthSaveResult {
+    pub id: i64,
+    pub created: bool,
+    pub name: String,
+    pub account_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct AccountIdentity {
     email: Option<String>,
@@ -312,8 +379,6 @@ struct AccountIdentity {
 
 // ── Helper functions ──────────────────────────────────────────────────
 
-const CREDENTIAL_CHUNK_CHARS: usize = 500;
-const CREDENTIAL_MANIFEST_FORMAT: &str = "codex-account-manager-secret-chunks";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
 const CODEX_TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -325,6 +390,10 @@ const TOKEN_REFRESH_SKEW_SECONDS: i64 = 300;
 const CODEX_CONFIG_FILE: &str = "config.toml";
 const CODEX_GLOBAL_STATE_FILE: &str = ".codex-global-state.json";
 const CODEX_GOALS_DB_FILE: &str = "goals_1.sqlite";
+const CODEX_STATE_DB_FILE: &str = "state_5.sqlite";
+const CODEX_SESSION_INDEX_FILE: &str = "session_index.jsonl";
+const CODEX_SESSIONS_DIR: &str = "sessions";
+const CODEX_ARCHIVED_SESSIONS_DIR: &str = "archived_sessions";
 const CODEX_FEATURES_SECTION: &str = "features";
 const CODEX_MEMORIES_SECTION: &str = "memories";
 const CODEX_DESKTOP_SECTION: &str = "desktop";
@@ -335,8 +404,27 @@ const CODEX_USER_CHANGED_TIER_KEY: &str = "has-user-changed-service-tier";
 const CODEX_PROJECTS_SECTION_PREFIX: &str = "projects.";
 const CODEX_TRUST_LEVEL_KEY: &str = "trust_level";
 const CODEX_TRUSTED_LEVEL: &str = "trusted";
+const CODEX_PROXY_PROVIDER_ID: &str = "codex_account_manager_proxy";
+const CODEX_PROXY_PROVIDER_NAME: &str = "Codex Account Manager Proxy";
+const CODEX_PROXY_DEFAULT_PORT: u16 = 14998;
+const CODEX_PROXY_UPSTREAM_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CODEX_PROXY_SETTING_ENABLED: &str = "codex_proxy_enabled";
+const CODEX_PROXY_SETTING_PORT: &str = "codex_proxy_port";
+const CODEX_PROXY_SETTING_ACTIVE_ACCOUNT_ID: &str = "codex_proxy_active_account_id";
+const CODEX_PROXY_SETTING_CONFIG_BACKUP: &str = "codex_proxy_config_backup";
+const CODEX_PROXY_DEFAULT_USER_AGENT: &str =
+    "codex-tui/0.135.0 (Mac OS; arm64) CodexAccountManagerProxy/0.1.0";
+const CODEX_PROXY_DEFAULT_ORIGINATOR: &str = "codex-tui";
 
 static OAUTH_STATE: Mutex<Option<OAuthState>> = Mutex::new(None);
+
+struct CodexProxyRuntime {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    last_error: Arc<Mutex<String>>,
+}
+
+static CODEX_PROXY_RUNTIME: Mutex<Option<CodexProxyRuntime>> = Mutex::new(None);
 
 fn get_home_dir() -> Result<String, String> {
     if cfg!(target_os = "windows") {
@@ -692,7 +780,11 @@ fn normalize_project_path_for_match(path: &str) -> String {
         .trim()
         .trim_end_matches('\\')
         .to_string();
-    if cfg!(target_os = "windows") {
+    let looks_like_windows_drive_path = normalized
+        .as_bytes()
+        .get(1)
+        .is_some_and(|byte| *byte == b':');
+    if cfg!(target_os = "windows") || looks_like_windows_drive_path {
         normalized.to_ascii_lowercase()
     } else {
         normalized
@@ -931,6 +1023,147 @@ fn codex_config_toml_with_speed(content: &str, speed: &CodexAppSpeed) -> String 
         next.push('\n');
     }
     next
+}
+
+fn codex_proxy_base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{}/v1", port)
+}
+
+fn root_toml_string_value(content: &str, key: &str) -> Option<String> {
+    for line in content.lines() {
+        if toml_section_name(line).is_some() {
+            return None;
+        }
+        if let Some(value) = toml_string_value_for_key(line, key) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn remove_root_toml_keys(content: &str, keys: &[&str]) -> String {
+    let mut output = Vec::new();
+    let mut in_section = false;
+    for line in content.lines() {
+        if toml_section_name(line).is_some() {
+            in_section = true;
+            output.push(line.to_string());
+            continue;
+        }
+
+        if !in_section {
+            let trimmed = strip_toml_comment(line);
+            if let Some((left, _)) = trimmed.split_once('=') {
+                if keys.iter().any(|key| left.trim() == *key) {
+                    continue;
+                }
+            }
+        }
+
+        output.push(line.to_string());
+    }
+    output.join("\n")
+}
+
+fn remove_toml_section(content: &str, section_name: &str) -> String {
+    let mut output = Vec::new();
+    let mut skip = false;
+    for line in content.lines() {
+        if let Some(section) = toml_section_name(line) {
+            skip = section == section_name;
+            if skip {
+                continue;
+            }
+        }
+        if !skip {
+            output.push(line.to_string());
+        }
+    }
+    output.join("\n")
+}
+
+fn codex_proxy_provider_section_name() -> String {
+    format!("model_providers.{}", CODEX_PROXY_PROVIDER_ID)
+}
+
+fn codex_proxy_config_installed(content: &str) -> bool {
+    root_toml_string_value(content, "model_provider").as_deref() == Some(CODEX_PROXY_PROVIDER_ID)
+        && content.contains(&format!("[model_providers.{}]", CODEX_PROXY_PROVIDER_ID))
+}
+
+fn codex_proxy_config_toml(content: &str, port: u16) -> String {
+    let without_root = remove_root_toml_keys(content, &["model_provider", "openai_base_url"]);
+    let without_provider =
+        remove_toml_section(&without_root, codex_proxy_provider_section_name().as_str());
+    let preserved = without_provider.trim();
+    let provider = format!(
+        "model_provider = \"{}\"\n\n[model_providers.{}]\nname = \"{}\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\n",
+        CODEX_PROXY_PROVIDER_ID,
+        CODEX_PROXY_PROVIDER_ID,
+        CODEX_PROXY_PROVIDER_NAME,
+        codex_proxy_base_url(port),
+    );
+
+    if preserved.is_empty() {
+        provider
+    } else {
+        format!("{}\n\n{}\n", provider.trim_end(), preserved)
+    }
+}
+
+fn remove_codex_proxy_config_toml(content: &str) -> String {
+    let mut next = remove_toml_section(content, codex_proxy_provider_section_name().as_str());
+    if root_toml_string_value(&next, "model_provider").as_deref() == Some(CODEX_PROXY_PROVIDER_ID) {
+        next = remove_root_toml_keys(&next, &["model_provider"]);
+    }
+    let trimmed = next.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", trimmed)
+    }
+}
+
+fn install_codex_proxy_config_to_path(
+    config_path: &std::path::Path,
+    conn: &Connection,
+    port: u16,
+) -> Result<(), String> {
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("读取 Codex config.toml 失败: {}", e)),
+    };
+
+    if read_setting_from_conn(conn, CODEX_PROXY_SETTING_CONFIG_BACKUP)?.is_none() {
+        write_setting_to_conn(conn, CODEX_PROXY_SETTING_CONFIG_BACKUP, &content)?;
+    }
+
+    let next = codex_proxy_config_toml(&content, port);
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
+    }
+    std::fs::write(config_path, next).map_err(|e| format!("写入 Codex config.toml 失败: {}", e))
+}
+
+fn restore_codex_proxy_config_from_backup(
+    config_path: &std::path::Path,
+    conn: &Connection,
+) -> Result<(), String> {
+    if let Some(backup) = read_setting_from_conn(conn, CODEX_PROXY_SETTING_CONFIG_BACKUP)? {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
+        }
+        std::fs::write(config_path, backup)
+            .map_err(|e| format!("恢复 Codex config.toml 失败: {}", e))?;
+        delete_setting_from_conn(conn, CODEX_PROXY_SETTING_CONFIG_BACKUP)?;
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(config_path).unwrap_or_default();
+    let next = remove_codex_proxy_config_toml(&content);
+    std::fs::write(config_path, next).map_err(|e| format!("清理 Codex 代理配置失败: {}", e))
 }
 
 fn read_codex_app_speed_from_path(path: &std::path::Path) -> Result<CodexAppSpeed, String> {
@@ -1209,6 +1442,39 @@ fn ensure_column(
     Ok(())
 }
 
+fn read_setting_from_conn(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    let result = conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    );
+
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to read setting: {}", e)),
+    }
+}
+
+fn write_setting_to_conn(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "
+        INSERT INTO app_settings (key, value)
+        VALUES (?1, ?2)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        ",
+        params![key, value],
+    )
+    .map_err(|e| format!("Failed to save setting: {}", e))?;
+    Ok(())
+}
+
+fn delete_setting_from_conn(conn: &Connection, key: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])
+        .map_err(|e| format!("Failed to delete setting: {}", e))?;
+    Ok(())
+}
+
 fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     let account_id: String = row.get(17)?;
     Ok(Account {
@@ -1263,7 +1529,12 @@ fn truncate_log_text(value: &str, max_chars: usize) -> String {
 fn account_log_context(conn: &Connection, id: i64) -> (String, String) {
     conn.query_row(
         "
-        SELECT name, COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+        SELECT name,
+               CASE
+                   WHEN json_valid(json_info)
+                   THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                   ELSE ''
+               END
         FROM accounts
         WHERE id = ?1
         ",
@@ -1324,137 +1595,9 @@ fn quota_log_details(
     .to_string()
 }
 
-fn credential_key(id: i64) -> String {
-    format!("account-{}", id)
-}
-
-fn credential_entry(key: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new("codex-account-manager", key)
-        .map_err(|e| format!("Failed to open credential store: {}", e))
-}
-
-fn credential_manifest(text: &str) -> Option<CredentialManifest> {
-    let manifest = serde_json::from_str::<CredentialManifest>(text).ok()?;
-    if manifest.format == CREDENTIAL_MANIFEST_FORMAT && manifest.version == 1 {
-        Some(manifest)
-    } else {
-        None
-    }
-}
-
-fn chunk_secret(secret: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for ch in secret.chars() {
-        if current.chars().count() >= CREDENTIAL_CHUNK_CHARS {
-            chunks.push(current);
-            current = String::new();
-        }
-        current.push(ch);
-    }
-
-    if !current.is_empty() || secret.is_empty() {
-        chunks.push(current);
-    }
-
-    chunks
-}
-
-fn cleanup_secret_parts(prefix: &str, parts: usize) {
-    for index in 0..parts {
-        delete_account_secret_entry(&format!("{}.{}", prefix, index));
-    }
-}
-
-fn delete_account_secret_entry(key: &str) {
-    let _ = credential_entry(key).and_then(|entry| {
-        entry
-            .delete_credential()
-            .map_err(|e| format!("Failed to delete account credential: {}", e))
-    });
-}
-
-fn save_account_secret(key: &str, json_info: &str) -> Result<(), String> {
-    let previous_manifest = credential_entry(key)
-        .and_then(|entry| {
-            entry
-                .get_password()
-                .map_err(|e| format!("Failed to read account credential: {}", e))
-        })
-        .ok()
-        .and_then(|text| credential_manifest(&text));
-
-    let generation = {
-        let mut bytes = [0u8; 8];
-        OsRng.fill_bytes(&mut bytes);
-        BASE64.encode(bytes).replace(['/', '+', '='], "")
-    };
-    let part_prefix = format!("{}.part.{}", key, generation);
-    let chunks = chunk_secret(json_info);
-
-    for (index, chunk) in chunks.iter().enumerate() {
-        if let Err(e) = credential_entry(&format!("{}.{}", part_prefix, index)).and_then(|entry| {
-            entry
-                .set_password(chunk)
-                .map_err(|e| format!("Failed to save account credential: {}", e))
-        }) {
-            cleanup_secret_parts(&part_prefix, index);
-            return Err(e);
-        }
-    }
-
-    let manifest = CredentialManifest {
-        format: CREDENTIAL_MANIFEST_FORMAT.to_string(),
-        version: 1,
-        part_prefix: part_prefix.clone(),
-        parts: chunks.len(),
-    };
-    let manifest_text = serde_json::to_string(&manifest)
-        .map_err(|e| format!("Failed to serialize credential manifest: {}", e))?;
-
-    if let Err(e) = credential_entry(key)?.set_password(&manifest_text) {
-        cleanup_secret_parts(&part_prefix, chunks.len());
-        return Err(format!("Failed to save account credential: {}", e));
-    }
-
-    if let Some(previous_manifest) = previous_manifest {
-        cleanup_secret_parts(&previous_manifest.part_prefix, previous_manifest.parts);
-    }
-
-    Ok(())
-}
-
-fn read_account_secret(key: &str) -> Result<String, String> {
-    let stored = credential_entry(key)?
-        .get_password()
-        .map_err(|e| format!("Failed to read account credential: {}", e))?;
-
-    let Some(manifest) = credential_manifest(&stored) else {
-        return Ok(stored);
-    };
-
-    let mut secret = String::new();
-    for index in 0..manifest.parts {
-        let chunk = credential_entry(&format!("{}.{}", manifest.part_prefix, index))?
-            .get_password()
-            .map_err(|e| format!("Failed to read account credential part: {}", e))?;
-        secret.push_str(&chunk);
-    }
-    Ok(secret)
-}
-
-fn delete_account_secret(key: &str) {
-    if let Ok(stored) = credential_entry(key).and_then(|entry| {
-        entry
-            .get_password()
-            .map_err(|e| format!("Failed to read account credential: {}", e))
-    }) {
-        if let Some(manifest) = credential_manifest(&stored) {
-            cleanup_secret_parts(&manifest.part_prefix, manifest.parts);
-        }
-    }
-    delete_account_secret_entry(key);
+fn missing_account_credential_message() -> String {
+    "该账号没有保存在本地账号库的 auth.json，请重新 OAuth 授权，或编辑该账号重新粘贴 auth.json/token。"
+        .to_string()
 }
 
 fn extract_account_id(json_info: &str) -> Option<String> {
@@ -1468,10 +1611,38 @@ fn extract_account_id(json_info: &str) -> Option<String> {
         })
 }
 
+#[cfg(test)]
 fn account_stub_from_json(json_info: &str) -> String {
     extract_account_id(json_info)
         .map(|account_id| serde_json::json!({ "tokens": { "account_id": account_id } }).to_string())
         .unwrap_or_else(|| "{}".to_string())
+}
+
+fn json_info_has_credential(json_info: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json_info)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/tokens/access_token")
+                .and_then(|item| item.as_str())
+                .map(|item| !item.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn save_account_json_info(conn: &Connection, id: i64, json_info: &str) -> Result<(), String> {
+    conn.execute(
+        "
+        UPDATE accounts
+        SET credential_key = '',
+            json_info = ?1,
+            updated_at = datetime('now')
+        WHERE id = ?2
+        ",
+        params![json_info, id],
+    )
+    .map_err(|e| format!("Failed to save account credential: {}", e))?;
+    Ok(())
 }
 
 fn health_item(
@@ -1543,6 +1714,10 @@ fn normalize_json_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
+}
+
+fn normalize_email_for_match(value: Option<&str>) -> Option<String> {
+    normalize_json_string(value).map(|item| item.to_ascii_lowercase())
 }
 
 fn first_json_string(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
@@ -1630,6 +1805,35 @@ fn extract_identity_from_tokens(id_token: &str, access_token: &str) -> AccountId
         plan_type,
         account_name: None,
     }
+}
+
+fn extract_email_from_auth_json(json_info: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(json_info).ok()?;
+    let id_token = value
+        .pointer("/tokens/id_token")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let access_token = value
+        .pointer("/tokens/access_token")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    extract_identity_from_tokens(id_token, access_token).email
+}
+
+fn oauth_existing_account_matches_identity(
+    existing_name: &str,
+    existing_json_info: &str,
+    target_email: Option<&str>,
+) -> bool {
+    let Some(target_email) = normalize_email_for_match(target_email) else {
+        return false;
+    };
+
+    extract_email_from_auth_json(existing_json_info)
+        .and_then(|email| normalize_email_for_match(Some(&email)))
+        .or_else(|| normalize_email_for_match(Some(existing_name)))
+        .as_deref()
+        == Some(target_email.as_str())
 }
 
 fn chrono_like_now_timestamp() -> i64 {
@@ -2222,19 +2426,809 @@ async fn normalize_auth_input(input: &str) -> Result<String, String> {
     Err("未找到可导入的 Codex token 或 auth.json".to_string())
 }
 
-fn account_secret_key(conn: &Connection, id: i64) -> Result<String, String> {
-    let key: String = conn
+fn account_json_info(conn: &Connection, id: i64) -> Result<String, String> {
+    let (_key, json_info): (String, String) = conn
         .query_row(
-            "SELECT credential_key FROM accounts WHERE id = ?1",
+            "SELECT credential_key, json_info FROM accounts WHERE id = ?1",
             params![id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| format!("Failed to find account credential: {}", e))?;
-    if key.is_empty() {
-        Err("Account credential is missing".to_string())
-    } else {
-        Ok(key)
+
+    if json_info_has_credential(&json_info) {
+        return Ok(json_info);
     }
+
+    Err(
+        "该账号没有保存在本地账号库的 auth.json，请重新 OAuth 授权或编辑账号粘贴 auth.json/token。"
+            .to_string(),
+    )
+}
+
+fn read_proxy_active_account_id(conn: &Connection) -> Result<Option<i64>, String> {
+    read_setting_from_conn(conn, CODEX_PROXY_SETTING_ACTIVE_ACCOUNT_ID).map(|value| {
+        value.and_then(|item| item.trim().parse::<i64>().ok().filter(|parsed| *parsed > 0))
+    })
+}
+
+fn write_proxy_active_account_id(conn: &Connection, id: i64) -> Result<(), String> {
+    write_setting_to_conn(conn, CODEX_PROXY_SETTING_ACTIVE_ACCOUNT_ID, &id.to_string())
+}
+
+fn fallback_proxy_account_id(conn: &Connection) -> Result<Option<i64>, String> {
+    let result = conn.query_row(
+        "
+        SELECT id
+        FROM accounts
+        WHERE CASE
+                  WHEN json_valid(json_info)
+                  THEN COALESCE(json_extract(json_info, '$.tokens.access_token'), '')
+                  ELSE ''
+              END != ''
+        ORDER BY id DESC
+        LIMIT 1
+        ",
+        [],
+        |row| row.get::<_, i64>(0),
+    );
+
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to find proxy account: {}", e)),
+    }
+}
+
+fn proxy_account_credentials(conn: &Connection) -> Result<(i64, String, String, String), String> {
+    let id = read_proxy_active_account_id(conn)?
+        .or_else(|| fallback_proxy_account_id(conn).ok().flatten())
+        .ok_or_else(|| "代理没有可用账号，请先选择一个带 auth.json 的账号。".to_string())?;
+    let (account_name, _identifier) = account_log_context(conn, id);
+    let json_info = account_json_info(conn, id)?;
+    let (json_info, changed) =
+        tauri::async_runtime::block_on(refresh_auth_json_if_needed(&json_info, false))?;
+    if changed {
+        save_account_json_info(conn, id, &json_info)?;
+    }
+
+    let value = parse_auth_json(&json_info)?;
+    let access_token = require_json_string(&value, "/tokens/access_token", "tokens.access_token")?;
+    let account_id = require_json_string(&value, "/tokens/account_id", "tokens.account_id")?;
+    Ok((id, account_name, account_id, access_token))
+}
+
+#[derive(Debug)]
+struct ProxyHttpRequest {
+    method: String,
+    target: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn proxy_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn proxy_content_length(header_text: &str) -> Result<usize, String> {
+    for line in header_text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| format!("Content-Length 无效: {}", e));
+        }
+        if name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            return Err("暂不支持客户端 chunked 请求体".to_string());
+        }
+    }
+    Ok(0)
+}
+
+fn parse_proxy_http_request(raw: &[u8]) -> Result<ProxyHttpRequest, String> {
+    let Some(header_end) = proxy_header_end(raw) else {
+        return Err("代理请求缺少 HTTP 头".to_string());
+    };
+    let header_text = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = header_text.lines();
+    let request_line = lines.next().ok_or_else(|| "代理请求行为空".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "代理请求缺少 method".to_string())?
+        .to_string();
+    let target = parts
+        .next()
+        .ok_or_else(|| "代理请求缺少 target".to_string())?
+        .to_string();
+    let mut headers = HashMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    Ok(ProxyHttpRequest {
+        method,
+        target,
+        headers,
+        body: raw[header_end..].to_vec(),
+    })
+}
+
+fn read_proxy_http_request(stream: &mut TcpStream) -> Result<ProxyHttpRequest, String> {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(120)))
+        .map_err(|e| format!("设置读取超时失败: {}", e))?;
+    let mut buffer = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+
+    loop {
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("读取代理请求失败: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > 64 * 1024 * 1024 {
+            return Err("代理请求体过大".to_string());
+        }
+
+        if header_end.is_none() {
+            if let Some(end) = proxy_header_end(&buffer) {
+                let header_text = String::from_utf8_lossy(&buffer[..end]);
+                content_length = proxy_content_length(&header_text)?;
+                header_end = Some(end);
+            }
+        }
+
+        if let Some(end) = header_end {
+            if buffer.len() >= end + content_length {
+                return parse_proxy_http_request(&buffer[..end + content_length]);
+            }
+        }
+    }
+
+    Err("代理请求不完整".to_string())
+}
+
+fn normalize_proxy_target(target: &str) -> Result<String, String> {
+    let target = target.trim();
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let after_scheme = target
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .ok_or_else(|| "代理请求地址无效".to_string())?;
+        let path_start = after_scheme.find('/').unwrap_or(after_scheme.len());
+        let path = &after_scheme[path_start..];
+        return Ok(if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        });
+    }
+
+    if target.starts_with('/') {
+        Ok(target.to_string())
+    } else {
+        Err("代理请求路径必须以 / 开头".to_string())
+    }
+}
+
+fn resolve_codex_proxy_upstream_target(target: &str) -> Result<String, String> {
+    let target = normalize_proxy_target(target)?;
+    let trimmed = if let Some(rest) = target.strip_prefix("/v1") {
+        rest
+    } else if let Some(rest) = target.strip_prefix("/backend-api/codex") {
+        rest
+    } else {
+        return Err("代理只支持 /v1 或 /backend-api/codex 路径".to_string());
+    };
+
+    if trimmed.is_empty() {
+        Ok("/".to_string())
+    } else if trimmed.starts_with('/') {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("/{}", trimmed))
+    }
+}
+
+fn proxy_request_is_stream(headers: &HashMap<String, String>, body: &[u8]) -> bool {
+    headers
+        .get("accept")
+        .map(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
+        || serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("stream").and_then(|item| item.as_bool()))
+            .unwrap_or(false)
+}
+
+fn write_proxy_json_response(stream: &mut TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        body.as_bytes().len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn write_proxy_error(stream: &mut TcpStream, status: &str, message: &str) {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "codex_account_manager_proxy_error"
+        }
+    })
+    .to_string();
+    write_proxy_json_response(stream, status, &body);
+}
+
+fn write_proxy_options_response(stream: &mut TcpStream) {
+    let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, OpenAI-Beta, X-API-Key, X-Codex-Turn-State, X-Codex-Turn-Metadata, X-Client-Request-Id, ChatGPT-Account-Id\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn codex_proxy_models_response() -> String {
+    serde_json::json!({
+        "object": "list",
+        "data": [
+            { "id": "gpt-5-codex", "object": "model", "created": 0, "owned_by": "openai" },
+            { "id": "gpt-5-codex-mini", "object": "model", "created": 0, "owned_by": "openai" },
+            { "id": "gpt-5", "object": "model", "created": 0, "owned_by": "openai" }
+        ]
+    })
+    .to_string()
+}
+
+fn random_proxy_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    BASE64.encode(bytes).replace(['/', '+', '='], "")
+}
+
+fn forward_codex_proxy_request(
+    stream: &mut TcpStream,
+    db_path: &std::path::Path,
+    request: ProxyHttpRequest,
+) -> Result<(), String> {
+    let normalized_target = normalize_proxy_target(&request.target)?;
+    if request.method.eq_ignore_ascii_case("OPTIONS") {
+        write_proxy_options_response(stream);
+        return Ok(());
+    }
+
+    if normalized_target == "/v1/models" || normalized_target.starts_with("/v1/models?") {
+        write_proxy_json_response(stream, "200 OK", &codex_proxy_models_response());
+        return Ok(());
+    }
+
+    let upstream_target = resolve_codex_proxy_upstream_target(&normalized_target)?;
+    let upstream_url = format!("{}{}", CODEX_PROXY_UPSTREAM_BASE_URL, upstream_target);
+    let conn = Connection::open(db_path).map_err(|e| format!("代理打开账号库失败: {}", e))?;
+    let (_id, _name, account_id, access_token) = proxy_account_credentials(&conn)?;
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+        .map_err(|e| format!("代理请求方法无效: {}", e))?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("创建代理 HTTP 客户端失败: {}", e))?;
+    let mut upstream = client.request(method, upstream_url);
+
+    for (name, value) in &request.headers {
+        if matches!(
+            name.as_str(),
+            "authorization"
+                | "host"
+                | "content-length"
+                | "connection"
+                | "proxy-connection"
+                | "accept-encoding"
+                | "x-api-key"
+        ) {
+            continue;
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| format!("代理请求头无效 {}: {}", name, e))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|e| format!("代理请求头值无效 {}: {}", name, e))?;
+        upstream = upstream.header(header_name, header_value);
+    }
+
+    upstream = upstream
+        .header(AUTHORIZATION, format!("Bearer {}", access_token))
+        .header("ChatGPT-Account-Id", account_id)
+        .header("Originator", CODEX_PROXY_DEFAULT_ORIGINATOR)
+        .header("Connection", "Keep-Alive");
+
+    if !request.headers.contains_key("user-agent") {
+        upstream = upstream.header(USER_AGENT, CODEX_PROXY_DEFAULT_USER_AGENT);
+    }
+    if !request.headers.contains_key("accept") {
+        upstream = upstream.header(
+            ACCEPT,
+            if proxy_request_is_stream(&request.headers, &request.body) {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        );
+    }
+    if !request.headers.contains_key("content-type") && !request.body.is_empty() {
+        upstream = upstream.header(CONTENT_TYPE, "application/json");
+    }
+    if upstream_target.starts_with("/responses") {
+        if !request.headers.contains_key("x-codex-turn-state") {
+            upstream = upstream.header("x-codex-turn-state", "");
+        }
+        if !request.headers.contains_key("x-codex-turn-metadata") {
+            upstream = upstream.header("x-codex-turn-metadata", "");
+        }
+        if !request.headers.contains_key("session_id")
+            && !request.headers.contains_key("session-id")
+        {
+            upstream = upstream.header("Session_id", random_proxy_session_id());
+        }
+    }
+    if !request.body.is_empty() {
+        upstream = upstream.body(request.body);
+    }
+
+    let mut response = upstream
+        .send()
+        .map_err(|e| format!("代理上游请求失败: {}", e))?;
+    let status = response.status();
+    let reason = status.canonical_reason().unwrap_or("OK");
+    let mut head = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason);
+    for (name, value) in response.headers() {
+        let name_text = name.as_str().to_ascii_lowercase();
+        if matches!(
+            name_text.as_str(),
+            "content-length" | "transfer-encoding" | "connection" | "content-encoding"
+        ) {
+            continue;
+        }
+        if let Ok(value_text) = value.to_str() {
+            head.push_str(name.as_str());
+            head.push_str(": ");
+            head.push_str(value_text);
+            head.push_str("\r\n");
+        }
+    }
+    head.push_str("Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .map_err(|e| format!("写入代理响应头失败: {}", e))?;
+    std::io::copy(&mut response, stream).map_err(|e| format!("转发代理响应失败: {}", e))?;
+    let _ = stream.flush();
+    Ok(())
+}
+
+fn handle_codex_proxy_connection(
+    mut stream: TcpStream,
+    db_path: std::path::PathBuf,
+    last_error: Arc<Mutex<String>>,
+) {
+    let result = read_proxy_http_request(&mut stream)
+        .and_then(|request| forward_codex_proxy_request(&mut stream, &db_path, request));
+    match result {
+        Ok(()) => {
+            if let Ok(mut guard) = last_error.lock() {
+                guard.clear();
+            }
+        }
+        Err(error) => {
+            if let Ok(mut guard) = last_error.lock() {
+                *guard = error.clone();
+            }
+            write_proxy_error(&mut stream, "502 Bad Gateway", &error);
+        }
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn stop_codex_proxy_runtime() -> Result<(), String> {
+    let mut guard = CODEX_PROXY_RUNTIME
+        .lock()
+        .map_err(|_| "Codex proxy runtime lock is poisoned".to_string())?;
+    if let Some(runtime) = guard.take() {
+        runtime.stop.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn start_codex_proxy_runtime(db_path: std::path::PathBuf, port: u16) -> Result<(), String> {
+    {
+        let guard = CODEX_PROXY_RUNTIME
+            .lock()
+            .map_err(|_| "Codex proxy runtime lock is poisoned".to_string())?;
+        if let Some(runtime) = guard.as_ref() {
+            if runtime.port == port && !runtime.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+        }
+    }
+
+    stop_codex_proxy_runtime()?;
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("启动 Codex 代理失败，端口 {} 不可用: {}", port, e))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置 Codex 代理监听失败: {}", e))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_error = Arc::new(Mutex::new(String::new()));
+    let stop_for_thread = stop.clone();
+    let last_error_for_thread = last_error.clone();
+    std::thread::spawn(move || {
+        while !stop_for_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        if let Ok(mut guard) = last_error_for_thread.lock() {
+                            *guard = format!("Codex 代理连接初始化失败: {}", e);
+                        }
+                        continue;
+                    }
+                    let db_path = db_path.clone();
+                    let last_error = last_error_for_thread.clone();
+                    std::thread::spawn(move || {
+                        handle_codex_proxy_connection(stream, db_path, last_error);
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                }
+                Err(e) => {
+                    if let Ok(mut guard) = last_error_for_thread.lock() {
+                        *guard = format!("Codex 代理监听失败: {}", e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+    });
+
+    let mut guard = CODEX_PROXY_RUNTIME
+        .lock()
+        .map_err(|_| "Codex proxy runtime lock is poisoned".to_string())?;
+    *guard = Some(CodexProxyRuntime {
+        port,
+        stop,
+        last_error,
+    });
+    Ok(())
+}
+
+fn hot_switch_result(
+    status: &str,
+    message: impl Into<String>,
+    detail: impl Into<String>,
+) -> CodexHotSwitchResult {
+    CodexHotSwitchResult {
+        status: status.to_string(),
+        message: message.into(),
+        detail: detail.into(),
+    }
+}
+
+fn skipped_hot_switch_result(message: impl Into<String>) -> CodexHotSwitchResult {
+    hot_switch_result("skipped", message, "")
+}
+
+fn unavailable_hot_switch_result(
+    message: impl Into<String>,
+    detail: impl Into<String>,
+) -> CodexHotSwitchResult {
+    hot_switch_result("unavailable", message, detail)
+}
+
+fn failed_hot_switch_result(
+    message: impl Into<String>,
+    detail: impl Into<String>,
+) -> CodexHotSwitchResult {
+    hot_switch_result("failed", message, detail)
+}
+
+fn applied_hot_switch_result(
+    message: impl Into<String>,
+    detail: impl Into<String>,
+) -> CodexHotSwitchResult {
+    hot_switch_result("applied", message, detail)
+}
+
+fn codex_app_server_socket_path() -> Result<std::path::PathBuf, String> {
+    Ok(get_codex_home_path()?
+        .join("app-server-control")
+        .join("app-server-control.sock"))
+}
+
+fn app_server_auth_params_from_json(
+    json_info: &str,
+) -> Result<(String, String, Option<String>), String> {
+    let value = parse_auth_json(json_info)?;
+    let access_token = require_json_string(&value, "/tokens/access_token", "tokens.access_token")?;
+    let account_id = require_json_string(&value, "/tokens/account_id", "tokens.account_id")?;
+    let id_token = value
+        .pointer("/tokens/id_token")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let identity = extract_identity_from_tokens(id_token, &access_token);
+    let plan_type = identity.plan_type.filter(|item| {
+        let trimmed = item.trim();
+        !trimmed.is_empty() && trimmed != "unknown"
+    });
+
+    Ok((access_token, account_id, plan_type))
+}
+
+#[cfg(unix)]
+fn read_http_upgrade_response(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 1];
+    while bytes.len() < 16 * 1024 {
+        stream.read_exact(&mut buf)?;
+        bytes.push(buf[0]);
+        if bytes.ends_with(b"\r\n\r\n") {
+            return Ok(String::from_utf8_lossy(&bytes).to_string());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "app-server websocket handshake response is too large",
+    ))
+}
+
+#[cfg(unix)]
+fn websocket_send_text(
+    stream: &mut std::os::unix::net::UnixStream,
+    text: &str,
+) -> std::io::Result<()> {
+    let payload = text.as_bytes();
+    let mut frame = Vec::with_capacity(payload.len() + 16);
+    frame.push(0x81);
+    if payload.len() <= 125 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+
+    let mut mask = [0u8; 4];
+    OsRng.fill_bytes(&mut mask);
+    frame.extend_from_slice(&mask);
+    for (index, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[index % mask.len()]);
+    }
+
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+#[cfg(unix)]
+fn websocket_read_text(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<String> {
+    loop {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header)?;
+        let opcode = header[0] & 0x0f;
+        let masked = (header[1] & 0x80) != 0;
+        let mut len = (header[1] & 0x7f) as u64;
+
+        if len == 126 {
+            let mut extended = [0u8; 2];
+            stream.read_exact(&mut extended)?;
+            len = u16::from_be_bytes(extended) as u64;
+        } else if len == 127 {
+            let mut extended = [0u8; 8];
+            stream.read_exact(&mut extended)?;
+            len = u64::from_be_bytes(extended);
+        }
+
+        if len > 8 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "app-server websocket frame is too large",
+            ));
+        }
+
+        let mut mask = [0u8; 4];
+        if masked {
+            stream.read_exact(&mut mask)?;
+        }
+
+        let mut payload = vec![0u8; len as usize];
+        stream.read_exact(&mut payload)?;
+        if masked {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % mask.len()];
+            }
+        }
+
+        match opcode {
+            0x1 => {
+                return String::from_utf8(payload).map_err(|err| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
+                });
+            }
+            0x8 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "app-server closed websocket",
+                ));
+            }
+            0x9 | 0xA => continue,
+            _ => continue,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn websocket_read_response(
+    stream: &mut std::os::unix::net::UnixStream,
+    id: i64,
+) -> Result<serde_json::Value, String> {
+    for _ in 0..50 {
+        let text = websocket_read_text(stream)
+            .map_err(|e| format!("failed to read app-server response: {}", e))?;
+        let value = serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|e| format!("invalid app-server JSON-RPC message: {}", e))?;
+        if value.get("id").and_then(|item| item.as_i64()) == Some(id) {
+            if let Some(error) = value.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("app-server returned an error");
+                let code = error.get("code").and_then(|item| item.as_i64());
+                return Err(match code {
+                    Some(code) => format!("{} (code {})", message, code),
+                    None => message.to_string(),
+                });
+            }
+            return Ok(value
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
+        }
+    }
+
+    Err(format!("app-server did not return response id {}", id))
+}
+
+#[cfg(unix)]
+fn try_hot_switch_codex_app_server_inner(json_info: &str) -> Result<String, String> {
+    let (access_token, account_id, plan_type) = app_server_auth_params_from_json(json_info)?;
+    let socket_path = codex_app_server_socket_path()?;
+    if !socket_path.exists() {
+        return Err(format!(
+            "APP_SERVER_SOCKET_MISSING:{}",
+            socket_path.to_string_lossy()
+        ));
+    }
+
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+        .map_err(|e| format!("APP_SERVER_CONNECT_FAILED:{}:{}", socket_path.display(), e))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("failed to set app-server read timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| format!("failed to set app-server write timeout: {}", e))?;
+
+    let mut websocket_key_bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut websocket_key_bytes);
+    let websocket_key = BASE64.encode(websocket_key_bytes);
+    let request = format!(
+        "GET / HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: {}\r\n\
+         \r\n",
+        websocket_key
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("failed to send app-server websocket handshake: {}", e))?;
+    let response = read_http_upgrade_response(&mut stream)
+        .map_err(|e| format!("failed to read app-server websocket handshake: {}", e))?;
+    if !response.starts_with("HTTP/1.1 101") && !response.starts_with("HTTP/1.0 101") {
+        return Err(format!(
+            "app-server websocket handshake was rejected: {}",
+            response.lines().next().unwrap_or("unknown response")
+        ));
+    }
+
+    let initialize = serde_json::json!({
+        "method": "initialize",
+        "id": 1,
+        "params": {
+            "clientInfo": {
+                "name": "codex-account-manager",
+                "title": "Codex Account Manager",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "capabilities": {
+                "experimentalApi": true
+            }
+        }
+    });
+    websocket_send_text(&mut stream, &initialize.to_string())
+        .map_err(|e| format!("failed to send app-server initialize: {}", e))?;
+    websocket_read_response(&mut stream, 1)?;
+
+    let initialized = serde_json::json!({
+        "method": "initialized"
+    });
+    websocket_send_text(&mut stream, &initialized.to_string())
+        .map_err(|e| format!("failed to send app-server initialized notification: {}", e))?;
+
+    let login = serde_json::json!({
+        "method": "account/login/start",
+        "id": 2,
+        "params": {
+            "type": "chatgptAuthTokens",
+            "accessToken": access_token,
+            "chatgptAccountId": account_id,
+            "chatgptPlanType": plan_type
+        }
+    });
+    websocket_send_text(&mut stream, &login.to_string())
+        .map_err(|e| format!("failed to send app-server account switch: {}", e))?;
+    websocket_read_response(&mut stream, 2)?;
+
+    Ok(socket_path.to_string_lossy().to_string())
+}
+
+#[cfg(unix)]
+fn try_hot_switch_codex_app_server(json_info: &str) -> CodexHotSwitchResult {
+    match try_hot_switch_codex_app_server_inner(json_info) {
+        Ok(socket_path) => applied_hot_switch_result(
+            "已通知正在运行的 Codex 热更新账号",
+            format!("socket={socket_path}"),
+        ),
+        Err(err) if err.starts_with("APP_SERVER_SOCKET_MISSING:") => {
+            let path = err.trim_start_matches("APP_SERVER_SOCKET_MISSING:");
+            unavailable_hot_switch_result(
+                "未发现正在运行的 Codex app-server，已写入 auth.json，重启 Codex 后生效",
+                format!("socket={path}"),
+            )
+        }
+        Err(err) if err.starts_with("APP_SERVER_CONNECT_FAILED:") => unavailable_hot_switch_result(
+            "无法连接正在运行的 Codex app-server，已写入 auth.json，重启 Codex 后生效",
+            err,
+        ),
+        Err(err) => failed_hot_switch_result(
+            "Codex app-server 拒绝热切号，已写入 auth.json，必要时请重启 Codex",
+            err,
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_hot_switch_codex_app_server(_json_info: &str) -> CodexHotSwitchResult {
+    unavailable_hot_switch_result(
+        "当前系统暂不支持通过本工具热切号，已写入 auth.json，重启 Codex 后生效",
+        "app-server unix socket is unavailable on this platform",
+    )
 }
 
 fn mark_quota_error(conn: &Connection, id: i64, error: &str) -> Result<(), String> {
@@ -2259,6 +3253,11 @@ fn mark_quota_error(conn: &Connection, id: i64, error: &str) -> Result<(), Strin
 
 fn friendly_account_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
+    if lower.contains("no matching entry found in secure storage")
+        || lower.contains("账号凭据在系统凭据库中不存在")
+    {
+        return missing_account_credential_message();
+    }
     if lower.contains("refresh_token") && lower.contains("missing") {
         return "该账号没有 refresh_token，access_token 过期后无法自动刷新，请重新 OAuth 授权。"
             .to_string();
@@ -2711,6 +3710,23 @@ fn start_codex_oauth_login(
 }
 
 #[command]
+fn open_codex_oauth_url(login_id: String) -> Result<(), String> {
+    let auth_url = {
+        let guard = OAUTH_STATE
+            .lock()
+            .map_err(|_| "OAuth state lock is poisoned".to_string())?;
+        guard
+            .as_ref()
+            .filter(|state| state.login_id == login_id)
+            .filter(|state| state.expires_at > chrono_like_now_timestamp())
+            .map(|state| state.auth_url.clone())
+            .ok_or_else(|| "OAuth login state not found, please start login again".to_string())?
+    };
+
+    open_url_in_browser(&auth_url)
+}
+
+#[command]
 fn cancel_codex_oauth_login(login_id: Option<String>) -> Result<(), String> {
     let should_cancel = {
         let guard = OAUTH_STATE
@@ -2747,46 +3763,128 @@ fn save_oauth_account(
     app: &AppHandle,
     auth_json: &str,
     identity: &AccountIdentity,
-) -> Result<i64, String> {
+) -> Result<OAuthSaveResult, String> {
     parse_auth_json(auth_json)?;
     let conn = open_accounts_db(app)?;
-    if identity.account_id.as_deref().is_none() {
-        return Err("OAuth login did not return a ChatGPT account id".to_string());
-    }
+    let account_id = identity
+        .account_id
+        .as_deref()
+        .ok_or_else(|| "OAuth login did not return a ChatGPT account id".to_string())?;
     let name = identity
         .email
         .as_deref()
         .or(identity.account_name.as_deref())
         .unwrap_or("Codex OAuth Account");
     let plan_type = identity.plan_type.as_deref().unwrap_or("unknown");
+    let candidates = {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, name, json_info
+                FROM accounts
+                WHERE CASE
+                          WHEN json_valid(json_info)
+                          THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                          ELSE ''
+                      END = ?1
+                ORDER BY id DESC
+                ",
+            )
+            .map_err(|e| format!("Failed to prepare existing OAuth account query: {}", e))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to find existing OAuth account: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read existing OAuth account: {}", e))?
+    };
+    let existing = candidates
+        .into_iter()
+        .find(|(_, existing_name, json_info)| {
+            oauth_existing_account_matches_identity(
+                existing_name,
+                json_info,
+                identity.email.as_deref(),
+            )
+        });
+
+    if let Some((id, _existing_name, _json_info)) = existing {
+        conn.execute(
+            "
+            UPDATE accounts
+            SET credential_key = '',
+                json_info = ?1,
+                plan_type = CASE WHEN ?2 != 'unknown' THEN ?2 ELSE plan_type END,
+                last_quota_error = '',
+                updated_at = datetime('now')
+            WHERE id = ?3
+            ",
+            params![auth_json, plan_type, id],
+        )
+        .map_err(|e| format!("Failed to restore OAuth account credential: {}", e))?;
+
+        let (account_name, account_identifier) = account_log_context(&conn, id);
+        let _ = insert_operation_log(
+            &conn,
+            "info",
+            "oauth_login",
+            Some(id),
+            &account_name,
+            &account_identifier,
+            "updated",
+            "OAuth 账号凭据已更新",
+            &format!(
+                "email={}, account_id={}",
+                identity.email.as_deref().unwrap_or(""),
+                account_id
+            ),
+        );
+
+        return Ok(OAuthSaveResult {
+            id,
+            created: false,
+            name: account_name,
+            account_id: account_id.to_string(),
+        });
+    }
 
     conn.execute(
         "
-        INSERT INTO accounts (name, activation_date, json_info, plan_type, updated_at)
-        VALUES (?1, '', '{}', ?2, datetime('now'))
+        INSERT INTO accounts (name, activation_date, credential_key, json_info, plan_type, updated_at)
+        VALUES (?1, '', '', ?2, ?3, datetime('now'))
         ",
-        params![name, plan_type],
+        params![name, auth_json, plan_type],
     )
     .map_err(|e| format!("Failed to add OAuth account: {}", e))?;
     let id = conn.last_insert_rowid();
 
-    let key = credential_key(id);
-    save_account_secret(&key, auth_json)?;
-    conn.execute(
-        "
-        UPDATE accounts
-        SET name = ?1,
-            credential_key = ?2,
-            json_info = ?3,
-            plan_type = ?4,
-            updated_at = datetime('now')
-        WHERE id = ?5
-        ",
-        params![name, key, account_stub_from_json(auth_json), plan_type, id],
-    )
-    .map_err(|e| format!("Failed to save OAuth account: {}", e))?;
+    let _ = insert_operation_log(
+        &conn,
+        "info",
+        "oauth_login",
+        Some(id),
+        name,
+        account_id,
+        "created",
+        "OAuth 账号已新增",
+        &format!(
+            "email={}, account_id={}",
+            identity.email.as_deref().unwrap_or(""),
+            account_id
+        ),
+    );
 
-    Ok(id)
+    Ok(OAuthSaveResult {
+        id,
+        created: true,
+        name: name.to_string(),
+        account_id: account_id.to_string(),
+    })
 }
 
 async fn exchange_oauth_code(
@@ -2835,7 +3933,7 @@ async fn save_oauth_tokens(
     id_token: String,
     access_token: String,
     refresh_token: String,
-) -> Result<i64, String> {
+) -> Result<OAuthSaveResult, String> {
     let mut identity = extract_identity_from_tokens(&id_token, &access_token);
     if let Ok(remote) =
         fetch_remote_account_identity(&access_token, identity.account_id.as_deref()).await
@@ -2851,12 +3949,12 @@ async fn save_oauth_tokens(
         .ok_or_else(|| "OAuth login succeeded, but account id could not be detected".to_string())?;
 
     let auth_json = codex_auth_json(&id_token, &access_token, &refresh_token, &account_id)?;
-    let id = save_oauth_account(&app, &auth_json, &identity)?;
-    if let Err(e) = refresh_account_quota(app, id).await {
+    let saved = save_oauth_account(&app, &auth_json, &identity)?;
+    if let Err(e) = refresh_account_quota(app, saved.id).await {
         eprintln!("Failed to fetch initial OAuth quota: {}", e);
     }
 
-    Ok(id)
+    Ok(saved)
 }
 
 #[command]
@@ -2864,7 +3962,7 @@ async fn complete_codex_oauth_login(
     app: AppHandle,
     login_id: String,
     callback_url: Option<String>,
-) -> Result<i64, String> {
+) -> Result<OAuthSaveResult, String> {
     let (state, code) = {
         let mut guard = OAUTH_STATE
             .lock()
@@ -2913,7 +4011,14 @@ fn list_accounts(app: AppHandle) -> Result<Vec<Account>, String> {
         .prepare(
             "
             SELECT id, name, activation_date,
-                   CASE WHEN credential_key IS NOT NULL AND credential_key != '' THEN 1 ELSE 0 END AS has_json_info,
+                   CASE
+                       WHEN json_valid(json_info)
+                       THEN CASE
+                           WHEN COALESCE(json_extract(json_info, '$.tokens.access_token'), '') != ''
+                           THEN 1 ELSE 0
+                       END
+                       ELSE 0
+                   END AS has_json_info,
                    plan_type,
                    primary_used_percent, primary_reset_at,
                    primary_window_minutes, primary_window_present,
@@ -2921,7 +4026,11 @@ fn list_accounts(app: AppHandle) -> Result<Vec<Account>, String> {
                    secondary_window_minutes, secondary_window_present,
                    last_quota_checked_at, last_quota_error,
                    created_at, updated_at,
-                   COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                   CASE
+                       WHEN json_valid(json_info)
+                       THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                       ELSE ''
+                   END
             FROM accounts
             ORDER BY id DESC
             ",
@@ -2937,6 +4046,24 @@ fn list_accounts(app: AppHandle) -> Result<Vec<Account>, String> {
         accounts.push(row.map_err(|e| format!("Failed to read account: {}", e))?);
     }
     Ok(accounts)
+}
+
+#[command]
+fn get_account_auth_json(app: AppHandle, id: i64) -> Result<String, String> {
+    let conn = open_accounts_db(&app)?;
+    let json_info: String = conn
+        .query_row(
+            "SELECT json_info FROM accounts WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to read account auth.json: {}", e))?;
+
+    if json_info_has_credential(&json_info) {
+        Ok(json_info)
+    } else {
+        Ok(String::new())
+    }
 }
 
 #[command]
@@ -3002,11 +4129,10 @@ fn clear_operation_logs(app: AppHandle) -> Result<(), String> {
 #[command]
 async fn refresh_account_profile(app: AppHandle, id: i64) -> Result<Account, String> {
     let conn = open_accounts_db(&app)?;
-    let key = account_secret_key(&conn, id)?;
-    let json_info = read_account_secret(&key)?;
+    let json_info = account_json_info(&conn, id)?;
     let (json_info, changed) = refresh_auth_json_if_needed(&json_info, false).await?;
     if changed {
-        save_account_secret(&key, &json_info)?;
+        save_account_json_info(&conn, id, &json_info)?;
     }
 
     let mut value = parse_auth_json(&json_info)?;
@@ -3037,14 +4163,13 @@ async fn refresh_account_profile(app: AppHandle, id: i64) -> Result<Account, Str
 
     let updated_json = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("Failed to serialize refreshed account profile: {}", e))?;
-    save_account_secret(&key, &updated_json)?;
+    save_account_json_info(&conn, id, &updated_json)?;
 
     let plan_type = remote_identity
         .plan_type
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("unknown");
-    let account_stub = account_stub_from_json(&updated_json);
     conn.execute(
         "
         UPDATE accounts
@@ -3054,7 +4179,7 @@ async fn refresh_account_profile(app: AppHandle, id: i64) -> Result<Account, Str
             updated_at = datetime('now')
         WHERE id = ?3
         ",
-        params![account_stub, plan_type, id],
+        params![updated_json, plan_type, id],
     )
     .map_err(|e| format!("Failed to update account profile: {}", e))?;
 
@@ -3062,7 +4187,14 @@ async fn refresh_account_profile(app: AppHandle, id: i64) -> Result<Account, Str
         .prepare(
             "
             SELECT id, name, activation_date,
-                   CASE WHEN credential_key IS NOT NULL AND credential_key != '' THEN 1 ELSE 0 END AS has_json_info,
+                   CASE
+                       WHEN json_valid(json_info)
+                       THEN CASE
+                           WHEN COALESCE(json_extract(json_info, '$.tokens.access_token'), '') != ''
+                           THEN 1 ELSE 0
+                       END
+                       ELSE 0
+                   END AS has_json_info,
                    plan_type,
                    primary_used_percent, primary_reset_at,
                    primary_window_minutes, primary_window_present,
@@ -3070,7 +4202,11 @@ async fn refresh_account_profile(app: AppHandle, id: i64) -> Result<Account, Str
                    secondary_window_minutes, secondary_window_present,
                    last_quota_checked_at, last_quota_error,
                    created_at, updated_at,
-                   COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                   CASE
+                       WHEN json_valid(json_info)
+                       THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                       ELSE ''
+                   END
             FROM accounts
             WHERE id = ?1
             ",
@@ -3098,68 +4234,13 @@ fn migrate_plaintext_accounts(app: AppHandle) -> Result<MigrationStatus, String>
 }
 
 fn pending_plaintext_account_count(conn: &Connection) -> Result<i64, String> {
-    conn.query_row(
-        "
-        SELECT COUNT(*)
-        FROM accounts
-        WHERE json_info IS NOT NULL
-          AND trim(json_info) != ''
-          AND (credential_key IS NULL OR credential_key = '')
-        ",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .map_err(|e| format!("Failed to inspect credential migration status: {}", e))
+    let _ = conn;
+    Ok(0)
 }
 
 fn migrate_plaintext_credentials(conn: &Connection) -> Result<usize, String> {
-    let mut stmt = conn
-        .prepare(
-            "
-            SELECT id, json_info
-            FROM accounts
-            WHERE json_info IS NOT NULL
-              AND trim(json_info) != ''
-              AND (credential_key IS NULL OR credential_key = '')
-            ",
-        )
-        .map_err(|e| format!("Failed to prepare credential migration: {}", e))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|e| format!("Failed to query credential migration rows: {}", e))?;
-
-    let mut migrated = Vec::new();
-    for row in rows {
-        let (id, json_info) =
-            row.map_err(|e| format!("Failed to read credential migration row: {}", e))?;
-        let key = credential_key(id);
-        save_account_secret(&key, &json_info)?;
-        migrated.push((id, key, extract_account_id(&json_info).unwrap_or_default()));
-    }
-    drop(stmt);
-
-    let migrated_count = migrated.len();
-    for (id, key, account_id) in migrated {
-        let account_stub = account_id
-            .is_empty()
-            .then(|| "{}".to_string())
-            .unwrap_or_else(|| {
-                serde_json::json!({ "tokens": { "account_id": account_id } }).to_string()
-            });
-        conn.execute(
-            "
-            UPDATE accounts
-            SET credential_key = ?1, json_info = ?2, updated_at = datetime('now')
-            WHERE id = ?3
-            ",
-            params![key, account_stub, id],
-        )
-        .map_err(|e| format!("Failed to finish credential migration: {}", e))?;
-    }
-
-    Ok(migrated_count)
+    let _ = conn;
+    Ok(0)
 }
 
 #[command]
@@ -3175,36 +4256,21 @@ async fn add_account(
     let json_info = normalize_auth_input(&json_info).await?;
 
     let conn = open_accounts_db(&app)?;
+    let stored_json = if json_info.trim().is_empty() {
+        "{}"
+    } else {
+        json_info.trim()
+    };
     conn.execute(
         "
-        INSERT INTO accounts (name, activation_date, json_info, updated_at)
-        VALUES (?1, ?2, '{}', datetime('now'))
+        INSERT INTO accounts (name, activation_date, credential_key, json_info, updated_at)
+        VALUES (?1, ?2, '', ?3, datetime('now'))
         ",
-        params![name.trim(), activation_date],
+        params![name.trim(), activation_date, stored_json],
     )
     .map_err(|e| format!("Failed to add account: {}", e))?;
 
     let id = conn.last_insert_rowid();
-    if !json_info.trim().is_empty() {
-        let key = credential_key(id);
-        if let Err(e) = save_account_secret(&key, json_info.trim()) {
-            let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
-            return Err(e);
-        }
-        if let Err(e) = conn.execute(
-            "
-            UPDATE accounts
-            SET credential_key = ?1, json_info = ?2, updated_at = datetime('now')
-            WHERE id = ?3
-            ",
-            params![key, account_stub_from_json(json_info.trim()), id],
-        ) {
-            delete_account_secret(&key);
-            let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
-            return Err(format!("Failed to attach account credential: {}", e));
-        }
-    }
-
     Ok(id)
 }
 
@@ -3230,52 +4296,31 @@ async fn update_account(
     }
 
     let conn = open_accounts_db(&app)?;
-    let stored_key = match conn.query_row(
-        "SELECT credential_key FROM accounts WHERE id = ?1",
-        params![id],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(key) => key,
+    let exists = match conn.query_row("SELECT 1 FROM accounts WHERE id = ?1", params![id], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(_) => true,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Err("Account not found".to_string()),
         Err(e) => return Err(format!("Failed to find account: {}", e)),
     };
+    if !exists {
+        return Err("Account not found".to_string());
+    }
 
     if should_update_secret {
-        let key = if stored_key.is_empty() {
-            credential_key(id)
-        } else {
-            stored_key
-        };
-        let previous_secret = read_account_secret(&key).ok();
-        if let Err(e) = save_account_secret(&key, json_info.trim()) {
-            return Err(e);
-        }
-
-        if let Err(e) = conn.execute(
+        conn.execute(
             "
             UPDATE accounts
             SET name = ?1,
                 activation_date = ?2,
-                credential_key = ?3,
-                json_info = ?4,
+                credential_key = '',
+                json_info = ?3,
                 updated_at = datetime('now')
-            WHERE id = ?5
+            WHERE id = ?4
             ",
-            params![
-                name.trim(),
-                activation_date,
-                key,
-                account_stub_from_json(json_info.trim()),
-                id
-            ],
-        ) {
-            if let Some(previous_secret) = previous_secret {
-                let _ = save_account_secret(&key, &previous_secret);
-            } else {
-                delete_account_secret(&key);
-            }
-            return Err(format!("Failed to update account credential: {}", e));
-        }
+            params![name.trim(), activation_date, json_info.trim(), id],
+        )
+        .map_err(|e| format!("Failed to update account credential: {}", e))?;
 
         return Ok(());
     }
@@ -3296,9 +4341,6 @@ async fn update_account(
 #[command]
 fn delete_account(app: AppHandle, id: i64) -> Result<(), String> {
     let conn = open_accounts_db(&app)?;
-    if let Ok(key) = account_secret_key(&conn, id) {
-        delete_account_secret(&key);
-    }
     conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])
         .map_err(|e| format!("Failed to delete account: {}", e))?;
     Ok(())
@@ -3311,7 +4353,6 @@ fn export_encrypted_backup(
     account_ids: Option<Vec<i64>>,
 ) -> Result<String, String> {
     let conn = open_accounts_db(&app)?;
-    migrate_plaintext_credentials(&conn)?;
     let filter_ids: Option<std::collections::HashSet<i64>> =
         account_ids.map(|items| items.into_iter().collect());
 
@@ -3324,7 +4365,7 @@ fn export_encrypted_backup(
                    secondary_used_percent, secondary_reset_at,
                    secondary_window_minutes, secondary_window_present,
                    last_quota_checked_at, last_quota_error,
-                   credential_key
+                   json_info
             FROM accounts
             ORDER BY id ASC
             ",
@@ -3370,17 +4411,18 @@ fn export_encrypted_backup(
             secondary_window_present,
             last_quota_checked_at,
             last_quota_error,
-            key,
+            stored_json_info,
         ) = row.map_err(|e| format!("Failed to read backup account: {}", e))?;
         if let Some(filter_ids) = &filter_ids {
             if !filter_ids.contains(&id) {
                 continue;
             }
         }
-        if key.is_empty() {
+        let json_info = if json_info_has_credential(&stored_json_info) {
+            stored_json_info
+        } else {
             continue;
-        }
-        let json_info = read_account_secret(&key)?;
+        };
         accounts.push(BackupAccount {
             name,
             activation_date,
@@ -3494,9 +4536,18 @@ fn existing_account_ids(
     let mut stmt = conn
         .prepare(
             "
-            SELECT id, COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+            SELECT id,
+                   CASE
+                       WHEN json_valid(json_info)
+                       THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                       ELSE ''
+                   END
             FROM accounts
-            WHERE COALESCE(json_extract(json_info, '$.tokens.account_id'), '') != ''
+            WHERE CASE
+                      WHEN json_valid(json_info)
+                      THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                      ELSE ''
+                  END != ''
             ORDER BY id ASC
             ",
         )
@@ -3532,11 +4583,12 @@ fn insert_backup_account(
             last_quota_checked_at, last_quota_error,
             updated_at
         )
-        VALUES (?1, ?2, '{}', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'))
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, datetime('now'))
         ",
         params![
             account.name,
             account.activation_date,
+            account.json_info,
             account.plan_type,
             account.primary_used_percent,
             account.primary_reset_at,
@@ -3557,65 +4609,36 @@ fn insert_backup_account(
     .map_err(|e| format!("Failed to import account: {}", e))?;
 
     let id = conn.last_insert_rowid();
-    let key = credential_key(id);
-    if let Err(e) = save_account_secret(&key, &account.json_info) {
-        let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
-        return Err(e);
-    }
-    imported_credentials.push((id, key.clone()));
-
-    if let Err(e) = conn.execute(
-        "
-        UPDATE accounts
-        SET credential_key = ?1, json_info = ?2, updated_at = datetime('now')
-        WHERE id = ?3
-        ",
-        params![key, account_stub_from_json(&account.json_info), id],
-    ) {
-        delete_account_secret(&key);
-        let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
-        return Err(format!("Failed to attach imported credential: {}", e));
-    }
+    imported_credentials.push((id, String::new()));
     Ok(())
 }
 
 fn merge_backup_account(conn: &Connection, id: i64, account: &BackupAccount) -> Result<(), String> {
-    let key = match conn.query_row(
-        "SELECT credential_key FROM accounts WHERE id = ?1",
-        params![id],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(key) if !key.is_empty() => key,
-        Ok(_) => credential_key(id),
-        Err(e) => return Err(format!("Failed to find account for merge: {}", e)),
-    };
-    save_account_secret(&key, &account.json_info)?;
     conn.execute(
         "
         UPDATE accounts
         SET name = ?1,
             activation_date = ?2,
-            credential_key = ?3,
-            json_info = ?4,
-            plan_type = ?5,
-            primary_used_percent = ?6,
-            primary_reset_at = ?7,
-            primary_window_minutes = ?8,
-            primary_window_present = ?9,
-            secondary_used_percent = ?10,
-            secondary_reset_at = ?11,
-            secondary_window_minutes = ?12,
-            secondary_window_present = ?13,
-            last_quota_checked_at = ?14,
-            last_quota_error = ?15,
+            credential_key = '',
+            json_info = ?3,
+            plan_type = ?4,
+            primary_used_percent = ?5,
+            primary_reset_at = ?6,
+            primary_window_minutes = ?7,
+            primary_window_present = ?8,
+            secondary_used_percent = ?9,
+            secondary_reset_at = ?10,
+            secondary_window_minutes = ?11,
+            secondary_window_present = ?12,
+            last_quota_checked_at = ?13,
+            last_quota_error = ?14,
             updated_at = datetime('now')
-        WHERE id = ?16
+        WHERE id = ?15
         ",
         params![
             account.name,
             account.activation_date,
-            key,
-            account_stub_from_json(&account.json_info),
+            account.json_info,
             account.plan_type,
             account.primary_used_percent,
             account.primary_reset_at,
@@ -3730,8 +4753,7 @@ async fn import_encrypted_backup(
 }
 
 fn cleanup_imported_accounts(conn: &Connection, imported_credentials: &[(i64, String)]) {
-    for (id, key) in imported_credentials {
-        delete_account_secret(key);
+    for (id, _key) in imported_credentials {
         let _ = conn.execute("DELETE FROM accounts WHERE id = ?1", params![id]);
     }
 }
@@ -3752,22 +4774,11 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
             "开始刷新额度",
             "",
         );
-        let key = account_secret_key(&conn, id)?;
-        let json_info = read_account_secret(&key)?;
+        let json_info = account_json_info(&conn, id)?;
         let refreshed_json = match refresh_auth_json_if_needed(&json_info, false).await {
             Ok((updated_json, changed)) => {
                 if changed {
-                    save_account_secret(&key, &updated_json)?;
-                    let account_stub = account_stub_from_json(&updated_json);
-                    conn.execute(
-                        "
-                        UPDATE accounts
-                        SET json_info = ?1, updated_at = datetime('now')
-                        WHERE id = ?2
-                        ",
-                        params![account_stub, id],
-                    )
-                    .map_err(|e| format!("Failed to update refreshed account credential: {}", e))?;
+                    save_account_json_info(&conn, id, &updated_json)?;
                 }
                 updated_json
             }
@@ -3862,10 +4873,7 @@ async fn check_account_health(app: AppHandle, id: i64) -> Result<AccountHealthRe
 
     let secret_result = {
         let conn = open_accounts_db(&app)?;
-        match account_secret_key(&conn, id) {
-            Ok(key) => read_account_secret(&key),
-            Err(e) => Err(e),
-        }
+        account_json_info(&conn, id)
     };
 
     match secret_result {
@@ -3874,7 +4882,7 @@ async fn check_account_health(app: AppHandle, id: i64) -> Result<AccountHealthRe
                 "credential",
                 "凭据读取",
                 "ok",
-                "系统凭据库可读取",
+                "本地数据库可读取",
             ));
 
             match serde_json::from_str::<serde_json::Value>(&json_info) {
@@ -4003,25 +5011,34 @@ async fn switch_account_by_id(
     app: AppHandle,
     id: i64,
     restart_codex: Option<bool>,
-) -> Result<(), String> {
+) -> Result<SwitchAccountResult, String> {
     let conn = open_accounts_db(&app)?;
-    let key = account_secret_key(&conn, id)?;
-    let json_info = read_account_secret(&key)?;
+    let _ = write_proxy_active_account_id(&conn, id);
+    let (account_name, account_identifier) = account_log_context(&conn, id);
+    let json_info = account_json_info(&conn, id)?;
     let (json_info, changed) = refresh_auth_json_if_needed(&json_info, false).await?;
     if changed {
-        save_account_secret(&key, &json_info)?;
-        let account_stub = account_stub_from_json(&json_info);
-        conn.execute(
-            "
-            UPDATE accounts
-            SET json_info = ?1, updated_at = datetime('now')
-            WHERE id = ?2
-            ",
-            params![account_stub, id],
-        )
-        .map_err(|e| format!("Failed to update refreshed account credential: {}", e))?;
+        save_account_json_info(&conn, id, &json_info)?;
     }
-    switch_account(json_info, restart_codex).await
+    let result = switch_account(json_info, restart_codex).await?;
+    let (level, stage) = match result.hot_switch.status.as_str() {
+        "failed" => ("warn", "hot_switch_failed"),
+        "unavailable" => ("info", "hot_switch_unavailable"),
+        "applied" => ("info", "hot_switch_applied"),
+        _ => ("info", "completed"),
+    };
+    let _ = insert_operation_log(
+        &conn,
+        level,
+        "switch_account",
+        Some(id),
+        &account_name,
+        &account_identifier,
+        stage,
+        &result.hot_switch.message,
+        &result.hot_switch.detail,
+    );
+    Ok(result)
 }
 
 #[command]
@@ -4066,39 +5083,154 @@ fn update_account_quota(app: AppHandle, id: i64, quota: QuotaInfo) -> Result<(),
     Ok(())
 }
 
+fn saved_codex_proxy_port(conn: &Connection) -> Result<u16, String> {
+    Ok(read_setting_from_conn(conn, CODEX_PROXY_SETTING_PORT)?
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(CODEX_PROXY_DEFAULT_PORT))
+}
+
+fn runtime_proxy_snapshot() -> Result<(bool, Option<u16>, String), String> {
+    let guard = CODEX_PROXY_RUNTIME
+        .lock()
+        .map_err(|_| "Codex proxy runtime lock is poisoned".to_string())?;
+    if let Some(runtime) = guard.as_ref() {
+        let enabled = !runtime.stop.load(Ordering::Relaxed);
+        let last_error = runtime
+            .last_error
+            .lock()
+            .map(|item| item.clone())
+            .unwrap_or_default();
+        Ok((enabled, Some(runtime.port), last_error))
+    } else {
+        Ok((false, None, String::new()))
+    }
+}
+
+fn codex_proxy_state(app: &AppHandle, conn: &Connection) -> Result<CodexProxyState, String> {
+    let (enabled, runtime_port, last_error) = runtime_proxy_snapshot()?;
+    let port = runtime_port.unwrap_or(saved_codex_proxy_port(conn)?);
+    let active_account_id = read_proxy_active_account_id(conn)?;
+    let active_account_name = active_account_id
+        .map(|id| account_log_context(conn, id).0)
+        .unwrap_or_default();
+    let config_path = get_codex_config_path()?;
+    let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let _ = app;
+
+    Ok(CodexProxyState {
+        enabled,
+        port,
+        base_url: codex_proxy_base_url(port),
+        active_account_id,
+        active_account_name,
+        config_installed: codex_proxy_config_installed(&config_text),
+        config_path: config_path.to_string_lossy().to_string(),
+        last_error,
+    })
+}
+
+fn start_codex_proxy_for_app(app: &AppHandle, port: u16) -> Result<(), String> {
+    let db_path = get_database_path(app)?;
+    start_codex_proxy_runtime(db_path, port)
+}
+
+fn restore_codex_proxy_on_startup(app: AppHandle) {
+    let result = (|| -> Result<(), String> {
+        let conn = open_accounts_db(&app)?;
+        let enabled = read_setting_from_conn(&conn, CODEX_PROXY_SETTING_ENABLED)?
+            .map(|value| value == "true")
+            .unwrap_or(false);
+        if enabled {
+            let port = saved_codex_proxy_port(&conn)?;
+            start_codex_proxy_for_app(&app, port)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        eprintln!("Failed to restore Codex proxy: {}", error);
+    }
+}
+
+#[command]
+fn get_codex_proxy_state(app: AppHandle) -> Result<CodexProxyState, String> {
+    let conn = open_accounts_db(&app)?;
+    codex_proxy_state(&app, &conn)
+}
+
+#[command]
+fn activate_codex_proxy(
+    app: AppHandle,
+    account_id: Option<i64>,
+    port: Option<u16>,
+) -> Result<CodexProxyState, String> {
+    let conn = open_accounts_db(&app)?;
+    let port = port.unwrap_or(saved_codex_proxy_port(&conn)?);
+    let account_id = account_id
+        .or(read_proxy_active_account_id(&conn)?)
+        .or(fallback_proxy_account_id(&conn)?)
+        .ok_or_else(|| "没有可用于代理的账号，请先添加 OAuth 账号。".to_string())?;
+    account_json_info(&conn, account_id)?;
+    write_proxy_active_account_id(&conn, account_id)?;
+    write_setting_to_conn(&conn, CODEX_PROXY_SETTING_PORT, &port.to_string())?;
+    write_setting_to_conn(&conn, CODEX_PROXY_SETTING_ENABLED, "true")?;
+    install_codex_proxy_config_to_path(&get_codex_config_path()?, &conn, port)?;
+    start_codex_proxy_for_app(&app, port)?;
+    codex_proxy_state(&app, &conn)
+}
+
+#[command]
+fn deactivate_codex_proxy(app: AppHandle) -> Result<CodexProxyState, String> {
+    let conn = open_accounts_db(&app)?;
+    stop_codex_proxy_runtime()?;
+    write_setting_to_conn(&conn, CODEX_PROXY_SETTING_ENABLED, "false")?;
+    restore_codex_proxy_config_from_backup(&get_codex_config_path()?, &conn)?;
+    codex_proxy_state(&app, &conn)
+}
+
+#[command]
+fn set_codex_proxy_account(app: AppHandle, account_id: i64) -> Result<CodexProxyState, String> {
+    let conn = open_accounts_db(&app)?;
+    let (was_running, _runtime_port, _last_error) = runtime_proxy_snapshot()?;
+    let config_path = get_codex_config_path()?;
+    let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let should_keep_enabled = was_running
+        || read_setting_from_conn(&conn, CODEX_PROXY_SETTING_ENABLED)?
+            .map(|value| value == "true")
+            .unwrap_or(false)
+        || codex_proxy_config_installed(&config_text);
+
+    account_json_info(&conn, account_id)?;
+    write_proxy_active_account_id(&conn, account_id)?;
+
+    if should_keep_enabled {
+        let port = saved_codex_proxy_port(&conn)?;
+        write_setting_to_conn(&conn, CODEX_PROXY_SETTING_ENABLED, "true")?;
+        install_codex_proxy_config_to_path(&config_path, &conn, port)?;
+        start_codex_proxy_for_app(&app, port)?;
+    }
+
+    codex_proxy_state(&app, &conn)
+}
+
 #[command]
 fn get_setting(app: AppHandle, key: String) -> Result<Option<String>, String> {
     let conn = open_accounts_db(&app)?;
-    let result = conn.query_row(
-        "SELECT value FROM app_settings WHERE key = ?1",
-        params![key],
-        |row| row.get::<_, String>(0),
-    );
-
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(format!("Failed to read setting: {}", e)),
-    }
+    read_setting_from_conn(&conn, &key)
 }
 
 #[command]
 fn set_setting(app: AppHandle, key: String, value: String) -> Result<(), String> {
     let conn = open_accounts_db(&app)?;
-    conn.execute(
-        "
-        INSERT INTO app_settings (key, value)
-        VALUES (?1, ?2)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        ",
-        params![key, value],
-    )
-    .map_err(|e| format!("Failed to save setting: {}", e))?;
-    Ok(())
+    write_setting_to_conn(&conn, &key, &value)
 }
 
 #[command]
-async fn switch_account(json_info: String, restart_codex: Option<bool>) -> Result<(), String> {
+async fn switch_account(
+    json_info: String,
+    restart_codex: Option<bool>,
+) -> Result<SwitchAccountResult, String> {
     // Guardrail: switching accounts writes only ~/.codex/auth.json. Any
     // config.toml repair or speed setting must stay behind explicit commands.
     if json_info.trim().is_empty() {
@@ -4124,7 +5256,17 @@ async fn switch_account(json_info: String, restart_codex: Option<bool>) -> Resul
         restart_codex_process()?;
     }
 
-    Ok(())
+    let hot_switch = if should_restart {
+        skipped_hot_switch_result("已重启 Codex，不需要单独热切号")
+    } else {
+        try_hot_switch_codex_app_server(&json_info)
+    };
+
+    Ok(SwitchAccountResult {
+        restarted: should_restart,
+        auth_json_path: auth_path.to_string_lossy().to_string(),
+        hot_switch,
+    })
 }
 
 #[command]
@@ -4180,10 +5322,18 @@ async fn get_current_account_record_id(app: AppHandle) -> Result<Option<i64>, St
     let mut stmt = conn
         .prepare(
             "
-            SELECT id, credential_key,
-                   COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+            SELECT id, json_info,
+                   CASE
+                       WHEN json_valid(json_info)
+                       THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                       ELSE ''
+                   END
             FROM accounts
-            WHERE credential_key IS NOT NULL AND credential_key != ''
+            WHERE CASE
+                      WHEN json_valid(json_info)
+                      THEN COALESCE(json_extract(json_info, '$.tokens.access_token'), '')
+                      ELSE ''
+                  END != ''
             ORDER BY id DESC
             ",
         )
@@ -4200,15 +5350,12 @@ async fn get_current_account_record_id(app: AppHandle) -> Result<Option<i64>, St
 
     let mut account_id_matches = Vec::new();
     for row in rows {
-        let (id, key, account_id) =
+        let (id, stored_json_info, account_id) =
             row.map_err(|e| format!("Failed to read current account candidate: {}", e))?;
         if current_account_id == Some(account_id.as_str()) {
             account_id_matches.push(id);
         }
-        let Ok(secret) = read_account_secret(&key) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&secret) else {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&stored_json_info) else {
             continue;
         };
         let Some(access_token) = value
@@ -4351,6 +5498,893 @@ async fn repair_codex_project_visibility(
         is_trusted: true,
         changed,
     })
+}
+
+#[derive(Debug, Clone)]
+struct CodexRolloutFile {
+    path: PathBuf,
+    relative_path: PathBuf,
+    archived: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CodexRolloutThreadMetadata {
+    path: PathBuf,
+    relative_path: PathBuf,
+    archived: bool,
+    id: String,
+    model_provider: String,
+    cwd: String,
+    created_at: i64,
+    created_at_ms: i64,
+    updated_at: i64,
+    updated_at_ms: i64,
+    source: String,
+    thread_source: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    cli_version: String,
+    title: String,
+    preview: String,
+    sandbox_policy: String,
+    approval_mode: String,
+    tokens_used: i64,
+    first_user_message: String,
+    memory_mode: String,
+}
+
+#[derive(Debug, Clone)]
+struct SqliteVisibilityState {
+    exists: bool,
+    provider: String,
+}
+
+const USER_MESSAGE_BEGIN_MARKER: &str = "## My request for Codex:";
+
+fn codex_state_db_path_for_home(codex_home: &Path) -> PathBuf {
+    codex_home.join(CODEX_STATE_DB_FILE)
+}
+
+fn codex_session_index_path_for_home(codex_home: &Path) -> PathBuf {
+    codex_home.join(CODEX_SESSION_INDEX_FILE)
+}
+
+fn collect_codex_rollout_files(codex_home: &Path) -> Result<Vec<CodexRolloutFile>, String> {
+    let mut files = Vec::new();
+    for (subdir, archived) in [
+        (CODEX_SESSIONS_DIR, false),
+        (CODEX_ARCHIVED_SESSIONS_DIR, true),
+    ] {
+        let root = codex_home.join(subdir);
+        if !root.exists() {
+            continue;
+        }
+        collect_codex_rollout_files_recursive(codex_home, &root, archived, &mut files)?;
+    }
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(files)
+}
+
+fn collect_codex_rollout_files_recursive(
+    codex_home: &Path,
+    dir: &Path,
+    archived: bool,
+    files: &mut Vec<CodexRolloutFile>,
+) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("读取 Codex 会话目录失败: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取 Codex 会话文件失败: {}", e))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("读取 Codex 会话文件类型失败: {}", e))?;
+        if file_type.is_dir() {
+            collect_codex_rollout_files_recursive(codex_home, &path, archived, files)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|item| item.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let relative_path = path.strip_prefix(codex_home).unwrap_or(&path).to_path_buf();
+        files.push(CodexRolloutFile {
+            path,
+            relative_path,
+            archived,
+        });
+    }
+    Ok(())
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_str())
+        .map(str::to_string)
+        .filter(|item| !item.trim().is_empty())
+}
+
+fn json_state_string(value: &serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(text) = value.as_str() {
+        return (!text.trim().is_empty()).then(|| text.to_string());
+    }
+    serde_json::to_string(value)
+        .ok()
+        .filter(|item| !item.trim().is_empty())
+}
+
+fn parse_rfc3339_epoch(value: &str) -> Option<(i64, i64)> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+    Some((parsed.timestamp(), parsed.timestamp_millis()))
+}
+
+fn file_modified_epoch(path: &Path) -> Option<(i64, i64)> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = i64::try_from(duration.as_secs()).ok()?;
+    let millis = seconds
+        .saturating_mul(1000)
+        .saturating_add(i64::from(duration.subsec_millis()));
+    Some((seconds, millis))
+}
+
+fn strip_user_message_prefix(text: &str) -> String {
+    match text.find(USER_MESSAGE_BEGIN_MARKER) {
+        Some(index) => text[index + USER_MESSAGE_BEGIN_MARKER.len()..]
+            .trim()
+            .to_string(),
+        None => text.trim().to_string(),
+    }
+}
+
+fn default_rollout_title(id: &str) -> String {
+    format!("Codex session {}", id)
+}
+
+fn parse_codex_rollout_metadata(
+    file: &CodexRolloutFile,
+) -> Result<Option<CodexRolloutThreadMetadata>, String> {
+    let content = std::fs::read_to_string(&file.path)
+        .map_err(|e| format!("读取 rollout 文件失败 {}: {}", file.path.display(), e))?;
+    let file_time = file_modified_epoch(&file.path).unwrap_or((0, 0));
+
+    let mut id = String::new();
+    let mut model_provider = String::new();
+    let mut cwd = String::new();
+    let mut created_at = file_time.0;
+    let mut created_at_ms = file_time.1;
+    let mut source = String::new();
+    let mut thread_source = None;
+    let mut cli_version = String::new();
+    let mut memory_mode = "enabled".to_string();
+    let mut model = None;
+    let mut reasoning_effort = None;
+    let mut title = String::new();
+    let mut preview = String::new();
+    let mut sandbox_policy = r#"{"type":"read-only"}"#.to_string();
+    let mut approval_mode = "on-request".to_string();
+    let mut tokens_used = 0;
+    let mut first_user_message = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        match value.get("type").and_then(|item| item.as_str()) {
+            Some("session_meta") if id.is_empty() => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                id = json_string(payload, "id").unwrap_or_default();
+                model_provider = json_string(payload, "model_provider").unwrap_or_default();
+                cwd = json_string(payload, "cwd").unwrap_or_default();
+                source = payload
+                    .get("source")
+                    .and_then(json_state_string)
+                    .unwrap_or_else(|| "vscode".to_string());
+                thread_source = json_string(payload, "thread_source");
+                cli_version = json_string(payload, "cli_version").unwrap_or_default();
+                memory_mode =
+                    json_string(payload, "memory_mode").unwrap_or_else(|| "enabled".to_string());
+                if let Some(timestamp) = json_string(payload, "timestamp") {
+                    if let Some((seconds, millis)) = parse_rfc3339_epoch(&timestamp) {
+                        created_at = seconds;
+                        created_at_ms = millis;
+                    }
+                }
+            }
+            Some("turn_context") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                model = json_string(payload, "model").or(model);
+                reasoning_effort = json_string(payload, "effort").or(reasoning_effort);
+                if let Some(policy) = payload
+                    .get("permission_profile")
+                    .or_else(|| payload.get("sandbox_policy"))
+                    .and_then(json_state_string)
+                {
+                    sandbox_policy = policy;
+                }
+                if let Some(approval) = payload.get("approval_policy").and_then(json_state_string)
+                {
+                    approval_mode = approval;
+                }
+                if cwd.is_empty() {
+                    cwd = json_string(payload, "cwd").unwrap_or_default();
+                }
+            }
+            Some("event_msg") => {
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
+                match payload.get("type").and_then(|item| item.as_str()) {
+                    Some("user_message") => {
+                        if let Some(message) = json_string(payload, "message") {
+                            let clean = strip_user_message_prefix(&message);
+                            if !clean.is_empty() {
+                                if first_user_message.is_empty() {
+                                    first_user_message = clean.clone();
+                                }
+                                if preview.is_empty() {
+                                    preview = clean.clone();
+                                }
+                                if title.is_empty() {
+                                    title = clean;
+                                }
+                            }
+                        }
+                    }
+                    Some("token_count") => {
+                        tokens_used = payload
+                            .pointer("/info/total_token_usage/total_tokens")
+                            .and_then(|item| item.as_i64())
+                            .unwrap_or(tokens_used)
+                            .max(0);
+                    }
+                    Some("thread_goal_updated") => {
+                        if preview.is_empty() {
+                            if let Some(objective) =
+                                payload.pointer("/goal/objective").and_then(|item| item.as_str())
+                            {
+                                let objective = objective.trim();
+                                if !objective.is_empty() {
+                                    preview = objective.to_string();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if id.is_empty() {
+        return Ok(None);
+    }
+    if title.trim().is_empty() {
+        title = if preview.trim().is_empty() {
+            default_rollout_title(&id)
+        } else {
+            preview.clone()
+        };
+    }
+    if preview.trim().is_empty() {
+        preview = title.clone();
+    }
+
+    Ok(Some(CodexRolloutThreadMetadata {
+        path: file.path.clone(),
+        relative_path: file.relative_path.clone(),
+        archived: file.archived,
+        id,
+        model_provider,
+        cwd,
+        created_at,
+        created_at_ms,
+        updated_at: file_time.0.max(created_at),
+        updated_at_ms: file_time.1.max(created_at_ms),
+        source,
+        thread_source,
+        model,
+        reasoning_effort,
+        cli_version,
+        title,
+        preview,
+        sandbox_policy,
+        approval_mode,
+        tokens_used,
+        first_user_message,
+        memory_mode,
+    }))
+}
+
+fn detect_session_visibility_target_provider(
+    codex_home: &Path,
+    target_provider: Option<String>,
+    metadata: &[CodexRolloutThreadMetadata],
+) -> String {
+    if let Some(provider) = target_provider
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+    {
+        return provider;
+    }
+
+    if let Some(provider) = metadata
+        .iter()
+        .filter(|item| !item.model_provider.trim().is_empty())
+        .max_by_key(|item| item.updated_at_ms)
+        .map(|item| item.model_provider.clone())
+    {
+        return provider;
+    }
+
+    let config_path = codex_home.join(CODEX_CONFIG_FILE);
+    let config = std::fs::read_to_string(config_path).unwrap_or_default();
+    root_toml_string_value(&config, "model_provider").unwrap_or_else(|| "openai".to_string())
+}
+
+fn read_session_index_ids(path: &Path) -> Result<HashSet<String>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(format!("读取 session_index.jsonl 失败: {}", e)),
+    };
+    let mut ids = HashSet::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if let Some(id) = json_string(&value, "id") {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn sqlite_visibility_state(
+    conn: &Connection,
+    thread_id: &str,
+) -> Result<SqliteVisibilityState, String> {
+    match conn.query_row(
+        "SELECT model_provider FROM threads WHERE id = ?",
+        params![thread_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(provider) => Ok(SqliteVisibilityState {
+            exists: true,
+            provider,
+        }),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(SqliteVisibilityState {
+            exists: false,
+            provider: String::new(),
+        }),
+        Err(e) => Err(format!("读取 Codex state_5.sqlite 失败: {}", e)),
+    }
+}
+
+fn scan_codex_session_visibility(
+    codex_home: &Path,
+    target_provider: Option<String>,
+) -> Result<
+    (
+        String,
+        Vec<CodexRolloutThreadMetadata>,
+        usize,
+        usize,
+        usize,
+        usize,
+    ),
+    String,
+> {
+    let rollout_files = collect_codex_rollout_files(codex_home)?;
+    let mut metadata = Vec::new();
+    for file in &rollout_files {
+        if let Some(item) = parse_codex_rollout_metadata(file)? {
+            metadata.push(item);
+        }
+    }
+    let target_provider =
+        detect_session_visibility_target_provider(codex_home, target_provider, &metadata);
+    let mismatched_rollout_files = metadata
+        .iter()
+        .filter(|item| item.model_provider != target_provider)
+        .count();
+
+    let state_db_path = codex_state_db_path_for_home(codex_home);
+    let mut mismatched_sqlite_records = 0;
+    let mut missing_sqlite_records = 0;
+    if state_db_path.exists() {
+        let conn = Connection::open_with_flags(
+            &state_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
+        for item in &metadata {
+            let state = sqlite_visibility_state(&conn, &item.id)?;
+            if !state.exists {
+                missing_sqlite_records += 1;
+            } else if state.provider != target_provider {
+                mismatched_sqlite_records += 1;
+            }
+        }
+    } else {
+        missing_sqlite_records = metadata.len();
+    }
+
+    let session_index_path = codex_session_index_path_for_home(codex_home);
+    let index_ids = read_session_index_ids(&session_index_path)?;
+    let missing_session_index_entries = metadata
+        .iter()
+        .filter(|item| !index_ids.contains(&item.id))
+        .count();
+
+    Ok((
+        target_provider,
+        metadata,
+        rollout_files.len(),
+        mismatched_rollout_files,
+        mismatched_sqlite_records,
+        missing_sqlite_records + missing_session_index_entries,
+    ))
+}
+
+fn get_codex_session_visibility_status_for_home(
+    codex_home: &Path,
+    target_provider: Option<String>,
+) -> Result<CodexSessionVisibilityStatus, String> {
+    let (
+        target_provider,
+        metadata,
+        scanned_rollout_files,
+        mismatched_rollout_files,
+        mismatched_sqlite_records,
+        missing_total,
+    ) = scan_codex_session_visibility(codex_home, target_provider)?;
+    let state_db_path = codex_state_db_path_for_home(codex_home);
+    let session_index_path = codex_session_index_path_for_home(codex_home);
+
+    let missing_sqlite_records = if state_db_path.exists() {
+        let conn = Connection::open_with_flags(
+            &state_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
+        let mut count = 0;
+        for item in &metadata {
+            if !sqlite_visibility_state(&conn, &item.id)?.exists {
+                count += 1;
+            }
+        }
+        count
+    } else {
+        metadata.len()
+    };
+    let session_index_ids = read_session_index_ids(&session_index_path)?;
+    let missing_session_index_entries = missing_total.saturating_sub(missing_sqlite_records);
+    let missing_session_index_entries = if missing_session_index_entries == 0 {
+        metadata
+            .iter()
+            .filter(|item| !session_index_ids.contains(&item.id))
+            .count()
+    } else {
+        missing_session_index_entries
+    };
+
+    Ok(CodexSessionVisibilityStatus {
+        codex_home: codex_home.to_string_lossy().to_string(),
+        state_db_path: state_db_path.to_string_lossy().to_string(),
+        session_index_path: session_index_path.to_string_lossy().to_string(),
+        target_provider,
+        scanned_rollout_files,
+        mismatched_rollout_files,
+        mismatched_sqlite_records,
+        missing_sqlite_records,
+        missing_session_index_entries,
+    })
+}
+
+fn ensure_parent_dir(path: &Path, label: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建{}目录失败: {}", label, e))?;
+    }
+    Ok(())
+}
+
+fn copy_file_to_backup(source: &Path, destination: &Path) -> Result<bool, String> {
+    if !source.exists() {
+        return Ok(false);
+    }
+    ensure_parent_dir(destination, "备份")?;
+    std::fs::copy(source, destination).map_err(|e| {
+        format!(
+            "备份文件失败 {} -> {}: {}",
+            source.display(),
+            destination.display(),
+            e
+        )
+    })?;
+    Ok(true)
+}
+
+fn create_session_visibility_backup(
+    codex_home: &Path,
+    target_provider: &str,
+    rollout_files: &[PathBuf],
+    include_sqlite: bool,
+    include_session_index: bool,
+) -> Result<String, String> {
+    if rollout_files.is_empty() && !include_sqlite && !include_session_index {
+        return Ok(String::new());
+    }
+
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let backup_dir = codex_home.join(format!(
+        "backup-{}-session-visibility-repair",
+        stamp
+    ));
+    let files_dir = backup_dir.join("files");
+    std::fs::create_dir_all(&files_dir).map_err(|e| format!("创建修复备份目录失败: {}", e))?;
+
+    let mut rollout_relatives = Vec::new();
+    for relative_path in rollout_files {
+        let source = codex_home.join(relative_path);
+        let destination = files_dir.join(relative_path);
+        copy_file_to_backup(&source, &destination)?;
+        rollout_relatives.push(relative_path.to_string_lossy().to_string());
+    }
+
+    let state_db_path = codex_state_db_path_for_home(codex_home);
+    let has_sqlite_backup = if include_sqlite {
+        copy_file_to_backup(&state_db_path, &backup_dir.join(CODEX_STATE_DB_FILE))?
+    } else {
+        false
+    };
+    for suffix in ["-wal", "-shm"] {
+        let source = PathBuf::from(format!("{}{}", state_db_path.display(), suffix));
+        if source.exists() {
+            let destination = backup_dir.join(format!("{}{}", CODEX_STATE_DB_FILE, suffix));
+            let _ = copy_file_to_backup(&source, &destination)?;
+        }
+    }
+
+    let session_index_path = codex_session_index_path_for_home(codex_home);
+    let has_session_index_backup = if include_session_index {
+        copy_file_to_backup(&session_index_path, &backup_dir.join(CODEX_SESSION_INDEX_FILE))?
+    } else {
+        false
+    };
+
+    let manifest = serde_json::json!({
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "instanceRoot": codex_home.to_string_lossy(),
+        "targetProvider": target_provider,
+        "rolloutFiles": rollout_relatives,
+        "hasSqliteBackup": has_sqlite_backup,
+        "hasSessionIndexBackup": has_session_index_backup,
+    });
+    std::fs::write(
+        backup_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)
+            .map_err(|e| format!("生成修复备份清单失败: {}", e))?,
+    )
+    .map_err(|e| format!("写入修复备份清单失败: {}", e))?;
+
+    Ok(backup_dir.to_string_lossy().to_string())
+}
+
+fn rewrite_rollout_model_provider(path: &Path, target_provider: &str) -> Result<bool, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("读取 rollout 文件失败 {}: {}", path.display(), e))?;
+    let had_trailing_newline = content.ends_with('\n');
+    let mut changed = false;
+    let mut lines = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !changed && !trimmed.is_empty() {
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if value.get("type").and_then(|item| item.as_str()) == Some("session_meta") {
+                    if let Some(payload) = value.get_mut("payload").and_then(|item| item.as_object_mut())
+                    {
+                        let current = payload
+                            .get("model_provider")
+                            .and_then(|item| item.as_str())
+                            .unwrap_or_default();
+                        if current != target_provider {
+                            payload.insert(
+                                "model_provider".to_string(),
+                                serde_json::Value::String(target_provider.to_string()),
+                            );
+                            lines.push(
+                                serde_json::to_string(&value)
+                                    .map_err(|e| format!("序列化 rollout 元数据失败: {}", e))?,
+                            );
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        lines.push(line.to_string());
+    }
+
+    if changed {
+        let mut next = lines.join("\n");
+        if had_trailing_newline {
+            next.push('\n');
+        }
+        std::fs::write(path, next)
+            .map_err(|e| format!("写入 rollout 文件失败 {}: {}", path.display(), e))?;
+    }
+    Ok(changed)
+}
+
+fn update_sqlite_thread_provider(
+    conn: &Connection,
+    thread_id: &str,
+    target_provider: &str,
+) -> Result<usize, String> {
+    conn.execute(
+        "UPDATE threads SET model_provider = ? WHERE id = ? AND model_provider != ?",
+        params![target_provider, thread_id, target_provider],
+    )
+    .map_err(|e| format!("更新 Codex state_5.sqlite 失败: {}", e))
+}
+
+fn insert_sqlite_thread_metadata(
+    conn: &Connection,
+    item: &CodexRolloutThreadMetadata,
+    target_provider: &str,
+) -> Result<usize, String> {
+    let archived = if item.archived { 1 } else { 0 };
+    let archived_at = item.archived.then_some(item.updated_at);
+    conn.execute(
+        r#"
+        INSERT INTO threads (
+            id,
+            rollout_path,
+            created_at,
+            updated_at,
+            created_at_ms,
+            updated_at_ms,
+            source,
+            thread_source,
+            model_provider,
+            model,
+            reasoning_effort,
+            cwd,
+            cli_version,
+            title,
+            preview,
+            sandbox_policy,
+            approval_mode,
+            tokens_used,
+            first_user_message,
+            archived,
+            archived_at,
+            memory_mode
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+        "#,
+        params![
+            item.id,
+            item.path.to_string_lossy().to_string(),
+            item.created_at,
+            item.updated_at,
+            item.created_at_ms,
+            item.updated_at_ms,
+            item.source,
+            item.thread_source,
+            target_provider,
+            item.model,
+            item.reasoning_effort,
+            item.cwd,
+            item.cli_version,
+            item.title,
+            item.preview,
+            item.sandbox_policy,
+            item.approval_mode,
+            item.tokens_used,
+            item.first_user_message,
+            archived,
+            archived_at,
+            item.memory_mode,
+        ],
+    )
+    .map_err(|e| format!("补写 Codex state_5.sqlite 失败: {}", e))
+}
+
+fn append_session_index_entry(
+    path: &Path,
+    thread_id: &str,
+    thread_name: &str,
+) -> Result<(), String> {
+    ensure_parent_dir(path, "session_index")?;
+    let entry = serde_json::json!({
+        "id": thread_id,
+        "thread_name": thread_name,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let mut line = serde_json::to_string(&entry)
+        .map_err(|e| format!("序列化 session_index 条目失败: {}", e))?;
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("打开 session_index.jsonl 失败: {}", e))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("写入 session_index.jsonl 失败: {}", e))
+}
+
+fn repair_codex_session_visibility_for_home(
+    codex_home: &Path,
+    target_provider: Option<String>,
+) -> Result<CodexSessionVisibilityRepairReport, String> {
+    let rollout_files = collect_codex_rollout_files(codex_home)?;
+    let mut metadata = Vec::new();
+    let mut failed_rollout_files = Vec::new();
+    for file in &rollout_files {
+        match parse_codex_rollout_metadata(file) {
+            Ok(Some(item)) => metadata.push(item),
+            Ok(None) => {}
+            Err(error) => failed_rollout_files.push(CodexSessionVisibilityRepairFailure {
+                path: file.path.to_string_lossy().to_string(),
+                error,
+            }),
+        }
+    }
+    let target_provider =
+        detect_session_visibility_target_provider(codex_home, target_provider, &metadata);
+
+    let state_db_path = codex_state_db_path_for_home(codex_home);
+    let session_index_path = codex_session_index_path_for_home(codex_home);
+    let index_ids = read_session_index_ids(&session_index_path)?;
+
+    let mut rollout_relatives_to_backup = metadata
+        .iter()
+        .filter(|item| item.model_provider != target_provider)
+        .map(|item| item.relative_path.clone())
+        .collect::<Vec<_>>();
+    rollout_relatives_to_backup.sort();
+    rollout_relatives_to_backup.dedup();
+
+    let mut needs_sqlite_backup = false;
+    let mut sqlite_existing_states = HashMap::<String, SqliteVisibilityState>::new();
+    if state_db_path.exists() {
+        let conn = Connection::open_with_flags(
+            &state_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
+        for item in &metadata {
+            let state = sqlite_visibility_state(&conn, &item.id)?;
+            if !state.exists || state.provider != target_provider {
+                needs_sqlite_backup = true;
+            }
+            sqlite_existing_states.insert(item.id.clone(), state);
+        }
+    }
+
+    let needs_session_index_backup = metadata.iter().any(|item| !index_ids.contains(&item.id));
+    let backup_dir = create_session_visibility_backup(
+        codex_home,
+        &target_provider,
+        &rollout_relatives_to_backup,
+        needs_sqlite_backup,
+        needs_session_index_backup,
+    )?;
+
+    let mut ready_metadata = Vec::new();
+    let mut rewritten_rollout_files = 0;
+    for mut item in metadata {
+        if item.model_provider != target_provider {
+            match rewrite_rollout_model_provider(&item.path, &target_provider) {
+                Ok(true) => {
+                    rewritten_rollout_files += 1;
+                    item.model_provider = target_provider.clone();
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    failed_rollout_files.push(CodexSessionVisibilityRepairFailure {
+                        path: item.path.to_string_lossy().to_string(),
+                        error,
+                    });
+                    continue;
+                }
+            }
+        }
+        ready_metadata.push(item);
+    }
+
+    let mut sqlite_records_updated = 0;
+    let mut sqlite_records_inserted = 0;
+    if state_db_path.exists() {
+        let conn = Connection::open(&state_db_path)
+            .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
+        for item in &ready_metadata {
+            let state = sqlite_existing_states
+                .get(&item.id)
+                .cloned()
+                .unwrap_or(SqliteVisibilityState {
+                    exists: false,
+                    provider: String::new(),
+                });
+            if state.exists {
+                sqlite_records_updated +=
+                    update_sqlite_thread_provider(&conn, &item.id, &target_provider)?;
+            } else {
+                sqlite_records_inserted +=
+                    insert_sqlite_thread_metadata(&conn, item, &target_provider)?;
+            }
+        }
+    }
+
+    let mut refreshed_index_ids = index_ids;
+    let mut session_index_entries_added = 0;
+    for item in &ready_metadata {
+        if refreshed_index_ids.insert(item.id.clone()) {
+            append_session_index_entry(&session_index_path, &item.id, &item.title)?;
+            session_index_entries_added += 1;
+        }
+    }
+
+    Ok(CodexSessionVisibilityRepairReport {
+        codex_home: codex_home.to_string_lossy().to_string(),
+        state_db_path: state_db_path.to_string_lossy().to_string(),
+        session_index_path: session_index_path.to_string_lossy().to_string(),
+        target_provider,
+        backup_dir,
+        scanned_rollout_files: rollout_files.len(),
+        rewritten_rollout_files,
+        sqlite_records_updated,
+        sqlite_records_inserted,
+        session_index_entries_added,
+        failed_rollout_files,
+    })
+}
+
+#[command]
+async fn get_codex_session_visibility_status(
+    target_provider: Option<String>,
+) -> Result<CodexSessionVisibilityStatus, String> {
+    let codex_home = get_codex_home_path()?;
+    get_codex_session_visibility_status_for_home(&codex_home, target_provider)
+}
+
+#[command]
+async fn repair_codex_session_visibility(
+    target_provider: Option<String>,
+) -> Result<CodexSessionVisibilityRepairReport, String> {
+    let codex_home = get_codex_home_path()?;
+    repair_codex_session_visibility_for_home(&codex_home, target_provider)
 }
 
 #[command]
@@ -4542,6 +6576,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             setup_tray(app.handle())?;
+            restore_codex_proxy_on_startup(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| match event {
@@ -4558,9 +6593,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_quota,
             start_codex_oauth_login,
+            open_codex_oauth_url,
             cancel_codex_oauth_login,
             complete_codex_oauth_login,
             list_accounts,
+            get_account_auth_json,
             list_operation_logs,
             clear_operation_logs,
             refresh_account_profile,
@@ -4576,6 +6613,10 @@ pub fn run() {
             refresh_account_quota,
             check_account_health,
             switch_account_by_id,
+            get_codex_proxy_state,
+            activate_codex_proxy,
+            deactivate_codex_proxy,
+            set_codex_proxy_account,
             update_account_quota,
             get_setting,
             set_setting,
@@ -4591,6 +6632,8 @@ pub fn run() {
             repair_codex_app_speed_state,
             get_codex_project_visibility_status,
             repair_codex_project_visibility,
+            get_codex_session_visibility_status,
+            repair_codex_session_visibility,
             get_codex_usage_summary,
             open_storage_folder,
             open_codex_auth_folder,
@@ -4610,6 +6653,12 @@ mod tests {
         format!("{}.{}.signature", header, payload)
     }
 
+    fn sample_jwt_payload(payload: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_string(&payload).unwrap());
+        format!("{}.{}.signature", header, payload)
+    }
+
     fn sample_auth_json() -> String {
         serde_json::json!({
             "auth_mode": "chatgpt",
@@ -4617,6 +6666,19 @@ mod tests {
                 "access_token": "access-token",
                 "refresh_token": "refresh-token",
                 "account_id": "account-123"
+            }
+        })
+        .to_string()
+    }
+
+    fn sample_auth_json_with_email(email: &str, account_id: &str) -> String {
+        serde_json::json!({
+            "OPENAI_API_KEY": serde_json::Value::Null,
+            "tokens": {
+                "id_token": sample_jwt_payload(serde_json::json!({ "email": email })),
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "account_id": account_id
             }
         })
         .to_string()
@@ -4706,6 +6768,90 @@ mod tests {
     }
 
     #[test]
+    fn oauth_existing_match_requires_same_email_when_token_email_exists() {
+        let existing = sample_auth_json_with_email("old@example.com", "shared-account-id");
+
+        assert!(oauth_existing_account_matches_identity(
+            "Renamed Account",
+            &existing,
+            Some("OLD@example.com")
+        ));
+        assert!(!oauth_existing_account_matches_identity(
+            "new@example.com",
+            &existing,
+            Some("new@example.com")
+        ));
+        assert!(!oauth_existing_account_matches_identity(
+            "old@example.com",
+            &existing,
+            None
+        ));
+    }
+
+    #[test]
+    fn oauth_existing_match_can_fallback_to_name_for_legacy_rows() {
+        assert!(oauth_existing_account_matches_identity(
+            "legacy@example.com",
+            &sample_auth_json(),
+            Some("LEGACY@example.com")
+        ));
+        assert!(!oauth_existing_account_matches_identity(
+            "legacy@example.com",
+            &sample_auth_json(),
+            Some("other@example.com")
+        ));
+    }
+
+    #[test]
+    fn codex_proxy_config_installs_managed_provider() {
+        let original = r#"model = "gpt-5"
+openai_base_url = "https://legacy.example.com/v1"
+
+[features]
+goals = true
+"#;
+        let next = codex_proxy_config_toml(original, 14998);
+
+        assert!(codex_proxy_config_installed(&next));
+        assert!(next.contains("model_provider = \"codex_account_manager_proxy\""));
+        assert!(next.contains("[model_providers.codex_account_manager_proxy]"));
+        assert!(next.contains("base_url = \"http://127.0.0.1:14998/v1\""));
+        assert!(next.contains("wire_api = \"responses\""));
+        assert!(next.contains("[features]\ngoals = true"));
+        assert!(!next.contains("openai_base_url"));
+    }
+
+    #[test]
+    fn codex_proxy_config_removal_only_cleans_managed_provider() {
+        let installed = codex_proxy_config_toml(
+            r#"[model_providers.manual]
+name = "Manual"
+base_url = "https://manual.example.com/v1"
+"#,
+            14998,
+        );
+        let cleaned = remove_codex_proxy_config_toml(&installed);
+
+        assert!(!codex_proxy_config_installed(&cleaned));
+        assert!(!cleaned.contains("codex_account_manager_proxy"));
+        assert!(cleaned.contains("[model_providers.manual]"));
+        assert!(cleaned.contains("https://manual.example.com/v1"));
+    }
+
+    #[test]
+    fn codex_proxy_resolves_v1_and_backend_targets() {
+        assert_eq!(
+            resolve_codex_proxy_upstream_target("/v1/responses?stream=true").unwrap(),
+            "/responses?stream=true"
+        );
+        assert_eq!(
+            resolve_codex_proxy_upstream_target("/backend-api/codex/responses").unwrap(),
+            "/responses"
+        );
+        assert!(resolve_codex_proxy_upstream_target("/other/responses").is_err());
+    }
+
+    #[test]
     fn codex_speed_config_toggles_desktop_service_tier() {
         let original = r#"[model]
 name = "gpt-5"
@@ -4781,6 +6927,222 @@ goals = true
         assert!(next.contains("[projects.'D:\\project\\new']\ntrust_level = \"trusted\""));
     }
 
+    fn temp_codex_home(label: &str) -> PathBuf {
+        let unique = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "codex-account-manager-{}-{}-{}",
+            label,
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_test_rollout(
+        codex_home: &Path,
+        thread_id: &str,
+        provider: &str,
+        cwd: &str,
+    ) -> PathBuf {
+        let path = codex_home
+            .join(CODEX_SESSIONS_DIR)
+            .join("2026")
+            .join("06")
+            .join("08")
+            .join(format!("rollout-2026-06-08T12-30-00-{}.jsonl", thread_id));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-06-08T04:30:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": thread_id,
+                "timestamp": "2026-06-08T04:30:00.000Z",
+                "source": "vscode",
+                "model_provider": provider,
+                "cwd": cwd,
+                "cli_version": "0.137.0",
+                "thread_source": "user"
+            }
+        });
+        let turn_context = serde_json::json!({
+            "timestamp": "2026-06-08T04:30:01.000Z",
+            "type": "turn_context",
+            "payload": {
+                "cwd": cwd,
+                "model": "gpt-5.5",
+                "effort": "medium",
+                "approval_policy": "never",
+                "permission_profile": { "type": "disabled" }
+            }
+        });
+        let user_message = serde_json::json!({
+            "timestamp": "2026-06-08T04:30:02.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "帮我修一下历史会话"
+            }
+        });
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&session_meta).unwrap(),
+            serde_json::to_string(&turn_context).unwrap(),
+            serde_json::to_string(&user_message).unwrap()
+        );
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn create_test_state_db(codex_home: &Path) -> Connection {
+        let path = codex_state_db_path_for_home(codex_home);
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                title TEXT NOT NULL,
+                sandbox_policy TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                has_user_event INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                archived_at INTEGER,
+                git_sha TEXT,
+                git_branch TEXT,
+                git_origin_url TEXT,
+                cli_version TEXT NOT NULL DEFAULT '',
+                first_user_message TEXT NOT NULL DEFAULT '',
+                agent_nickname TEXT,
+                agent_role TEXT,
+                memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                model TEXT,
+                reasoning_effort TEXT,
+                agent_path TEXT,
+                created_at_ms INTEGER,
+                updated_at_ms INTEGER,
+                thread_source TEXT,
+                preview TEXT NOT NULL DEFAULT ''
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_test_thread_row(
+        conn: &Connection,
+        thread_id: &str,
+        rollout_path: &Path,
+        provider: &str,
+        cwd: &str,
+    ) {
+        conn.execute(
+            r#"
+            INSERT INTO threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd,
+                title, sandbox_policy, approval_mode, preview, created_at_ms, updated_at_ms
+            ) VALUES (?, ?, 1780893000, 1780893001, 'vscode', ?, ?, '旧会话', '{"type":"disabled"}', 'never', '旧会话', 1780893000000, 1780893001000)
+            "#,
+            params![
+                thread_id,
+                rollout_path.to_string_lossy().to_string(),
+                provider,
+                cwd
+            ],
+        )
+        .unwrap();
+    }
+
+    fn rollout_provider(path: &Path) -> String {
+        let content = std::fs::read_to_string(path).unwrap();
+        for line in content.lines() {
+            let value = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            if value.get("type").and_then(|item| item.as_str()) == Some("session_meta") {
+                return value
+                    .pointer("/payload/model_provider")
+                    .and_then(|item| item.as_str())
+                    .unwrap()
+                    .to_string();
+            }
+        }
+        String::new()
+    }
+
+    #[test]
+    fn session_visibility_repair_rewrites_rollout_and_sqlite_provider() {
+        let codex_home = temp_codex_home("session-visibility-rewrite");
+        let thread_id = "019ea57e-a382-7461-9043-d0bd81d86f2f";
+        let cwd = "/Users/shorlyn/Documents/project/rust/codex_account_manager";
+        let rollout_path = write_test_rollout(&codex_home, thread_id, "openai", cwd);
+        let conn = create_test_state_db(&codex_home);
+        insert_test_thread_row(&conn, thread_id, &rollout_path, "openai", cwd);
+        drop(conn);
+
+        let report =
+            repair_codex_session_visibility_for_home(&codex_home, Some("custom".to_string()))
+                .unwrap();
+
+        assert_eq!(report.rewritten_rollout_files, 1);
+        assert_eq!(report.sqlite_records_updated, 1);
+        assert_eq!(report.session_index_entries_added, 1);
+        assert!(PathBuf::from(&report.backup_dir).join("manifest.json").exists());
+        assert_eq!(rollout_provider(&rollout_path), "custom");
+
+        let conn = Connection::open(codex_state_db_path_for_home(&codex_home)).unwrap();
+        let provider: String = conn
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = ?",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "custom");
+        let index = std::fs::read_to_string(codex_session_index_path_for_home(&codex_home)).unwrap();
+        assert!(index.contains(thread_id));
+
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn session_visibility_repair_updates_stale_sqlite_when_rollout_is_already_fixed() {
+        let codex_home = temp_codex_home("session-visibility-sqlite-only");
+        let thread_id = "019ea4f3-f763-73e0-9722-17c177a0b64b";
+        let cwd = "/Users/shorlyn/Documents/project/core/campus-all";
+        let rollout_path = write_test_rollout(&codex_home, thread_id, "custom", cwd);
+        let conn = create_test_state_db(&codex_home);
+        insert_test_thread_row(&conn, thread_id, &rollout_path, "openai", cwd);
+        drop(conn);
+
+        let report =
+            repair_codex_session_visibility_for_home(&codex_home, Some("custom".to_string()))
+                .unwrap();
+
+        assert_eq!(report.rewritten_rollout_files, 0);
+        assert_eq!(report.sqlite_records_updated, 1);
+        assert_eq!(rollout_provider(&rollout_path), "custom");
+
+        let conn = Connection::open(codex_state_db_path_for_home(&codex_home)).unwrap();
+        let provider: String = conn
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = ?",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(provider, "custom");
+
+        let _ = std::fs::remove_dir_all(codex_home);
+    }
+
     #[test]
     fn encrypted_backup_round_trips_payload() {
         let payload = BackupPayload {
@@ -4837,14 +7199,12 @@ goals = true
     }
 
     #[test]
-    fn long_secret_is_split_into_safe_chunks() {
-        let secret = "a".repeat(CREDENTIAL_CHUNK_CHARS * 2 + 17);
-        let chunks = chunk_secret(&secret);
+    fn keyring_missing_entry_gets_actionable_account_message() {
+        let friendly = friendly_account_error(
+            "Failed to read account credential: No matching entry found in secure storage",
+        );
 
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.chars().count() <= CREDENTIAL_CHUNK_CHARS));
-        assert_eq!(chunks.concat(), secret);
+        assert!(friendly.contains("本地账号库"));
+        assert!(friendly.contains("重新粘贴 auth.json/token"));
     }
 }

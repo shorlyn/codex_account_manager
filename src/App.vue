@@ -13,7 +13,9 @@ import type {
   CodexAppSpeed,
   CodexAppSpeedConfig,
   CodexFeatureStatus,
-  CodexProjectVisibilityStatus,
+  CodexProxyState,
+  CodexSessionVisibilityRepairReport,
+  CodexSessionVisibilityStatus,
   CodexUsageRollup,
   CodexUsageSummary,
   BatchRefreshFailure,
@@ -21,6 +23,7 @@ import type {
   ImportBackupResult,
   ImportBackupStrategy,
   MigrationStatus,
+  OAuthSaveResult,
   OperationLog,
   StoragePaths,
 } from './types';
@@ -28,13 +31,15 @@ import type {
 const {
   accounts, loading, switchingId, currentAccountRecordId, refreshInterval, accountViewMode,
   restartCodexOnSwitch,
-  loadAccounts, loadCurrentAccount, addAccount, updateAccount, deleteAccount,
+  loadAccounts, loadCurrentAccount, getAccountAuthJson, addAccount, updateAccount, deleteAccount,
   refreshQuota, refreshProfile, refreshQuotaBatch, switchAccount, loadRefreshInterval, setRefreshInterval,
   loadRestartCodexOnSwitch, setRestartCodexOnSwitch, loadAccountViewMode, setAccountViewMode,
 } = useAccounts();
 
 const showDialog = ref(false);
 const editingAccount = ref<Account | null>(null);
+const editingAccountAuthJson = ref('');
+const editingAccountAuthLoading = ref(false);
 const message = ref('');
 const messageType = ref<'success' | 'error'>('success');
 const storagePaths = ref<StoragePaths | null>(null);
@@ -50,6 +55,9 @@ const codexFeatureStatus = ref<CodexFeatureStatus | null>(null);
 const codexFeatureLoading = ref(false);
 const codexFeatureRepairing = ref(false);
 const showCodexFeatureStatus = ref(false);
+const codexProxyState = ref<CodexProxyState | null>(null);
+const codexProxyBusy = ref(false);
+const codexProxySelectedAccountId = ref<number | null>(null);
 const codexUsage = ref<CodexUsageSummary | null>(null);
 const codexUsageLoading = ref(false);
 const showUsageSidebar = ref(false);
@@ -82,7 +90,7 @@ const backupPasswordBusy = ref(false);
 const pendingExportAccountIds = ref<number[] | null>(null);
 const pendingImportFile = ref<File | null>(null);
 const showProjectVisibilityDialog = ref(false);
-const projectVisibilityPath = ref('');
+const sessionVisibilityStatus = ref<CodexSessionVisibilityStatus | null>(null);
 const projectVisibilityBusy = ref(false);
 const pendingConfirmAction = ref<ConfirmAction | null>(null);
 const confirmActionBusy = ref(false);
@@ -95,6 +103,7 @@ const operationLogActionFilter = ref('all');
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 let unlistenOauth: UnlistenFn | null = null;
 let unlistenOauthTimeout: UnlistenFn | null = null;
+let editAuthLoadToken = 0;
 
 const intervalOptions = [
   { label: '关闭', value: 0 },
@@ -405,6 +414,33 @@ const accountStats = computed(() => {
   };
 });
 
+const proxyAccountCandidates = computed(() =>
+  accounts.value.filter(account => account.has_json_info),
+);
+
+const codexProxyStatusLabel = computed(() => {
+  if (!codexProxyState.value) return '未读取';
+  if (codexProxyState.value.enabled && codexProxyState.value.config_installed) return '运行中';
+  if (codexProxyState.value.enabled) return '仅服务运行';
+  if (codexProxyState.value.config_installed) return '配置已接管';
+  return '未启用';
+});
+
+const codexProxySwitchActive = computed(() =>
+  Boolean(codexProxyState.value?.enabled || codexProxyState.value?.config_installed),
+);
+
+const codexProxySwitchDisabled = computed(() =>
+  codexProxyBusy.value
+  || (!codexProxySwitchActive.value && proxyAccountCandidates.value.length === 0),
+);
+
+const codexProxySelectedName = computed(() => {
+  const id = codexProxySelectedAccountId.value ?? codexProxyState.value?.active_account_id ?? null;
+  if (id === null) return '';
+  return accounts.value.find(account => account.id === id)?.name ?? '';
+});
+
 const filteredAccounts = computed(() => {
   const query = searchQuery.value.trim().toLowerCase();
   const direction = accountSortDirection.value === 'asc' ? 1 : -1;
@@ -525,7 +561,7 @@ const confirmActionDescription = computed(() => {
     return '这会删除当前账号管理器记录的操作日志，不会影响账号凭据。';
   }
   const pending = migrationStatus.value?.pending_plaintext_accounts ?? 0;
-  return `检测到 ${pending} 个旧账号仍在数据库明文保存。迁移后完整凭据会保存到系统凭据库。`;
+  return `检测到 ${pending} 个旧账号需要确认。本版本会把完整 auth.json 保存在本地账号库。`;
 });
 
 const confirmActionButtonLabel = computed(() => {
@@ -554,13 +590,18 @@ onMounted(async () => {
     oauthAdding.value = false;
     oauthError.value = `授权已超时，请刷新授权链接后重试。`;
   });
-  await loadAccounts();
+  try {
+    await loadAccounts();
+  } catch (e) {
+    showMessage(`加载账号失败: ${e}`, 'error');
+  }
   await loadCurrentAccount();
+  await loadCodexProxyState();
   await loadStoragePaths();
   await loadMigrationStatus();
   await loadRefreshInterval(10);
   await loadRestartCodexOnSwitch(true);
-  await loadAccountViewMode('cards');
+  await loadAccountViewMode('table');
   await loadCodexAppSpeed();
   await loadCodexFeatureStatus();
   await loadCodexUsage();
@@ -584,9 +625,56 @@ function showMessage(text: string, type: 'success' | 'error' = 'success') {
   messageTimer = setTimeout(() => { message.value = ''; }, 3000);
 }
 
-function openAddDialog() { editingAccount.value = null; showDialog.value = true; }
-function openEditDialog(account: Account) { editingAccount.value = account; showDialog.value = true; }
-function closeDialog() { showDialog.value = false; editingAccount.value = null; }
+function openAddDialog() {
+  editAuthLoadToken += 1;
+  editingAccount.value = null;
+  editingAccountAuthJson.value = '';
+  editingAccountAuthLoading.value = false;
+  showDialog.value = true;
+}
+
+async function openEditDialog(account: Account) {
+  const loadToken = editAuthLoadToken + 1;
+  editAuthLoadToken = loadToken;
+  editingAccount.value = account;
+  editingAccountAuthJson.value = '';
+  editingAccountAuthLoading.value = account.has_json_info;
+  showDialog.value = true;
+
+  if (!account.has_json_info) return;
+
+  try {
+    const authJson = await getAccountAuthJson(account.id);
+    if (editAuthLoadToken !== loadToken) return;
+    editingAccountAuthJson.value = authJson;
+  } catch (e) {
+    if (editAuthLoadToken !== loadToken) return;
+    showMessage(`读取账号 auth.json 失败: ${e}`, 'error');
+  } finally {
+    if (editAuthLoadToken === loadToken) {
+      editingAccountAuthLoading.value = false;
+    }
+  }
+}
+
+function closeDialog() {
+  editAuthLoadToken += 1;
+  showDialog.value = false;
+  editingAccount.value = null;
+  editingAccountAuthJson.value = '';
+  editingAccountAuthLoading.value = false;
+}
+
+function resetOauthDialogState() {
+  showOauthDialog.value = false;
+  oauthAdding.value = false;
+  oauthLoginId.value = '';
+  oauthUrl.value = '';
+  oauthCallbackUrl.value = '';
+  oauthError.value = '';
+  oauthUrlCopied.value = false;
+  oauthTimedOut.value = false;
+}
 
 async function addAccountWithOAuth() {
   oauthAdding.value = true;
@@ -621,14 +709,7 @@ async function cancelOauthSession() {
 
 async function closeOauthDialog() {
   await cancelOauthSession();
-  showOauthDialog.value = false;
-  oauthAdding.value = false;
-  oauthLoginId.value = '';
-  oauthUrl.value = '';
-  oauthCallbackUrl.value = '';
-  oauthError.value = '';
-  oauthUrlCopied.value = false;
-  oauthTimedOut.value = false;
+  resetOauthDialogState();
 }
 
 async function retryOauthLogin() {
@@ -648,10 +729,23 @@ async function copyOauthUrl() {
 }
 
 async function openOauthUrl() {
-  try {
-    window.open(oauthUrl.value, '_blank', 'noopener,noreferrer');
-  } catch {
+  if (!oauthLoginId.value) {
     await copyOauthUrl();
+    return;
+  }
+  oauthError.value = '';
+  try {
+    await invoke('open_codex_oauth_url', { loginId: oauthLoginId.value });
+  } catch (e) {
+    const message = String(e).replace(/^Error:\s*/, '');
+    try {
+      await navigator.clipboard.writeText(oauthUrl.value);
+      oauthUrlCopied.value = true;
+      setTimeout(() => { oauthUrlCopied.value = false; }, 1200);
+      oauthError.value = `打开浏览器失败：${message}。授权链接已复制，请手动粘贴到浏览器。`;
+    } catch {
+      oauthError.value = `打开浏览器失败：${message}。请复制授权链接后手动打开。`;
+    }
   }
 }
 
@@ -663,13 +757,18 @@ async function completeOauthLogin(auto = false) {
   oauthAdding.value = true;
   oauthError.value = '';
   try {
-    await invoke<number>('complete_codex_oauth_login', {
+    const result = await invoke<OAuthSaveResult>('complete_codex_oauth_login', {
       loginId: oauthLoginId.value,
       callbackUrl: auto ? null : oauthCallbackUrl.value.trim(),
     });
     await loadAccounts();
-    await closeOauthDialog();
-    showMessage('OAuth 账号已添加');
+    resetAccountFilters();
+    const savedAccount = accounts.value.find(account => account.id === result.id);
+    if (!savedAccount) {
+      throw new Error(`OAuth 账号已写入数据库，但列表刷新后没有找到记录 #${result.id}。请重新打开应用或查看操作日志。`);
+    }
+    resetOauthDialogState();
+    showMessage(result.created ? `OAuth 账号已新增: ${savedAccount.name}` : `OAuth 账号已更新: ${savedAccount.name}`);
   } catch (e) {
     oauthError.value = String(e).replace(/^Error:\s*/, '');
   } finally {
@@ -704,6 +803,92 @@ async function loadCodexFeatureStatus(showSuccess = false) {
     showMessage(`读取 Codex 配置检查失败: ${e}`, 'error');
   } finally {
     codexFeatureLoading.value = false;
+  }
+}
+
+async function loadCodexProxyState(showSuccess = false) {
+  try {
+    codexProxyState.value = await invoke<CodexProxyState>('get_codex_proxy_state');
+    codexProxySelectedAccountId.value =
+      codexProxyState.value.active_account_id
+      ?? currentAccountRecordId.value
+      ?? proxyAccountCandidates.value[0]?.id
+      ?? null;
+    if (showSuccess) showMessage('Codex 代理状态已刷新');
+  } catch (e) {
+    showMessage(`读取 Codex 代理状态失败: ${e}`, 'error');
+  }
+}
+
+async function activateCodexProxy() {
+  if (codexProxyBusy.value) return;
+  const accountId =
+    codexProxySelectedAccountId.value
+    ?? currentAccountRecordId.value
+    ?? proxyAccountCandidates.value[0]?.id
+    ?? null;
+  if (accountId === null) {
+    showMessage('没有可用于代理的账号', 'error');
+    return;
+  }
+  codexProxyBusy.value = true;
+  try {
+    codexProxyState.value = await invoke<CodexProxyState>('activate_codex_proxy', {
+      accountId,
+      port: codexProxyState.value?.port ?? null,
+    });
+    codexProxySelectedAccountId.value = codexProxyState.value.active_account_id;
+    await loadCodexFeatureStatus();
+    showMessage('Codex 代理已启用');
+  } catch (e) {
+    showMessage(`启用 Codex 代理失败: ${e}`, 'error');
+  } finally {
+    codexProxyBusy.value = false;
+  }
+}
+
+async function deactivateCodexProxy() {
+  if (codexProxyBusy.value) return;
+  codexProxyBusy.value = true;
+  try {
+    codexProxyState.value = await invoke<CodexProxyState>('deactivate_codex_proxy');
+    await loadCodexFeatureStatus();
+    showMessage('Codex 代理已停用');
+  } catch (e) {
+    showMessage(`停用 Codex 代理失败: ${e}`, 'error');
+  } finally {
+    codexProxyBusy.value = false;
+  }
+}
+
+function toggleCodexProxy() {
+  if (codexProxySwitchActive.value) {
+    void deactivateCodexProxy();
+  } else {
+    void activateCodexProxy();
+  }
+}
+
+async function updateCodexProxyAccount() {
+  const accountId = codexProxySelectedAccountId.value;
+  if (accountId === null) return;
+  const shouldKeepActive = Boolean(codexProxyState.value?.enabled || codexProxyState.value?.config_installed);
+  codexProxyBusy.value = true;
+  try {
+    codexProxyState.value = await invoke<CodexProxyState>('set_codex_proxy_account', {
+      accountId,
+    });
+    if (shouldKeepActive && (!codexProxyState.value.enabled || !codexProxyState.value.config_installed)) {
+      codexProxyState.value = await invoke<CodexProxyState>('activate_codex_proxy', {
+        accountId,
+        port: codexProxyState.value.port,
+      });
+    }
+    showMessage('代理账号已切换');
+  } catch (e) {
+    showMessage(`切换代理账号失败: ${e}`, 'error');
+  } finally {
+    codexProxyBusy.value = false;
   }
 }
 
@@ -798,11 +983,17 @@ async function handleSave(data: { name: string; activationDate: string; jsonInfo
       await updateAccount(editingAccount.value.id, data.name, data.activationDate, data.jsonInfo);
       showMessage('账号已更新');
     } else {
-      await addAccount(data.name, data.activationDate, data.jsonInfo);
-      showMessage('账号已添加');
+      const id = await addAccount(data.name, data.activationDate, data.jsonInfo);
+      resetAccountFilters();
+      const savedAccount = accounts.value.find(account => account.id === id);
+      if (!savedAccount) {
+        throw new Error(`账号已写入数据库，但列表刷新后没有找到记录 #${id}。请重新打开应用或查看操作日志。`);
+      }
+      showMessage(`账号已添加: ${savedAccount.name}`);
     }
     showDialog.value = false;
     editingAccount.value = null;
+    editingAccountAuthJson.value = '';
   } catch (e) {
     showMessage(`保存失败: ${e}`, 'error');
   } finally {
@@ -813,42 +1004,35 @@ async function handleSave(data: { name: string; activationDate: string; jsonInfo
 async function repairProjectVisibility() {
   showToolsMenu.value = false;
   try {
-    const status = await invoke<CodexProjectVisibilityStatus>('get_codex_project_visibility_status', {
-      projectPath: null,
+    sessionVisibilityStatus.value = await invoke<CodexSessionVisibilityStatus>('get_codex_session_visibility_status', {
+      targetProvider: null,
     });
-    projectVisibilityPath.value = status.project_path;
     showProjectVisibilityDialog.value = true;
   } catch (e) {
-    showMessage(`读取项目可见性失败: ${e}`, 'error');
+    showMessage(`读取历史会话状态失败: ${e}`, 'error');
   }
 }
 
 function closeProjectVisibilityDialog(force = false) {
   if (projectVisibilityBusy.value && !force) return;
   showProjectVisibilityDialog.value = false;
-  projectVisibilityPath.value = '';
+  sessionVisibilityStatus.value = null;
 }
 
 async function confirmProjectVisibilityRepair() {
   if (projectVisibilityBusy.value) return;
-  const projectPath = projectVisibilityPath.value.trim();
-  if (!projectPath) {
-    showMessage('请输入项目路径', 'error');
-    return;
-  }
+  const targetProvider = sessionVisibilityStatus.value?.target_provider || null;
   projectVisibilityBusy.value = true;
   try {
-    const repaired = await invoke<CodexProjectVisibilityStatus>('repair_codex_project_visibility', {
-      projectPath,
+    const repaired = await invoke<CodexSessionVisibilityRepairReport>('repair_codex_session_visibility', {
+      targetProvider,
     });
     closeProjectVisibilityDialog(true);
-    showMessage(
-      repaired.changed
-        ? `项目可见性已修复: ${repaired.project_path}`
-        : `项目已经是 trusted: ${repaired.project_path}`,
-    );
+    const failed = repaired.failed_rollout_files.length;
+    const summary = `历史会话可见性已修复: 改写 ${repaired.rewritten_rollout_files} 个 rollout，更新 ${repaired.sqlite_records_updated} 条 SQLite，补写 ${repaired.session_index_entries_added} 条 session_index`;
+    showMessage(failed > 0 ? `${summary}，${failed} 个文件失败` : summary, failed > 0 ? 'error' : 'success');
   } catch (e) {
-    showMessage(`修复项目可见性失败: ${e}`, 'error');
+    showMessage(`修复历史会话失败: ${e}`, 'error');
   } finally {
     projectVisibilityBusy.value = false;
   }
@@ -978,6 +1162,7 @@ async function confirmImportBackup() {
     });
     await loadAccounts();
     await loadMigrationStatus();
+    resetAccountFilters();
     closeImportPreviewDialog();
     showMessage(`导入完成：新增 ${result.imported}，更新 ${result.updated}，跳过 ${result.skipped}`);
   } catch (err) {
@@ -1014,7 +1199,7 @@ async function runMigrateOldAccounts() {
     const status = await invoke<MigrationStatus>('migrate_plaintext_accounts');
     migrationStatus.value = status;
     await loadAccounts();
-    showMessage(status.pending_plaintext_accounts === 0 ? '旧账号已迁移到系统凭据库' : `仍有 ${status.pending_plaintext_accounts} 个账号待迁移`, status.pending_plaintext_accounts === 0 ? 'success' : 'error');
+    showMessage(status.pending_plaintext_accounts === 0 ? '账号库已使用本地保存模式' : `仍有 ${status.pending_plaintext_accounts} 个账号待确认`, status.pending_plaintext_accounts === 0 ? 'success' : 'error');
   } catch (e) {
     showMessage(`迁移旧账号失败: ${e}`, 'error');
   } finally {
@@ -1046,8 +1231,21 @@ async function confirmDangerAction() {
 
 async function handleRun(id: number) {
   try {
-    await switchAccount(id, restartCodexOnSwitch.value);
-    showMessage(restartCodexOnSwitch.value ? '账号已切换，Codex 已重启' : '账号已切换，未重启 Codex');
+    const result = await switchAccount(id, restartCodexOnSwitch.value);
+    await loadCodexProxyState();
+    if (result.restarted) {
+      showMessage('账号已切换，Codex 已重启');
+      return;
+    }
+    if (result.hot_switch.status === 'applied') {
+      showMessage('账号已切换，正在运行的 Codex 已热更新');
+    } else if (result.hot_switch.status === 'unavailable') {
+      showMessage('账号已切换；未检测到可热更新的 Codex，重启 Codex 后生效');
+    } else if (result.hot_switch.status === 'failed') {
+      showMessage(`账号已写入 auth.json，但热切号失败: ${result.hot_switch.message}`, 'error');
+    } else {
+      showMessage(result.hot_switch.message || '账号已切换');
+    }
   }
   catch (e) { showMessage(`切换失败: ${e}`, 'error'); }
 }
@@ -1327,9 +1525,9 @@ function editDetailAccount(account: Account) {
               <option v-for="opt in intervalOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
             </select>
           </div>
-          <label class="restart-toggle" title="开启：写入 auth.json 并重启 Codex，当前运行环境立即生效。关闭：仅写入 auth.json，下次启动生效。">
+          <label class="restart-toggle" title="开启：写入 auth.json 并重启 Codex。关闭：写入 auth.json 后尝试通知正在运行的 Codex 热切号；连不上时重启后生效。">
             <input type="checkbox" :checked="restartCodexOnSwitch" @change="handleRestartToggle" />
-            <span>立即生效（重启 Codex）</span>
+            <span>立即生效（优先重启）</span>
           </label>
           <button class="btn-add btn-oauth" :disabled="oauthAdding" @click="addAccountWithOAuth">
             <svg v-if="oauthAdding" class="spin" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
@@ -1367,79 +1565,74 @@ function editDetailAccount(account: Account) {
 
     <!-- Content -->
     <main class="content">
-      <section v-if="storagePaths" class="storage-panel">
-        <div class="storage-bar">
-          <div class="storage-summary">
-            <div class="storage-icon">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                <ellipse cx="12" cy="5" rx="9" ry="3"/>
-                <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/>
-                <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/>
-              </svg>
-            </div>
-            <div>
-              <p class="storage-title">账号数据保存在本机</p>
-              <span>换电脑请使用加密备份，账号密钥会写入系统凭据库</span>
-            </div>
+      <section class="codex-proxy-strip">
+        <div class="proxy-strip-main">
+          <span
+            class="proxy-status-dot"
+            :class="{
+              active: codexProxyState?.enabled && codexProxyState?.config_installed,
+              partial: codexProxyState?.enabled && !codexProxyState?.config_installed,
+              warn: !codexProxyState?.enabled && codexProxyState?.config_installed,
+            }"
+          ></span>
+          <div class="proxy-strip-copy">
+            <strong>Codex 代理</strong>
+            <span>{{ codexProxyStatusLabel }}</span>
           </div>
-
-          <div class="storage-actions" @click.stop>
-            <button
-              v-if="migrationStatus && migrationStatus.pending_plaintext_accounts > 0"
-              class="btn-storage-warning"
-              :disabled="migratingAccounts"
-              @click="migrateOldAccounts"
-            >
-              {{ migratingAccounts ? '迁移中...' : `迁移旧账号 (${migrationStatus.pending_plaintext_accounts})` }}
-            </button>
-            <input
-              ref="importInput"
-              class="backup-input"
-              type="file"
-              accept="application/json,.json"
-              @change="importBackup"
-            />
-            <div class="tools-menu-wrap">
-              <button class="btn-storage-primary btn-tools" @click="showToolsMenu = !showToolsMenu">
-                <span>工具</span>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <polyline points="6 9 12 15 18 9"/>
-                </svg>
-              </button>
-              <div v-if="showToolsMenu" class="tools-menu">
-                <button @click="() => exportBackup()">
-                  <span>导出全部账号</span>
-                </button>
-                <button @click="exportFilteredBackup">
-                  <span>导出当前筛选结果</span>
-                </button>
-                <button @click="openImportBackup">
-                  <span>导入备份</span>
-                </button>
-                <button @click="openStorageFolder">
-                  <span>打开账号库目录</span>
-                </button>
-                <button @click="openAuthFolder">
-                  <span>打开当前账号目录</span>
-                </button>
-                <button @click="repairProjectVisibility">
-                  <span>修复项目可见性</span>
-                </button>
-                <button @click="toggleCodexFeatureStatus">
-                  <span>{{ showCodexFeatureStatus ? '收起 Codex 配置检查' : '检查 Codex 配置' }}</span>
-                </button>
-                <button @click="() => openOperationLogs()">
-                  <span>查看操作日志</span>
-                </button>
-                <button @click="toggleStorageDetails">
-                  <span>{{ showStorageDetails ? '收起存储详情' : '查看存储详情' }}</span>
-                </button>
-              </div>
-            </div>
-          </div>
+          <span
+            class="proxy-strip-account"
+            :title="codexProxySelectedName || codexProxyState?.active_account_name || '未选择账号'"
+          >
+            {{ codexProxySelectedName || codexProxyState?.active_account_name || '未选择账号' }}
+          </span>
         </div>
 
-        <div v-if="showStorageDetails" class="storage-details">
+        <div class="proxy-strip-controls">
+          <select
+            v-model.number="codexProxySelectedAccountId"
+            :disabled="codexProxyBusy || proxyAccountCandidates.length === 0"
+            @change="updateCodexProxyAccount"
+          >
+            <option
+              v-for="account in proxyAccountCandidates"
+              :key="account.id"
+              :value="account.id"
+            >
+              #{{ account.id }} {{ account.name }}
+            </option>
+          </select>
+          <button
+            class="btn-toolbar-icon proxy-refresh"
+            :disabled="codexProxyBusy"
+            title="刷新代理状态"
+            @click="loadCodexProxyState(true)"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button
+            class="proxy-switch"
+            :class="{ active: codexProxySwitchActive }"
+            :disabled="codexProxySwitchDisabled"
+            title="切换 Codex 代理"
+            @click="toggleCodexProxy"
+          >
+            <span class="proxy-switch-track">
+              <span class="proxy-switch-thumb"></span>
+            </span>
+            <span>{{ codexProxyBusy ? '处理中' : (codexProxySwitchActive ? '启用' : '停用') }}</span>
+          </button>
+        </div>
+      </section>
+
+      <div v-if="codexProxyState?.last_error" class="proxy-error-strip">
+        {{ codexProxyState.last_error }}
+      </div>
+
+      <section v-if="showStorageDetails && storagePaths" class="storage-details-panel">
+        <div class="storage-details">
           <div class="path-row">
             <span class="path-label">账号库</span>
             <code>{{ storagePaths.database_path }}</code>
@@ -1450,15 +1643,16 @@ function editDetailAccount(account: Account) {
             <code>{{ storagePaths.auth_json_path }}</code>
             <button @click="copyText(storagePaths.auth_json_path, 'auth.json 路径')">复制</button>
           </div>
-          <p class="storage-note">
-            `codex_accounts.db` 只保存账号元数据；完整 auth.json 保存在系统凭据库中。换电脑请使用加密备份导出和导入。
-            <span v-if="migrationStatus && migrationStatus.pending_plaintext_accounts > 0">
-              当前检测到 {{ migrationStatus.pending_plaintext_accounts }} 个旧账号还未迁移。
-            </span>
+          <p
+            v-if="migrationStatus && migrationStatus.pending_plaintext_accounts > 0"
+            class="storage-note"
+          >
+            当前检测到 {{ migrationStatus.pending_plaintext_accounts }} 个旧账号还未迁移。
           </p>
         </div>
+      </section>
 
-        <div v-if="showCodexFeatureStatus" class="codex-feature-panel">
+      <section v-if="showCodexFeatureStatus" class="codex-feature-panel">
           <div class="codex-feature-head">
             <div>
               <strong>Codex 配置检查</strong>
@@ -1528,7 +1722,6 @@ function editDetailAccount(account: Account) {
               第 {{ issue.line }} 行 {{ issue.label }}
             </span>
           </div>
-        </div>
       </section>
 
       <section class="overview-panel">
@@ -1550,10 +1743,14 @@ function editDetailAccount(account: Account) {
             <small>可用 {{ accountStats.usable }} 个</small>
           </div>
           <div class="stat-item">
-            <span class="stat-label">总剩余额度</span>
-            <strong>{{ accountStats.totalPrimaryLabel }} {{ accountStats.totalPrimaryRemaining }}%</strong>
-            <small v-if="accountStats.hasSecondaryQuota">{{ accountStats.totalSecondaryLabel }} {{ accountStats.totalSecondaryRemaining }}%</small>
-            <small v-else>无第二额度窗口</small>
+            <span class="stat-label">剩余额度池</span>
+            <strong>{{ accountStats.totalPrimaryRemaining }}%</strong>
+            <small>
+              {{ accountStats.totalPrimaryLabel }}合计
+              <template v-if="accountStats.hasSecondaryQuota">
+                · {{ accountStats.totalSecondaryLabel }} {{ accountStats.totalSecondaryRemaining }}%
+              </template>
+            </small>
           </div>
           <div class="stat-item stat-warn">
             <span class="stat-label">状态问题</span>
@@ -1681,6 +1878,58 @@ function editDetailAccount(account: Account) {
           <button v-if="hasActiveAccountFilters" class="btn-toolbar btn-toolbar-ghost" @click="resetAccountFilters">
             清空
           </button>
+          <button
+            v-if="migrationStatus && migrationStatus.pending_plaintext_accounts > 0"
+            class="btn-toolbar btn-migration-warning"
+            :disabled="migratingAccounts"
+            @click="migrateOldAccounts"
+          >
+            {{ migratingAccounts ? '迁移中...' : `迁移旧账号 (${migrationStatus.pending_plaintext_accounts})` }}
+          </button>
+          <input
+            ref="importInput"
+            class="backup-input"
+            type="file"
+            accept="application/json,.json"
+            @change="importBackup"
+          />
+          <div class="tools-menu-wrap toolbar-tools" @click.stop>
+            <button class="btn-toolbar btn-tools" @click="showToolsMenu = !showToolsMenu">
+              <span>工具</span>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
+            </button>
+            <div v-if="showToolsMenu" class="tools-menu">
+              <button @click="() => exportBackup()">
+                <span>导出全部账号</span>
+              </button>
+              <button @click="exportFilteredBackup">
+                <span>导出当前筛选结果</span>
+              </button>
+              <button @click="openImportBackup">
+                <span>导入备份</span>
+              </button>
+              <button @click="openStorageFolder">
+                <span>打开账号库目录</span>
+              </button>
+              <button @click="openAuthFolder">
+                <span>打开当前账号目录</span>
+              </button>
+              <button @click="repairProjectVisibility">
+                <span>修复历史会话</span>
+              </button>
+              <button @click="toggleCodexFeatureStatus">
+                <span>{{ showCodexFeatureStatus ? '收起 Codex 配置检查' : '检查 Codex 配置' }}</span>
+              </button>
+              <button @click="() => openOperationLogs()">
+                <span>查看操作日志</span>
+              </button>
+              <button @click="toggleStorageDetails">
+                <span>{{ showStorageDetails ? '收起存储详情' : '查看存储详情' }}</span>
+              </button>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -2078,24 +2327,32 @@ function editDetailAccount(account: Account) {
             </svg>
           </div>
           <div class="confirm-content">
-            <span>项目可见性</span>
-            <h2>修复 Codex 项目可见性</h2>
-            <p>只会新增或修正该项目的 trust_level，不会修改 provider、MCP、模型或 Memory 配置。</p>
-            <label class="confirm-field">
-              <span>项目路径</span>
-              <input
-                v-model="projectVisibilityPath"
-                type="text"
-                autocomplete="off"
-                placeholder="D:\\project\\rust\\codex_account_manager"
-                @keyup.enter="confirmProjectVisibilityRepair"
-              />
-            </label>
+            <span>历史会话</span>
+            <h2>修复 Codex 历史会话可见性</h2>
+            <p>将旧会话同步到当前 provider，并修复 Codex 本地 SQLite 与 session_index。执行前会自动备份被修改的文件。</p>
+            <div v-if="sessionVisibilityStatus" class="repair-stats">
+              <div>
+                <span>目标 provider</span>
+                <strong>{{ sessionVisibilityStatus.target_provider }}</strong>
+              </div>
+              <div>
+                <span>rollout 待改写</span>
+                <strong>{{ sessionVisibilityStatus.mismatched_rollout_files }}</strong>
+              </div>
+              <div>
+                <span>SQLite 待更新</span>
+                <strong>{{ sessionVisibilityStatus.mismatched_sqlite_records + sessionVisibilityStatus.missing_sqlite_records }}</strong>
+              </div>
+              <div>
+                <span>session_index 待补写</span>
+                <strong>{{ sessionVisibilityStatus.missing_session_index_entries }}</strong>
+              </div>
+            </div>
           </div>
           <div class="confirm-actions">
             <button class="confirm-cancel" :disabled="projectVisibilityBusy" @click="closeProjectVisibilityDialog()">取消</button>
             <button class="confirm-primary" :disabled="projectVisibilityBusy" @click="confirmProjectVisibilityRepair">
-              {{ projectVisibilityBusy ? '修复中...' : '修复可见性' }}
+              {{ projectVisibilityBusy ? '修复中...' : '开始修复' }}
             </button>
           </div>
         </div>
@@ -2162,6 +2419,8 @@ function editDetailAccount(account: Account) {
       <AccountDialog
         v-if="showDialog"
         :account="editingAccount"
+        :initial-json-info="editingAccountAuthJson"
+        :loading-json="editingAccountAuthLoading"
         :saving="savingAccount"
         @save="handleSave"
         @close="closeDialog"
@@ -2408,7 +2667,11 @@ function editDetailAccount(account: Account) {
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--text);
-  background: var(--surface);
+  background-color: var(--surface);
+  background-image: var(--select-caret);
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px 12px;
   cursor: pointer;
   transition: all 0.2s var(--ease-out);
 }
@@ -2490,6 +2753,9 @@ function editDetailAccount(account: Account) {
 
 /* ── Storage panel ─────────────────────── */
 .storage-panel {
+  position: relative;
+  z-index: 60;
+  overflow: visible;
   margin-bottom: 14px;
   padding: 10px 12px;
   border: 1px solid rgba(99, 102, 241, 0.14);
@@ -2540,6 +2806,27 @@ function editDetailAccount(account: Account) {
   white-space: nowrap;
 }
 
+.storage-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.storage-pills span {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 4px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .storage-actions {
   display: flex;
   align-items: center;
@@ -2559,9 +2846,9 @@ function editDetailAccount(account: Account) {
 
 .tools-menu {
   position: absolute;
-  z-index: 30;
+  z-index: 300;
   top: calc(100% + 6px);
-  right: 0;
+  left: 0;
   min-width: 178px;
   padding: 6px;
   border: 1px solid var(--border);
@@ -2688,7 +2975,8 @@ function editDetailAccount(account: Account) {
   font-size: 12px;
 }
 
-.codex-feature-panel {
+.codex-feature-panel,
+.codex-proxy-panel {
   margin-top: 10px;
   padding: 10px;
   border: 1px solid var(--border);
@@ -2752,6 +3040,10 @@ function editDetailAccount(account: Account) {
   margin-top: 10px;
 }
 
+.codex-proxy-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .codex-feature-item {
   min-width: 0;
   padding: 9px 10px;
@@ -2792,6 +3084,26 @@ function editDetailAccount(account: Account) {
 .codex-feature-actions {
   justify-content: flex-start;
   margin-top: 10px;
+}
+
+.codex-proxy-actions {
+  flex-wrap: wrap;
+}
+
+.codex-proxy-actions select {
+  min-height: 28px;
+  max-width: min(360px, 100%);
+  padding: 0 28px 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background-color: var(--surface);
+  background-image: var(--select-caret);
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px 12px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 800;
 }
 
 .codex-feature-issues {
@@ -3534,6 +3846,39 @@ function editDetailAccount(account: Account) {
   border-color: var(--primary);
   background: var(--surface);
   box-shadow: 0 0 0 3px var(--primary-glow);
+}
+
+.repair-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.repair-stats div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f8fafc;
+}
+
+.repair-stats span {
+  display: block;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.repair-stats strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .confirm-error {
@@ -4746,6 +5091,1315 @@ function editDetailAccount(account: Account) {
   }
 
   .detail-footer {
+    flex-direction: column;
+  }
+}
+
+/* Refined desktop console skin */
+.app {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.72) 0%, rgba(238, 243, 248, 0.88) 48%, #eaf0f6 100%);
+}
+
+.header {
+  background: rgba(255, 255, 255, 0.9);
+  border-bottom: 1px solid rgba(219, 228, 238, 0.9);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.75), 0 10px 28px rgba(16, 24, 39, 0.04);
+}
+
+.header-bg {
+  height: 2px;
+  background: linear-gradient(90deg, var(--primary), var(--accent), #f59e0b);
+}
+
+.header-inner {
+  min-height: 66px;
+  padding: 10px 28px;
+}
+
+.logo {
+  width: 42px;
+  height: 42px;
+  border: 1px solid rgba(199, 210, 254, 0.72);
+  border-radius: 10px;
+  box-shadow: 0 10px 24px rgba(79, 99, 232, 0.13);
+}
+
+.header-text h1 {
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+.header-count {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.header-right {
+  gap: 10px;
+}
+
+.interval-wrap {
+  height: 36px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.interval-wrap select {
+  height: 34px;
+  padding: 0 22px 0 4px;
+  border: 0;
+  background-color: transparent;
+  background-image: var(--select-caret);
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 12px 12px;
+  font-weight: 750;
+}
+
+.interval-wrap select:focus {
+  box-shadow: none;
+}
+
+.restart-toggle {
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  color: var(--text-secondary);
+}
+
+.restart-toggle input {
+  width: 14px;
+  height: 14px;
+}
+
+.btn-add {
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  box-shadow: 0 10px 22px rgba(79, 99, 232, 0.18);
+}
+
+.btn-add:hover:not(:disabled) {
+  background: var(--primary-hover);
+  box-shadow: 0 14px 30px rgba(79, 99, 232, 0.22);
+}
+
+.btn-oauth {
+  background: #111827;
+  box-shadow: 0 12px 24px rgba(16, 24, 39, 0.18);
+}
+
+.btn-oauth:hover:not(:disabled) {
+  background: #0b1220;
+  box-shadow: 0 16px 32px rgba(16, 24, 39, 0.22);
+}
+
+.content {
+  padding: 18px 26px 26px;
+}
+
+.storage-panel,
+.overview-panel,
+.account-toolbar,
+.account-table-wrap,
+.compact-row,
+.card {
+  border-color: rgba(219, 228, 238, 0.96);
+  box-shadow: var(--shadow-sm);
+}
+
+.storage-panel {
+  padding: 12px;
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.78);
+  backdrop-filter: blur(14px);
+}
+
+@media (min-width: 900px) {
+  .storage-panel {
+    display: grid;
+    grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+    align-items: start;
+    gap: 12px;
+  }
+
+  .storage-bar {
+    grid-column: 1;
+    grid-row: 1;
+    height: 100%;
+    justify-content: space-between;
+  }
+
+  .storage-details {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .codex-proxy-panel {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .codex-feature-panel {
+    grid-column: 1 / -1;
+  }
+}
+
+.storage-bar {
+  align-items: stretch;
+  flex-direction: column;
+  justify-content: flex-start;
+  min-height: 0;
+  padding: 10px;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, #ffffff 0%, var(--surface-soft) 100%);
+}
+
+.storage-summary {
+  align-items: flex-start;
+}
+
+.storage-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-light);
+  color: #0f766e;
+}
+
+.storage-title {
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.storage-summary span {
+  max-width: 240px;
+  margin-top: 2px;
+  line-height: 1.45;
+  white-space: normal;
+}
+
+.storage-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+
+.btn-storage,
+.btn-storage-primary,
+.btn-storage-warning,
+.codex-feature-head button,
+.codex-feature-actions button,
+.path-row button {
+  min-height: 30px;
+  border-radius: var(--radius-sm);
+  font-weight: 850;
+}
+
+.btn-storage-primary {
+  border-color: rgba(79, 99, 232, 0.2);
+  background: #fff;
+  color: var(--primary);
+}
+
+.tools-menu {
+  min-width: 210px;
+  border-color: rgba(219, 228, 238, 0.92);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+}
+
+.tools-menu button {
+  min-height: 32px;
+  font-weight: 750;
+}
+
+.codex-proxy-panel,
+.codex-feature-panel {
+  margin-top: 0;
+  padding: 12px;
+  border-color: rgba(20, 184, 166, 0.22);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, #ffffff 0%, #f6fffb 100%);
+}
+
+.codex-feature-panel {
+  margin-top: 10px;
+  border-color: var(--border);
+  background: var(--surface-soft);
+}
+
+.codex-feature-head {
+  min-height: 30px;
+}
+
+.codex-feature-head strong {
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.codex-feature-head span {
+  color: #0f766e;
+  font-weight: 850;
+}
+
+.codex-feature-grid {
+  gap: 7px;
+}
+
+.codex-proxy-grid {
+  grid-template-columns: 0.7fr 1fr 1.15fr;
+}
+
+.codex-feature-item {
+  min-height: 70px;
+  padding: 10px;
+  border-color: rgba(219, 228, 238, 0.82);
+  background: rgba(255, 255, 255, 0.86);
+}
+
+.codex-feature-item span,
+.codex-feature-item small {
+  font-weight: 750;
+}
+
+.codex-feature-item strong {
+  color: #0f9f75;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.codex-feature-item.warn strong {
+  color: #b45309;
+}
+
+.codex-proxy-actions {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) repeat(3, auto);
+  align-items: center;
+  gap: 8px;
+}
+
+.codex-proxy-actions select,
+.toolbar-selects select {
+  height: 34px;
+  border-color: var(--border);
+  background-color: #fff;
+  background-image: var(--select-caret);
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px 12px;
+}
+
+.codex-proxy-actions button:nth-of-type(1) {
+  border-color: rgba(20, 184, 166, 0.28);
+  background: var(--accent-light);
+  color: #0f766e;
+}
+
+.codex-feature-issues span {
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+}
+
+.overview-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 226px;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.stat-grid {
+  gap: 10px;
+}
+
+.stat-item {
+  position: relative;
+  min-height: 94px;
+  padding: 13px 14px;
+  overflow: hidden;
+  border-color: rgba(219, 228, 238, 0.96);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.stat-item::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--primary);
+  opacity: 0.72;
+}
+
+.stat-item:nth-child(2)::before {
+  background: var(--accent);
+}
+
+.stat-item:nth-child(3)::before {
+  background: #10b981;
+}
+
+.stat-warn::before {
+  background: var(--danger);
+}
+
+.stat-label {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.stat-item strong {
+  margin-top: 6px;
+  font-size: 20px;
+  font-weight: 900;
+}
+
+.stat-item small {
+  font-weight: 700;
+}
+
+.overview-controls {
+  gap: 8px;
+}
+
+.segmented {
+  min-height: 42px;
+  padding: 4px;
+  border-color: rgba(219, 228, 238, 0.96);
+  background: rgba(255, 255, 255, 0.62);
+  box-shadow: var(--shadow-xs);
+}
+
+.segmented button {
+  min-height: 32px;
+  border-radius: 6px;
+  font-weight: 900;
+}
+
+.segmented button.active {
+  color: var(--primary);
+  box-shadow: 0 1px 2px rgba(16, 24, 39, 0.05), 0 8px 16px rgba(79, 99, 232, 0.08);
+}
+
+.account-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 25;
+  margin-bottom: 12px;
+  padding: 9px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.86);
+  backdrop-filter: blur(14px);
+}
+
+.toolbar-main {
+  gap: 9px;
+}
+
+.account-search {
+  height: 38px;
+  border-color: rgba(219, 228, 238, 0.96);
+  background: var(--surface-soft);
+}
+
+.account-search input {
+  height: 36px;
+  font-weight: 700;
+}
+
+.toolbar-selects label span {
+  color: var(--text-tertiary);
+}
+
+.btn-toolbar,
+.btn-toolbar-icon {
+  height: 36px;
+  border-color: var(--border);
+  background: #fff;
+}
+
+.btn-toolbar:hover:not(:disabled),
+.btn-toolbar-icon:hover:not(:disabled),
+.codex-feature-head button:hover:not(:disabled),
+.codex-feature-actions button:hover:not(:disabled) {
+  border-color: rgba(79, 99, 232, 0.28);
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.btn-usage-toggle.active {
+  border-color: rgba(20, 184, 166, 0.28);
+  background: var(--accent-light);
+  color: #0f766e;
+}
+
+.toolbar-result {
+  padding: 0 4px;
+  font-weight: 850;
+}
+
+.batch-failures {
+  box-shadow: var(--shadow-xs);
+}
+
+.detail-backdrop,
+.confirm-backdrop,
+.oauth-backdrop,
+.import-backdrop {
+  background: rgba(16, 24, 39, 0.28);
+  backdrop-filter: blur(10px);
+}
+
+.detail-drawer,
+.usage-drawer,
+.log-drawer,
+.confirm-dialog,
+.oauth-dialog,
+.import-dialog {
+  border-color: rgba(219, 228, 238, 0.92);
+  box-shadow: var(--shadow-xl);
+}
+
+.detail-body,
+.usage-drawer-body,
+.log-body {
+  background: var(--surface-soft);
+}
+
+.toast {
+  top: 16px;
+  border-radius: var(--radius-sm);
+  font-weight: 750;
+}
+
+@media (max-width: 899px) {
+  .storage-panel,
+  .overview-panel {
+    display: block;
+  }
+
+  .storage-bar {
+    min-height: auto;
+  }
+
+  .codex-proxy-panel {
+    margin-top: 10px;
+  }
+
+  .overview-controls {
+    flex-direction: row;
+    margin-top: 10px;
+  }
+}
+
+@media (max-width: 760px) {
+  .content {
+    padding: 14px;
+  }
+
+  .header-inner {
+    padding: 12px 16px;
+  }
+
+  .header-right {
+    gap: 8px;
+  }
+
+  .codex-proxy-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .codex-proxy-actions select,
+  .codex-proxy-actions button {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    justify-self: stretch;
+  }
+
+  .codex-proxy-grid,
+  .codex-feature-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .overview-controls {
+    flex-direction: column;
+  }
+
+  .account-toolbar {
+    top: 0;
+  }
+}
+
+.codex-proxy-strip {
+  position: relative;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 9px 12px;
+  border: 1px solid rgba(219, 228, 238, 0.96);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(14px);
+}
+
+.proxy-strip-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.proxy-status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  box-shadow: 0 0 0 4px rgba(148, 163, 184, 0.14);
+  flex-shrink: 0;
+}
+
+.proxy-status-dot.active {
+  background: #10b981;
+  box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.14);
+}
+
+.proxy-status-dot.partial,
+.proxy-status-dot.warn {
+  background: #f59e0b;
+  box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+}
+
+.proxy-strip-copy {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.proxy-strip-copy strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.proxy-strip-copy span {
+  padding: 3px 8px;
+  border: 1px solid rgba(20, 184, 166, 0.2);
+  border-radius: 999px;
+  background: var(--accent-light);
+  color: #0f766e;
+  font-size: 11px;
+  font-weight: 850;
+  white-space: nowrap;
+}
+
+.proxy-strip-account {
+  max-width: 260px;
+  overflow: hidden;
+  padding-left: 10px;
+  border-left: 1px solid var(--border-light);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-strip-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 1;
+}
+
+.proxy-strip-controls select {
+  min-width: 180px;
+  max-width: 320px;
+  height: 36px;
+  padding: 0 30px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  appearance: none;
+  background-color: #fff;
+  background-image: var(--select-caret);
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 12px 12px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.proxy-strip-controls select:disabled {
+  opacity: 0.56;
+}
+
+.proxy-refresh:disabled,
+.proxy-switch:disabled,
+.btn-migration-warning:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.proxy-switch {
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+  transition: all 0.15s var(--ease-out);
+}
+
+.proxy-switch:hover:not(:disabled) {
+  border-color: rgba(20, 184, 166, 0.28);
+  background: var(--accent-light);
+  color: #0f766e;
+}
+
+.proxy-switch-track {
+  position: relative;
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  transition: background 0.15s var(--ease-out);
+  flex-shrink: 0;
+}
+
+.proxy-switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.26);
+  transition: transform 0.15s var(--ease-out);
+}
+
+.proxy-switch.active {
+  border-color: rgba(20, 184, 166, 0.28);
+  background: var(--accent-light);
+  color: #0f766e;
+}
+
+.proxy-switch.active .proxy-switch-track {
+  background: #14b8a6;
+}
+
+.proxy-switch.active .proxy-switch-thumb {
+  transform: translateX(16px);
+}
+
+.proxy-error-strip,
+.storage-details-panel {
+  margin: -4px 0 12px;
+  border: 1px solid rgba(245, 158, 11, 0.22);
+  border-radius: var(--radius-sm);
+  background: #fffbeb;
+  color: #92400e;
+  box-shadow: var(--shadow-xs);
+}
+
+.proxy-error-strip {
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.storage-details-panel {
+  padding: 10px;
+  border-color: rgba(219, 228, 238, 0.96);
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.storage-details-panel .storage-details {
+  display: grid;
+  gap: 8px;
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.account-toolbar {
+  overflow: visible;
+  flex-wrap: wrap;
+}
+
+.toolbar-main {
+  flex: 1 1 520px;
+  min-width: min(100%, 520px);
+}
+
+.toolbar-actions {
+  position: relative;
+  margin-left: auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.toolbar-tools {
+  z-index: 10;
+  flex-shrink: 0;
+}
+
+.toolbar-tools .tools-menu {
+  right: 0;
+  left: auto;
+  z-index: 1000;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.btn-migration-warning {
+  border-color: rgba(245, 158, 11, 0.28);
+  background: #fffbeb;
+  color: #b45309;
+}
+
+.btn-tools {
+  border-color: rgba(79, 99, 232, 0.2);
+  color: var(--primary);
+}
+
+@media (max-width: 760px) {
+  .codex-proxy-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .proxy-strip-controls {
+    width: 100%;
+  }
+
+  .proxy-strip-controls select {
+    max-width: none;
+    flex: 1;
+  }
+}
+
+@media (max-width: 760px) {
+  .codex-proxy-strip {
+    padding: 10px;
+  }
+
+  .proxy-strip-main {
+    flex-wrap: wrap;
+  }
+
+  .proxy-strip-copy {
+    flex-wrap: wrap;
+  }
+
+  .proxy-strip-account {
+    width: 100%;
+    max-width: 100%;
+    padding-left: 0;
+    border-left: 0;
+  }
+
+  .proxy-strip-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 36px auto;
+  }
+
+  .proxy-strip-controls select,
+  .proxy-refresh,
+  .proxy-switch {
+    width: 100%;
+  }
+
+  .toolbar-main {
+    width: 100%;
+    min-width: 0;
+    flex: 0 0 auto;
+  }
+
+  .account-search {
+    flex: 0 0 auto;
+    min-width: 0;
+  }
+
+  .toolbar-actions {
+    width: 100%;
+    margin-left: 0;
+    align-items: stretch;
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+  }
+
+  .toolbar-tools,
+  .toolbar-tools .btn-tools {
+    width: 100%;
+  }
+
+  .toolbar-tools .tools-menu {
+    right: 0;
+    left: 0;
+    min-width: 0;
+    width: 100%;
+    max-height: 260px;
+  }
+}
+
+/* ── macOS polish pass ────────────────── */
+.app {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.62) 0%, rgba(246, 248, 251, 0.94) 120px),
+    var(--bg);
+  color: var(--text);
+}
+
+.header {
+  border-bottom-color: var(--border);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.75) inset;
+  backdrop-filter: blur(18px);
+}
+
+.header-bg {
+  height: 1px;
+  background: linear-gradient(90deg, #4f6bff 0%, #20b26b 58%, #e36a5d 100%);
+  opacity: 0.84;
+}
+
+.header-inner {
+  padding: 12px 24px;
+}
+
+.logo {
+  width: 42px;
+  height: 42px;
+  border: 1px solid rgba(216, 224, 235, 0.9);
+  border-radius: 14px;
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.06), 0 8px 18px rgba(79, 107, 255, 0.1);
+}
+
+.header-text h1 {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 850;
+  letter-spacing: 0;
+}
+
+.header-count {
+  color: #6e7b91;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.header-right {
+  gap: 10px;
+}
+
+.interval-wrap {
+  height: 36px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+}
+
+.interval-wrap select {
+  height: 34px;
+  padding: 0 24px 0 4px;
+  border: 0;
+  background-color: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: none;
+}
+
+.interval-wrap select:focus {
+  box-shadow: none;
+}
+
+.restart-toggle {
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.btn-add {
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.08), 0 10px 20px rgba(79, 107, 255, 0.16);
+}
+
+.btn-add:hover:not(:disabled) {
+  background: var(--primary-hover);
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.08), 0 14px 26px rgba(79, 107, 255, 0.2);
+}
+
+.btn-oauth {
+  background: #111827;
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.14), 0 10px 20px rgba(17, 24, 39, 0.18);
+}
+
+.content {
+  padding: 18px 24px 24px;
+}
+
+.codex-proxy-strip,
+.overview-panel,
+.account-toolbar,
+.storage-details-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(16px);
+}
+
+.codex-proxy-strip {
+  min-height: 54px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+}
+
+.proxy-status-dot {
+  width: 9px;
+  height: 9px;
+  box-shadow: 0 0 0 4px rgba(149, 161, 179, 0.12);
+}
+
+.proxy-status-dot.active {
+  background: var(--success);
+  box-shadow: 0 0 0 4px rgba(32, 178, 107, 0.14);
+}
+
+.proxy-strip-copy strong {
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.proxy-strip-copy span {
+  padding: 3px 8px;
+  border-color: rgba(32, 178, 107, 0.18);
+  background: var(--accent-light);
+  color: #15865a;
+  font-weight: 800;
+}
+
+.proxy-strip-account {
+  max-width: 360px;
+  color: var(--text-secondary);
+  font-weight: 750;
+}
+
+.proxy-strip-controls select,
+.toolbar-selects select,
+.account-search,
+.btn-toolbar,
+.btn-toolbar-icon,
+.proxy-refresh,
+.proxy-switch {
+  height: 36px;
+  border-color: var(--border);
+  border-radius: var(--radius-sm);
+  background-color: #fff;
+}
+
+.proxy-strip-controls select,
+.toolbar-selects select {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.proxy-switch {
+  padding-right: 11px;
+  color: var(--text-secondary);
+}
+
+.proxy-switch.active {
+  border-color: rgba(32, 178, 107, 0.22);
+  background: #f8fffb;
+  color: #15865a;
+}
+
+.proxy-switch-track {
+  width: 34px;
+  height: 18px;
+  background: #c9d3df;
+}
+
+.proxy-switch.active .proxy-switch-track {
+  background: var(--success);
+}
+
+.overview-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 224px;
+  gap: 0;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+
+.stat-grid {
+  gap: 0;
+}
+
+.stat-item {
+  min-height: 92px;
+  padding: 13px 16px;
+  border: 0;
+  border-right: 1px solid var(--border-light);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.stat-item:last-child {
+  border-right: 0;
+}
+
+.stat-item::before {
+  inset: 10px auto 10px 0;
+  width: 2px;
+  border-radius: 999px;
+  opacity: 0;
+}
+
+.stat-item:first-child::before,
+.stat-warn::before {
+  opacity: 1;
+}
+
+.stat-item:nth-child(2)::before,
+.stat-item:nth-child(3)::before {
+  opacity: 0;
+}
+
+.stat-label {
+  color: #8b98aa;
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.stat-item strong {
+  margin-top: 7px;
+  color: var(--text);
+  font-size: 22px;
+  line-height: 1.08;
+  font-weight: 850;
+}
+
+.stat-item small {
+  margin-top: 5px;
+  color: #6e7b91;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.stat-warn strong {
+  color: var(--danger);
+}
+
+.overview-controls {
+  justify-content: center;
+  gap: 8px;
+  padding: 10px;
+  border-left: 1px solid var(--border-light);
+  background: #fbfdff;
+}
+
+.segmented {
+  min-height: 42px;
+  padding: 3px;
+  border-color: var(--border-light);
+  border-radius: var(--radius-sm);
+  background: #f7f9fc;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+}
+
+.segmented button {
+  min-height: 34px;
+  border-radius: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.segmented button.active {
+  background: #fff;
+  color: var(--primary);
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.06), 0 8px 18px rgba(79, 107, 255, 0.08);
+}
+
+.account-toolbar {
+  margin-bottom: 10px;
+  padding: 9px;
+}
+
+.toolbar-main {
+  gap: 8px;
+}
+
+.account-search {
+  padding: 0 11px;
+  background: #fff;
+  color: #9aa6b7;
+}
+
+.account-search input {
+  height: 34px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.toolbar-selects label {
+  gap: 6px;
+}
+
+.toolbar-selects label span {
+  color: var(--text-secondary);
+  font-weight: 750;
+}
+
+.btn-toolbar,
+.btn-toolbar-icon {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 780;
+  box-shadow: 0 1px 1px rgba(23, 32, 51, 0.025);
+}
+
+.btn-toolbar:hover:not(:disabled),
+.btn-toolbar-icon:hover:not(:disabled) {
+  border-color: rgba(79, 107, 255, 0.28);
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.toolbar-result {
+  color: #6e7b91;
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.btn-usage-toggle.active {
+  border-color: rgba(79, 107, 255, 0.2);
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.btn-tools {
+  border-color: rgba(79, 107, 255, 0.18);
+  background: #f8faff;
+  color: var(--primary);
+}
+
+.tools-menu {
+  padding: 6px;
+  border-color: var(--border);
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 18px 42px rgba(23, 32, 51, 0.16), 0 1px 2px rgba(23, 32, 51, 0.08);
+}
+
+.tools-menu button {
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.tools-menu button:hover {
+  background: var(--surface-soft);
+  color: var(--text);
+}
+
+@media (max-width: 980px) {
+  .overview-panel {
+    grid-template-columns: 1fr;
+  }
+
+  .overview-controls {
+    border-top: 1px solid var(--border-light);
+    border-left: 0;
+    flex-direction: row;
+  }
+}
+
+@media (max-width: 760px) {
+  .header-inner {
+    padding: 12px 16px;
+  }
+
+  .header-right {
+    gap: 8px;
+  }
+
+  .interval-wrap,
+  .restart-toggle,
+  .btn-add {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .content {
+    padding: 14px;
+  }
+
+  .codex-proxy-strip {
+    border-radius: var(--radius);
+  }
+
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stat-item {
+    min-height: 86px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-light);
+  }
+
+  .stat-item:last-child {
+    border-bottom: 0;
+  }
+
+  .overview-controls {
     flex-direction: column;
   }
 }

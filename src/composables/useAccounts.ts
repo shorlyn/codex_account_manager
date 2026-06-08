@@ -1,6 +1,13 @@
 import { ref, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import type { Account, AccountViewMode, BatchRefreshProgress, BatchRefreshResult, QuotaInfo } from '../types';
+import type {
+  Account,
+  AccountViewMode,
+  BatchRefreshProgress,
+  BatchRefreshResult,
+  QuotaInfo,
+  SwitchAccountResult,
+} from '../types';
 
 const REFRESH_INTERVAL_SETTING = 'refreshInterval';
 const RESTART_CODEX_SETTING = 'restartCodexOnSwitch';
@@ -11,7 +18,7 @@ const loading = ref(false);
 const switchingId = ref<number | null>(null);
 const currentAccountRecordId = ref<number | null>(null);
 const restartCodexOnSwitch = ref(true);
-const accountViewMode = ref<AccountViewMode>('cards');
+const accountViewMode = ref<AccountViewMode>('table');
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 const refreshInterval = ref(0);
 
@@ -21,6 +28,7 @@ async function loadAccounts(): Promise<void> {
     accounts.value = await invoke<Account[]>('list_accounts');
   } catch (e) {
     console.error('Failed to load accounts:', e);
+    throw e;
   } finally {
     loading.value = false;
   }
@@ -34,6 +42,10 @@ async function loadCurrentAccount(): Promise<void> {
   }
 }
 
+async function getAccountAuthJson(accountId: number): Promise<string> {
+  return invoke<string>('get_account_auth_json', { id: accountId });
+}
+
 function extractAccessToken(jsonInfo: string): string | null {
   try {
     const parsed = JSON.parse(jsonInfo);
@@ -43,7 +55,7 @@ function extractAccessToken(jsonInfo: string): string | null {
   }
 }
 
-async function addAccount(name: string, activationDate: string, jsonInfo: string): Promise<void> {
+async function addAccount(name: string, activationDate: string, jsonInfo: string): Promise<number> {
   const id = await invoke<number>('add_account', { name, activationDate, jsonInfo });
 
   if (extractAccessToken(jsonInfo)) {
@@ -55,6 +67,7 @@ async function addAccount(name: string, activationDate: string, jsonInfo: string
   }
 
   await loadAccounts();
+  return id;
 }
 
 async function updateAccount(id: number, name: string, activationDate: string, jsonInfo: string): Promise<void> {
@@ -147,7 +160,10 @@ async function refreshQuotaBatch(
   return { success, failed, skipped, failures };
 }
 
-async function switchAccount(accountId: number, restartCodex = restartCodexOnSwitch.value): Promise<void> {
+async function switchAccount(
+  accountId: number,
+  restartCodex = restartCodexOnSwitch.value,
+): Promise<SwitchAccountResult> {
   const account = accounts.value.find(a => a.id === accountId);
   if (!account) throw new Error('Account not found');
 
@@ -157,8 +173,9 @@ async function switchAccount(accountId: number, restartCodex = restartCodexOnSwi
 
   switchingId.value = accountId;
   try {
-    await invoke('switch_account_by_id', { id: account.id, restartCodex });
+    const result = await invoke<SwitchAccountResult>('switch_account_by_id', { id: account.id, restartCodex });
     await loadCurrentAccount();
+    return result;
   } finally {
     switchingId.value = null;
   }
@@ -169,7 +186,9 @@ function startAutoRefresh(intervalMinutes: number): void {
   refreshInterval.value = intervalMinutes;
   if (intervalMinutes > 0) {
     refreshTimer = setInterval(() => {
-      refreshAllQuotas();
+      refreshAllQuotas().catch((e) => {
+        console.warn('Failed to auto refresh quotas:', e);
+      });
     }, intervalMinutes * 60 * 1000);
   }
 }
@@ -263,6 +282,7 @@ export function useAccounts() {
     refreshInterval,
     loadAccounts,
     loadCurrentAccount,
+    getAccountAuthJson,
     addAccount,
     updateAccount,
     deleteAccount,

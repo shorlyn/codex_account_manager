@@ -9,8 +9,11 @@
     "beforeBuildCommand": "npm run build"
   },
   "bundle": {
-    "active": false,
-    "targets": [],
+    "active": true,
+    "targets": ["app", "dmg"],
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "icon": [
       "icons/icon.png",
       "icons/icon.icns",

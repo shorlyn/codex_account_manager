@@ -19,6 +19,36 @@ export interface Account {
   updated_at: string;
 }
 
+export interface CodexHotSwitchResult {
+  status: 'applied' | 'unavailable' | 'failed' | 'skipped' | string;
+  message: string;
+  detail: string;
+}
+
+export interface SwitchAccountResult {
+  restarted: boolean;
+  auth_json_path: string;
+  hot_switch: CodexHotSwitchResult;
+}
+
+export interface OAuthSaveResult {
+  id: number;
+  created: boolean;
+  name: string;
+  accountId: string;
+}
+
+export interface CodexProxyState {
+  enabled: boolean;
+  port: number;
+  base_url: string;
+  active_account_id: number | null;
+  active_account_name: string;
+  config_installed: boolean;
+  config_path: string;
+  last_error: string;
+}
+
 export interface QuotaInfo {
   plan_type: string;
   primary_used_percent: number;
@@ -123,6 +153,37 @@ export interface CodexProjectVisibilityStatus {
   config_path: string;
   is_trusted: boolean;
   changed: boolean;
+}
+
+export interface CodexSessionVisibilityStatus {
+  codex_home: string;
+  state_db_path: string;
+  session_index_path: string;
+  target_provider: string;
+  scanned_rollout_files: number;
+  mismatched_rollout_files: number;
+  mismatched_sqlite_records: number;
+  missing_sqlite_records: number;
+  missing_session_index_entries: number;
+}
+
+export interface CodexSessionVisibilityRepairFailure {
+  path: string;
+  error: string;
+}
+
+export interface CodexSessionVisibilityRepairReport {
+  codex_home: string;
+  state_db_path: string;
+  session_index_path: string;
+  target_provider: string;
+  backup_dir: string;
+  scanned_rollout_files: number;
+  rewritten_rollout_files: number;
+  sqlite_records_updated: number;
+  sqlite_records_inserted: number;
+  session_index_entries_added: number;
+  failed_rollout_files: CodexSessionVisibilityRepairFailure[];
 }
 
 export interface AccountHealthItem {
