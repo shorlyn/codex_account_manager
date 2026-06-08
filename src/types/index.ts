@@ -49,6 +49,16 @@ export interface CodexProxyState {
   last_error: string;
 }
 
+export interface CodexProxyAccountChangedEvent {
+  previousAccountId: number | null;
+  activeAccountId: number;
+  activeAccountName: string;
+  activeAccountIdentifier: string;
+  reason: string;
+  reasonLabel: string;
+  stage: string;
+}
+
 export interface QuotaInfo {
   plan_type: string;
   primary_used_percent: number;

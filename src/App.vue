@@ -12,6 +12,7 @@ import type {
   BackupPreview,
   CodexAppSpeed,
   CodexAppSpeedConfig,
+  CodexProxyAccountChangedEvent,
   CodexFeatureStatus,
   CodexProxyState,
   CodexSessionVisibilityRepairReport,
@@ -103,6 +104,7 @@ const operationLogActionFilter = ref('all');
 let messageTimer: ReturnType<typeof setTimeout> | null = null;
 let unlistenOauth: UnlistenFn | null = null;
 let unlistenOauthTimeout: UnlistenFn | null = null;
+let unlistenProxyAccountChanged: UnlistenFn | null = null;
 let editAuthLoadToken = 0;
 
 const intervalOptions = [
@@ -596,6 +598,16 @@ onMounted(async () => {
     oauthAdding.value = false;
     oauthError.value = `授权已超时，请刷新授权链接后重试。`;
   });
+  unlistenProxyAccountChanged = await listen<CodexProxyAccountChangedEvent>('codex-proxy-account-changed', async (event) => {
+    const payload = event.payload;
+    await Promise.all([
+      loadAccounts(),
+      loadCodexProxyState(),
+      showOperationLogs.value ? loadOperationLogs() : Promise.resolve(),
+    ]);
+    codexProxySelectedAccountId.value = payload.activeAccountId;
+    showMessage(`代理已自动切换到：${payload.activeAccountName}（${payload.reasonLabel}）`);
+  });
   try {
     await loadAccounts();
   } catch (e) {
@@ -621,6 +633,10 @@ onUnmounted(() => {
   if (unlistenOauthTimeout) {
     unlistenOauthTimeout();
     unlistenOauthTimeout = null;
+  }
+  if (unlistenProxyAccountChanged) {
+    unlistenProxyAccountChanged();
+    unlistenProxyAccountChanged = null;
   }
 });
 

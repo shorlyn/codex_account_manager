@@ -145,6 +145,18 @@ pub struct CodexProxyState {
     pub last_error: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProxyAccountChangedEvent {
+    pub previous_account_id: Option<i64>,
+    pub active_account_id: i64,
+    pub active_account_name: String,
+    pub active_account_identifier: String,
+    pub reason: String,
+    pub reason_label: String,
+    pub stage: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodexProjectVisibilityStatus {
     pub project_path: String,
@@ -412,6 +424,7 @@ const CODEX_PROXY_SETTING_ENABLED: &str = "codex_proxy_enabled";
 const CODEX_PROXY_SETTING_PORT: &str = "codex_proxy_port";
 const CODEX_PROXY_SETTING_ACTIVE_ACCOUNT_ID: &str = "codex_proxy_active_account_id";
 const CODEX_PROXY_SETTING_CONFIG_BACKUP: &str = "codex_proxy_config_backup";
+const CODEX_PROXY_LOW_QUOTA_REMAINING_PERCENT: i32 = 5;
 const CODEX_PROXY_DEFAULT_USER_AGENT: &str =
     "codex-tui/0.135.0 (Mac OS; arm64) CodexAccountManagerProxy/0.1.0";
 const CODEX_PROXY_DEFAULT_ORIGINATOR: &str = "codex-tui";
@@ -2486,22 +2499,456 @@ fn fallback_proxy_account_id(conn: &Connection) -> Result<Option<i64>, String> {
     }
 }
 
-fn proxy_account_credentials(conn: &Connection) -> Result<(i64, String, String, String), String> {
-    let id = read_proxy_active_account_id(conn)?
-        .or_else(|| fallback_proxy_account_id(conn).ok().flatten())
-        .ok_or_else(|| "代理没有可用账号，请先选择一个带 auth.json 的账号。".to_string())?;
-    let (account_name, _identifier) = account_log_context(conn, id);
-    let json_info = account_json_info(conn, id)?;
-    let (json_info, changed) =
-        tauri::async_runtime::block_on(refresh_auth_json_if_needed(&json_info, false))?;
-    if changed {
-        save_account_json_info(conn, id, &json_info)?;
+#[derive(Debug, Clone)]
+struct ProxyAccountCandidate {
+    id: i64,
+    name: String,
+    identifier: String,
+    json_info: String,
+    primary_used_percent: i32,
+    primary_window_present: bool,
+    secondary_used_percent: i32,
+    secondary_window_present: bool,
+    last_quota_error: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProxyAccountCredentials {
+    id: i64,
+    name: String,
+    identifier: String,
+    account_id: String,
+    access_token: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyAccountRejectReason {
+    Excluded,
+    MissingCredential,
+    BlockingError,
+    LowQuota,
+}
+
+impl ProxyAccountRejectReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Excluded => "excluded",
+            Self::MissingCredential => "missing_credential",
+            Self::BlockingError => "blocking_error",
+            Self::LowQuota => "quota_low",
+        }
+    }
+}
+
+fn quota_remaining_percent(used_percent: i32) -> i32 {
+    (100 - used_percent).clamp(0, 100)
+}
+
+fn proxy_account_quota_low(
+    primary_used_percent: i32,
+    primary_window_present: bool,
+    secondary_used_percent: i32,
+    secondary_window_present: bool,
+) -> bool {
+    (primary_window_present
+        && quota_remaining_percent(primary_used_percent) <= CODEX_PROXY_LOW_QUOTA_REMAINING_PERCENT)
+        || (secondary_window_present
+            && quota_remaining_percent(secondary_used_percent)
+                <= CODEX_PROXY_LOW_QUOTA_REMAINING_PERCENT)
+}
+
+fn proxy_account_has_blocking_error(error: &str) -> bool {
+    let error = error.trim();
+    if error.is_empty() {
+        return false;
     }
 
-    let value = parse_auth_json(&json_info)?;
-    let access_token = require_json_string(&value, "/tokens/access_token", "tokens.access_token")?;
-    let account_id = require_json_string(&value, "/tokens/account_id", "tokens.account_id")?;
-    Ok((id, account_name, account_id, access_token))
+    let lower = error.to_ascii_lowercase();
+    [
+        "401",
+        "402",
+        "429",
+        "unauthorized",
+        "payment required",
+        "invalid_grant",
+        "token_invalidated",
+        "usage_limit_reached",
+        "insufficient_quota",
+        "quota exceeded",
+        "quota exhausted",
+        "rate limit",
+        "rate_limit",
+        "billing",
+        "登录已失效",
+        "登录凭据刷新失败",
+        "重新 oauth",
+        "重新授权",
+        "额度已用尽",
+        "额度耗尽",
+        "用量已达",
+        "限流",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn load_proxy_account_candidates(conn: &Connection) -> Result<Vec<ProxyAccountCandidate>, String> {
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id, name, json_info,
+                   primary_used_percent, primary_window_present,
+                   secondary_used_percent, secondary_window_present,
+                   last_quota_error,
+                   CASE
+                       WHEN json_valid(json_info)
+                       THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
+                       ELSE ''
+                   END
+            FROM accounts
+            ORDER BY id ASC
+            ",
+        )
+        .map_err(|e| format!("Failed to prepare proxy account query: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ProxyAccountCandidate {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                json_info: row.get(2)?,
+                primary_used_percent: row.get(3)?,
+                primary_window_present: row.get::<_, i64>(4)? != 0,
+                secondary_used_percent: row.get(5)?,
+                secondary_window_present: row.get::<_, i64>(6)? != 0,
+                last_quota_error: row.get(7)?,
+                identifier: row.get(8)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query proxy accounts: {}", e))?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        candidates.push(row.map_err(|e| format!("Failed to read proxy account: {}", e))?);
+    }
+    Ok(candidates)
+}
+
+fn proxy_candidate_has_required_auth(candidate: &ProxyAccountCandidate) -> bool {
+    parse_auth_json(&candidate.json_info).is_ok()
+}
+
+fn proxy_account_reject_reason(
+    candidate: &ProxyAccountCandidate,
+    excluded_ids: &HashSet<i64>,
+) -> Option<ProxyAccountRejectReason> {
+    if excluded_ids.contains(&candidate.id) {
+        return Some(ProxyAccountRejectReason::Excluded);
+    }
+    if !proxy_candidate_has_required_auth(candidate) {
+        return Some(ProxyAccountRejectReason::MissingCredential);
+    }
+    if proxy_account_has_blocking_error(&candidate.last_quota_error) {
+        return Some(ProxyAccountRejectReason::BlockingError);
+    }
+    if proxy_account_quota_low(
+        candidate.primary_used_percent,
+        candidate.primary_window_present,
+        candidate.secondary_used_percent,
+        candidate.secondary_window_present,
+    ) {
+        return Some(ProxyAccountRejectReason::LowQuota);
+    }
+    None
+}
+
+fn next_usable_proxy_candidate(
+    candidates: &[ProxyAccountCandidate],
+    current_id: Option<i64>,
+    excluded_ids: &HashSet<i64>,
+) -> Option<ProxyAccountCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let current_index = current_id.and_then(|id| candidates.iter().position(|item| item.id == id));
+    let start = current_index.map(|index| index + 1).unwrap_or(0);
+    for offset in 0..candidates.len() {
+        let index = (start + offset) % candidates.len();
+        if current_index == Some(index) {
+            continue;
+        }
+        let candidate = &candidates[index];
+        if proxy_account_reject_reason(candidate, excluded_ids).is_none() {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+fn proxy_switch_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "quota_low" => "额度接近用尽",
+        "missing_credential" => "缺少可用 auth.json",
+        "blocking_error" => "账号存在阻断性异常",
+        "active_missing" => "当前代理账号不存在",
+        "no_active_account" => "尚未选择代理账号",
+        "upstream_401" => "上游返回 401",
+        "upstream_402" => "上游返回 402",
+        "upstream_403" => "上游返回 403",
+        "upstream_429" => "上游返回 429",
+        "credential_failed" => "凭据刷新失败",
+        _ => "需要切换账号",
+    }
+}
+
+fn log_proxy_account_switch(
+    conn: &Connection,
+    app: Option<&AppHandle>,
+    previous_id: Option<i64>,
+    next: &ProxyAccountCandidate,
+    stage: &str,
+    reason: &str,
+) {
+    let (previous_name, previous_identifier) = previous_id
+        .map(|id| account_log_context(conn, id))
+        .unwrap_or_else(|| (String::new(), String::new()));
+    let details = serde_json::json!({
+        "reason": reason,
+        "reason_label": proxy_switch_reason_label(reason),
+        "previous_id": previous_id,
+        "previous_name": previous_name,
+        "previous_identifier": previous_identifier,
+        "next_id": next.id,
+        "next_name": next.name,
+        "next_identifier": next.identifier,
+        "low_quota_threshold_remaining_percent": CODEX_PROXY_LOW_QUOTA_REMAINING_PERCENT,
+    })
+    .to_string();
+    let message = if previous_id.is_some() {
+        format!(
+            "代理自动切换账号：{} -> {}（{}）",
+            previous_name,
+            next.name,
+            proxy_switch_reason_label(reason)
+        )
+    } else {
+        format!(
+            "代理自动选择账号：{}（{}）",
+            next.name,
+            proxy_switch_reason_label(reason)
+        )
+    };
+    let _ = insert_operation_log(
+        conn,
+        "info",
+        "proxy_auto_switch",
+        Some(next.id),
+        &next.name,
+        &next.identifier,
+        stage,
+        &message,
+        &details,
+    );
+    if let Some(app) = app {
+        let _ = app.emit(
+            "codex-proxy-account-changed",
+            CodexProxyAccountChangedEvent {
+                previous_account_id: previous_id,
+                active_account_id: next.id,
+                active_account_name: next.name.clone(),
+                active_account_identifier: next.identifier.clone(),
+                reason: reason.to_string(),
+                reason_label: proxy_switch_reason_label(reason).to_string(),
+                stage: stage.to_string(),
+            },
+        );
+    }
+}
+
+fn log_proxy_account_warning(
+    conn: &Connection,
+    candidate: &ProxyAccountCandidate,
+    stage: &str,
+    message: &str,
+    details: &str,
+) {
+    let _ = insert_operation_log(
+        conn,
+        "warn",
+        "proxy_auto_switch",
+        Some(candidate.id),
+        &candidate.name,
+        &candidate.identifier,
+        stage,
+        message,
+        details,
+    );
+}
+
+fn select_proxy_account_for_request(
+    conn: &Connection,
+    app: Option<&AppHandle>,
+    excluded_ids: &HashSet<i64>,
+    switch_stage: &str,
+    switch_reason: &str,
+) -> Result<ProxyAccountCandidate, String> {
+    let current_id = read_proxy_active_account_id(conn)?
+        .or_else(|| fallback_proxy_account_id(conn).ok().flatten());
+    let candidates = load_proxy_account_candidates(conn)?;
+    if candidates.is_empty() {
+        return Err("代理没有可用账号，请先添加 OAuth 账号。".to_string());
+    }
+
+    let current_candidate =
+        current_id.and_then(|id| candidates.iter().find(|item| item.id == id).cloned());
+    if let Some(candidate) = current_candidate.as_ref() {
+        if proxy_account_reject_reason(candidate, excluded_ids).is_none() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    if let Some(next) = next_usable_proxy_candidate(&candidates, current_id, excluded_ids) {
+        let reason = current_candidate
+            .as_ref()
+            .and_then(|candidate| proxy_account_reject_reason(candidate, excluded_ids))
+            .map(|reason| {
+                if reason == ProxyAccountRejectReason::Excluded {
+                    switch_reason
+                } else {
+                    reason.code()
+                }
+            })
+            .unwrap_or_else(|| {
+                if current_id.is_some() {
+                    "active_missing"
+                } else {
+                    "no_active_account"
+                }
+            });
+        let stage = if reason.starts_with("upstream_") {
+            switch_stage
+        } else {
+            "preflight"
+        };
+        write_proxy_active_account_id(conn, next.id)?;
+        log_proxy_account_switch(conn, app, current_id, &next, stage, reason);
+        return Ok(next);
+    }
+
+    if excluded_ids.is_empty() {
+        if let Some(candidate) = current_candidate {
+            if proxy_account_reject_reason(&candidate, excluded_ids)
+                == Some(ProxyAccountRejectReason::LowQuota)
+            {
+                let details = serde_json::json!({
+                    "reason": "quota_low_no_alternative",
+                    "low_quota_threshold_remaining_percent": CODEX_PROXY_LOW_QUOTA_REMAINING_PERCENT,
+                    "primary_remaining_percent": quota_remaining_percent(candidate.primary_used_percent),
+                    "primary_window_present": candidate.primary_window_present,
+                    "secondary_remaining_percent": quota_remaining_percent(candidate.secondary_used_percent),
+                    "secondary_window_present": candidate.secondary_window_present,
+                })
+                .to_string();
+                log_proxy_account_warning(
+                    conn,
+                    &candidate,
+                    "preflight",
+                    "当前账号额度接近用尽，但没有找到下一个可用账号，继续使用当前账号。",
+                    &details,
+                );
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(format!(
+        "代理没有可自动切换的账号：所有账号都缺少凭据、授权异常，或额度剩余不高于 {}%。",
+        CODEX_PROXY_LOW_QUOTA_REMAINING_PERCENT
+    ))
+}
+
+fn proxy_account_credentials(
+    conn: &Connection,
+    app: Option<&AppHandle>,
+    excluded_ids: &HashSet<i64>,
+    switch_stage: &str,
+    switch_reason: &str,
+) -> Result<ProxyAccountCredentials, String> {
+    let max_attempts = load_proxy_account_candidates(conn)?.len().max(1);
+    let mut local_excluded_ids = excluded_ids.clone();
+    let mut last_error = None;
+
+    for _ in 0..max_attempts {
+        let candidate = match select_proxy_account_for_request(
+            conn,
+            app,
+            &local_excluded_ids,
+            switch_stage,
+            switch_reason,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                return Err(last_error
+                    .map(|last| format!("{} 最近一次账号凭据错误：{}", error, last))
+                    .unwrap_or(error));
+            }
+        };
+
+        let refreshed = tauri::async_runtime::block_on(refresh_auth_json_if_needed(
+            &candidate.json_info,
+            false,
+        ));
+        let json_info = match refreshed {
+            Ok((json_info, changed)) => {
+                if changed {
+                    save_account_json_info(conn, candidate.id, &json_info)?;
+                }
+                json_info
+            }
+            Err(error) => {
+                mark_quota_error(conn, candidate.id, &error)?;
+                let details = serde_json::json!({
+                    "reason": "credential_failed",
+                    "error": error,
+                })
+                .to_string();
+                log_proxy_account_warning(
+                    conn,
+                    &candidate,
+                    "credential",
+                    "代理账号凭据刷新失败，尝试切换下一个账号。",
+                    &details,
+                );
+                local_excluded_ids.insert(candidate.id);
+                last_error = Some(error);
+                continue;
+            }
+        };
+
+        let value = match parse_auth_json(&json_info) {
+            Ok(value) => value,
+            Err(error) => {
+                mark_quota_error(conn, candidate.id, &error)?;
+                local_excluded_ids.insert(candidate.id);
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let access_token =
+            require_json_string(&value, "/tokens/access_token", "tokens.access_token")?;
+        let account_id = require_json_string(&value, "/tokens/account_id", "tokens.account_id")?;
+        return Ok(ProxyAccountCredentials {
+            id: candidate.id,
+            name: candidate.name,
+            identifier: candidate.identifier,
+            account_id,
+            access_token,
+        });
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| "代理没有可用账号，请先选择一个带 auth.json 的账号。".to_string()))
 }
 
 #[derive(Debug)]
@@ -2813,39 +3260,16 @@ fn codex_proxy_request_body_with_fast_service_tier(body: Vec<u8>, enabled: bool)
     serde_json::to_vec(&value).unwrap_or(body)
 }
 
-fn forward_codex_proxy_request(
-    stream: &mut TcpStream,
-    db_path: &std::path::Path,
-    request: ProxyHttpRequest,
-) -> Result<(), String> {
-    let normalized_target = normalize_proxy_target(&request.target)?;
-    if request.method.eq_ignore_ascii_case("OPTIONS") {
-        write_proxy_options_response(stream);
-        return Ok(());
-    }
-
-    if normalized_target == "/v1/models" || normalized_target.starts_with("/v1/models?") {
-        write_proxy_json_response(stream, "200 OK", &codex_proxy_models_response());
-        return Ok(());
-    }
-
-    let upstream_target = resolve_codex_proxy_upstream_target(&normalized_target)?;
-    let upstream_url = format!("{}{}", CODEX_PROXY_UPSTREAM_BASE_URL, upstream_target);
-    let is_responses_request = upstream_target.starts_with("/responses");
-    let mut body = request.body;
-    body = codex_proxy_request_body_with_fast_service_tier(
-        body,
-        is_responses_request && codex_proxy_fast_service_tier_enabled(),
-    );
-    let conn = Connection::open(db_path).map_err(|e| format!("代理打开账号库失败: {}", e))?;
-    let (_id, _name, account_id, access_token) = proxy_account_credentials(&conn)?;
-    let method = reqwest::Method::from_bytes(request.method.as_bytes())
-        .map_err(|e| format!("代理请求方法无效: {}", e))?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("创建代理 HTTP 客户端失败: {}", e))?;
-    let mut upstream = client.request(method, upstream_url);
+fn send_codex_proxy_upstream_request(
+    client: &reqwest::blocking::Client,
+    request: &ProxyHttpRequest,
+    method: &reqwest::Method,
+    upstream_url: &str,
+    body: &[u8],
+    is_responses_request: bool,
+    credentials: &ProxyAccountCredentials,
+) -> Result<reqwest::blocking::Response, String> {
+    let mut upstream = client.request(method.clone(), upstream_url);
 
     for (name, value) in &request.headers {
         if matches!(
@@ -2868,8 +3292,11 @@ fn forward_codex_proxy_request(
     }
 
     upstream = upstream
-        .header(AUTHORIZATION, format!("Bearer {}", access_token))
-        .header("ChatGPT-Account-Id", account_id)
+        .header(
+            AUTHORIZATION,
+            format!("Bearer {}", credentials.access_token),
+        )
+        .header("ChatGPT-Account-Id", &credentials.account_id)
         .header("Originator", CODEX_PROXY_DEFAULT_ORIGINATOR)
         .header("Connection", "Keep-Alive");
 
@@ -2879,7 +3306,7 @@ fn forward_codex_proxy_request(
     if !request.headers.contains_key("accept") {
         upstream = upstream.header(
             ACCEPT,
-            if proxy_request_is_stream(&request.headers, &body) {
+            if proxy_request_is_stream(&request.headers, body) {
                 "text/event-stream"
             } else {
                 "application/json"
@@ -2903,12 +3330,116 @@ fn forward_codex_proxy_request(
         }
     }
     if !body.is_empty() {
-        upstream = upstream.body(body);
+        upstream = upstream.body(body.to_vec());
     }
 
-    let mut response = upstream
+    upstream
         .send()
-        .map_err(|e| format!("代理上游请求失败: {}", e))?;
+        .map_err(|e| format!("代理上游请求失败: {}", e))
+}
+
+fn codex_proxy_status_should_failover(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 402 | 403 | 429)
+}
+
+fn proxy_response_body_preview(response: reqwest::blocking::Response) -> String {
+    match response.text() {
+        Ok(body) => truncate_log_text(&body, 2000),
+        Err(error) => format!("Failed to read failover response body: {}", error),
+    }
+}
+
+fn mark_proxy_upstream_failure(
+    conn: &Connection,
+    credentials: &ProxyAccountCredentials,
+    status: reqwest::StatusCode,
+    body_preview: &str,
+) {
+    let message = format!(
+        "Proxy upstream returned status {} for account {}. Body preview: {}",
+        status.as_u16(),
+        credentials.name,
+        body_preview
+    );
+    let _ = mark_quota_error(conn, credentials.id, &message);
+}
+
+fn log_proxy_upstream_failover(
+    conn: &Connection,
+    from: &ProxyAccountCredentials,
+    to: &ProxyAccountCredentials,
+    status: reqwest::StatusCode,
+    body_preview: &str,
+) {
+    let details = serde_json::json!({
+        "status": status.as_u16(),
+        "status_text": status.to_string(),
+        "from_id": from.id,
+        "from_name": from.name,
+        "from_identifier": from.identifier,
+        "to_id": to.id,
+        "to_name": to.name,
+        "to_identifier": to.identifier,
+        "body_preview": body_preview,
+    })
+    .to_string();
+    let message = format!(
+        "代理上游返回 {}，已从 {} 切换到 {} 并重试一次。",
+        status.as_u16(),
+        from.name,
+        to.name
+    );
+    let _ = insert_operation_log(
+        conn,
+        "warn",
+        "proxy_failover",
+        Some(from.id),
+        &from.name,
+        &from.identifier,
+        "upstream_failover",
+        &message,
+        &details,
+    );
+}
+
+fn log_proxy_upstream_no_fallback(
+    conn: &Connection,
+    credentials: &ProxyAccountCredentials,
+    status: reqwest::StatusCode,
+    error: &str,
+) {
+    let message = format!(
+        "代理上游返回 {}，但没有找到可切换账号：{}",
+        status.as_u16(),
+        error
+    );
+    let details = serde_json::json!({
+        "status": status.as_u16(),
+        "status_text": status.to_string(),
+        "account_id": credentials.id,
+        "account_name": credentials.name,
+        "account_identifier": credentials.identifier,
+        "fallback_error": error,
+    })
+    .to_string();
+    let _ = mark_quota_error(conn, credentials.id, &message);
+    let _ = insert_operation_log(
+        conn,
+        "warn",
+        "proxy_failover",
+        Some(credentials.id),
+        &credentials.name,
+        &credentials.identifier,
+        "no_fallback",
+        &message,
+        &details,
+    );
+}
+
+fn write_codex_proxy_upstream_response(
+    stream: &mut TcpStream,
+    response: &mut reqwest::blocking::Response,
+) -> Result<(), String> {
     let status = response.status();
     let reason = status.canonical_reason().unwrap_or("OK");
     let mut head = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason);
@@ -2931,18 +3462,104 @@ fn forward_codex_proxy_request(
     stream
         .write_all(head.as_bytes())
         .map_err(|e| format!("写入代理响应头失败: {}", e))?;
-    std::io::copy(&mut response, stream).map_err(|e| format!("转发代理响应失败: {}", e))?;
+    std::io::copy(response, stream).map_err(|e| format!("转发代理响应失败: {}", e))?;
     let _ = stream.flush();
     Ok(())
 }
 
+fn forward_codex_proxy_request(
+    app: &AppHandle,
+    stream: &mut TcpStream,
+    db_path: &std::path::Path,
+    request: ProxyHttpRequest,
+) -> Result<(), String> {
+    let normalized_target = normalize_proxy_target(&request.target)?;
+    if request.method.eq_ignore_ascii_case("OPTIONS") {
+        write_proxy_options_response(stream);
+        return Ok(());
+    }
+
+    if normalized_target == "/v1/models" || normalized_target.starts_with("/v1/models?") {
+        write_proxy_json_response(stream, "200 OK", &codex_proxy_models_response());
+        return Ok(());
+    }
+
+    let upstream_target = resolve_codex_proxy_upstream_target(&normalized_target)?;
+    let upstream_url = format!("{}{}", CODEX_PROXY_UPSTREAM_BASE_URL, upstream_target);
+    let is_responses_request = upstream_target.starts_with("/responses");
+    let mut body = request.body.clone();
+    body = codex_proxy_request_body_with_fast_service_tier(
+        body,
+        is_responses_request && codex_proxy_fast_service_tier_enabled(),
+    );
+    let conn = Connection::open(db_path).map_err(|e| format!("代理打开账号库失败: {}", e))?;
+    let mut excluded_ids = HashSet::new();
+    let mut credentials =
+        proxy_account_credentials(&conn, Some(app), &excluded_ids, "preflight", "preflight")?;
+    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+        .map_err(|e| format!("代理请求方法无效: {}", e))?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("创建代理 HTTP 客户端失败: {}", e))?;
+
+    let mut response = send_codex_proxy_upstream_request(
+        &client,
+        &request,
+        &method,
+        &upstream_url,
+        &body,
+        is_responses_request,
+        &credentials,
+    )?;
+    let status = response.status();
+    if codex_proxy_status_should_failover(status) {
+        excluded_ids.insert(credentials.id);
+        let switch_reason = format!("upstream_{}", status.as_u16());
+        match proxy_account_credentials(
+            &conn,
+            Some(app),
+            &excluded_ids,
+            "upstream_failover",
+            &switch_reason,
+        ) {
+            Ok(next_credentials) => {
+                let body_preview = proxy_response_body_preview(response);
+                mark_proxy_upstream_failure(&conn, &credentials, status, &body_preview);
+                log_proxy_upstream_failover(
+                    &conn,
+                    &credentials,
+                    &next_credentials,
+                    status,
+                    &body_preview,
+                );
+                credentials = next_credentials;
+                response = send_codex_proxy_upstream_request(
+                    &client,
+                    &request,
+                    &method,
+                    &upstream_url,
+                    &body,
+                    is_responses_request,
+                    &credentials,
+                )?;
+            }
+            Err(error) => {
+                log_proxy_upstream_no_fallback(&conn, &credentials, status, &error);
+            }
+        }
+    }
+    write_codex_proxy_upstream_response(stream, &mut response)
+}
+
 fn handle_codex_proxy_connection(
+    app: AppHandle,
     mut stream: TcpStream,
     db_path: std::path::PathBuf,
     last_error: Arc<Mutex<String>>,
 ) {
     let result = read_proxy_http_request(&mut stream)
-        .and_then(|request| forward_codex_proxy_request(&mut stream, &db_path, request));
+        .and_then(|request| forward_codex_proxy_request(&app, &mut stream, &db_path, request));
     match result {
         Ok(()) => {
             if let Ok(mut guard) = last_error.lock() {
@@ -2969,7 +3586,11 @@ fn stop_codex_proxy_runtime() -> Result<(), String> {
     Ok(())
 }
 
-fn start_codex_proxy_runtime(db_path: std::path::PathBuf, port: u16) -> Result<(), String> {
+fn start_codex_proxy_runtime(
+    app: AppHandle,
+    db_path: std::path::PathBuf,
+    port: u16,
+) -> Result<(), String> {
     {
         let guard = CODEX_PROXY_RUNTIME
             .lock()
@@ -3003,8 +3624,9 @@ fn start_codex_proxy_runtime(db_path: std::path::PathBuf, port: u16) -> Result<(
                     }
                     let db_path = db_path.clone();
                     let last_error = last_error_for_thread.clone();
+                    let app = app.clone();
                     std::thread::spawn(move || {
-                        handle_codex_proxy_connection(stream, db_path, last_error);
+                        handle_codex_proxy_connection(app, stream, db_path, last_error);
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3397,6 +4019,25 @@ fn friendly_account_error(error: &str) -> String {
     }
     if lower.contains("401") || lower.contains("unauthorized") {
         return "登录已失效，请重新 OAuth 授权。".to_string();
+    }
+    if lower.contains("402")
+        || lower.contains("payment required")
+        || lower.contains("insufficient_quota")
+        || lower.contains("billing")
+    {
+        return format!("账号额度或计费受限，代理会尝试切换账号。详情：{}", error);
+    }
+    if lower.contains("429")
+        || lower.contains("usage_limit_reached")
+        || lower.contains("quota exceeded")
+        || lower.contains("quota exhausted")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+    {
+        return format!(
+            "账号触发额度或速率限制，代理会尝试切换账号。详情：{}",
+            error
+        );
     }
     if lower.contains("403") || lower.contains("forbidden") {
         return format!("接口拒绝访问，请确认账号权限或重新授权。详情：{}", error);
@@ -5250,7 +5891,7 @@ fn codex_proxy_state(app: &AppHandle, conn: &Connection) -> Result<CodexProxySta
 
 fn start_codex_proxy_for_app(app: &AppHandle, port: u16) -> Result<(), String> {
     let db_path = get_database_path(app)?;
-    start_codex_proxy_runtime(db_path, port)
+    start_codex_proxy_runtime(app.clone(), db_path, port)
 }
 
 fn restore_codex_proxy_on_startup(app: AppHandle) {
@@ -6801,6 +7442,75 @@ mod tests {
         .to_string()
     }
 
+    fn create_proxy_test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                json_info TEXT NOT NULL DEFAULT '',
+                primary_used_percent INTEGER DEFAULT 0,
+                primary_window_present INTEGER DEFAULT 1,
+                secondary_used_percent INTEGER DEFAULT 0,
+                secondary_window_present INTEGER DEFAULT 1,
+                last_quota_error TEXT DEFAULT ''
+            );
+            CREATE TABLE app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE operation_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                level TEXT NOT NULL,
+                action TEXT NOT NULL,
+                account_id INTEGER,
+                account_name TEXT DEFAULT '',
+                account_identifier TEXT DEFAULT '',
+                stage TEXT NOT NULL,
+                message TEXT NOT NULL,
+                details TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_proxy_test_account(
+        conn: &Connection,
+        id: i64,
+        name: &str,
+        primary_used_percent: i32,
+        primary_window_present: bool,
+        secondary_used_percent: i32,
+        secondary_window_present: bool,
+        last_quota_error: &str,
+    ) {
+        conn.execute(
+            r#"
+            INSERT INTO accounts (
+                id, name, json_info,
+                primary_used_percent, primary_window_present,
+                secondary_used_percent, secondary_window_present,
+                last_quota_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            params![
+                id,
+                name,
+                sample_auth_json(),
+                primary_used_percent,
+                if primary_window_present { 1 } else { 0 },
+                secondary_used_percent,
+                if secondary_window_present { 1 } else { 0 },
+                last_quota_error
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn parse_auth_json_requires_tokens() {
         assert!(parse_auth_json(&sample_auth_json()).is_ok());
@@ -7025,6 +7735,86 @@ base_url = "https://manual.example.com/v1"
             value.get("service_tier").and_then(|item| item.as_str()),
             Some("flex")
         );
+    }
+
+    #[test]
+    fn proxy_quota_low_uses_present_windows_only() {
+        assert!(proxy_account_quota_low(95, true, 0, false));
+        assert!(proxy_account_quota_low(10, true, 96, true));
+        assert!(!proxy_account_quota_low(94, true, 0, false));
+        assert!(!proxy_account_quota_low(100, false, 100, false));
+    }
+
+    #[test]
+    fn proxy_blocking_error_does_not_treat_decode_failures_as_unusable() {
+        assert!(!proxy_account_has_blocking_error(
+            "Failed to parse response: error decoding response body"
+        ));
+        assert!(proxy_account_has_blocking_error(
+            "Proxy upstream returned status 429 for account"
+        ));
+        assert!(proxy_account_has_blocking_error(
+            "登录已失效，请重新 OAuth 授权。"
+        ));
+    }
+
+    #[test]
+    fn proxy_selector_switches_to_next_account_when_active_quota_is_low() {
+        let conn = create_proxy_test_conn();
+        insert_proxy_test_account(&conn, 1, "Low", 96, true, 10, true, "");
+        insert_proxy_test_account(&conn, 2, "Ready", 20, true, 10, true, "");
+        write_proxy_active_account_id(&conn, 1).unwrap();
+
+        let selected = select_proxy_account_for_request(
+            &conn,
+            None,
+            &HashSet::new(),
+            "preflight",
+            "preflight",
+        )
+        .unwrap();
+
+        assert_eq!(selected.id, 2);
+        assert_eq!(read_proxy_active_account_id(&conn).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn proxy_selector_wraps_to_first_usable_account() {
+        let conn = create_proxy_test_conn();
+        insert_proxy_test_account(&conn, 1, "Ready", 20, true, 10, true, "");
+        insert_proxy_test_account(&conn, 2, "Blocked", 20, true, 10, true, "登录已失效");
+        insert_proxy_test_account(&conn, 3, "Low", 99, true, 10, true, "");
+        write_proxy_active_account_id(&conn, 3).unwrap();
+
+        let selected = select_proxy_account_for_request(
+            &conn,
+            None,
+            &HashSet::new(),
+            "preflight",
+            "preflight",
+        )
+        .unwrap();
+
+        assert_eq!(selected.id, 1);
+    }
+
+    #[test]
+    fn proxy_selector_keeps_active_account_without_quota_windows() {
+        let conn = create_proxy_test_conn();
+        insert_proxy_test_account(&conn, 1, "Monthly", 100, false, 100, false, "");
+        insert_proxy_test_account(&conn, 2, "Ready", 20, true, 10, true, "");
+        write_proxy_active_account_id(&conn, 1).unwrap();
+
+        let selected = select_proxy_account_for_request(
+            &conn,
+            None,
+            &HashSet::new(),
+            "preflight",
+            "preflight",
+        )
+        .unwrap();
+
+        assert_eq!(selected.id, 1);
     }
 
     #[test]
