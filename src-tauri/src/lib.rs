@@ -415,6 +415,8 @@ const CODEX_PROXY_SETTING_CONFIG_BACKUP: &str = "codex_proxy_config_backup";
 const CODEX_PROXY_DEFAULT_USER_AGENT: &str =
     "codex-tui/0.135.0 (Mac OS; arm64) CodexAccountManagerProxy/0.1.0";
 const CODEX_PROXY_DEFAULT_ORIGINATOR: &str = "codex-tui";
+const CODEX_PROXY_FAST_TIER_NAME: &str = "Fast";
+const CODEX_PROXY_FAST_TIER_DESCRIPTION: &str = "Use priority processing for Codex requests.";
 
 static OAUTH_STATE: Mutex<Option<OAuthState>> = Mutex::new(None);
 
@@ -757,6 +759,11 @@ fn read_service_tier_from_config(content: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn read_proxy_service_tier_from_config(content: &str) -> Option<String> {
+    root_toml_string_value(content, "service_tier")
+        .or_else(|| read_service_tier_from_config(content))
 }
 
 fn service_tier_line() -> String {
@@ -2683,14 +2690,88 @@ fn write_proxy_options_response(stream: &mut TcpStream) {
     let _ = stream.flush();
 }
 
+fn codex_proxy_openai_model(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": model,
+        "object": "model",
+        "created": 0,
+        "owned_by": "openai",
+        "service_tiers": [
+            {
+                "id": CODEX_PRIORITY_SERVICE_TIER,
+                "name": CODEX_PROXY_FAST_TIER_NAME,
+                "description": CODEX_PROXY_FAST_TIER_DESCRIPTION
+            }
+        ],
+        "default_service_tier": null
+    })
+}
+
+fn codex_proxy_model_info(model: &str, display_name: &str, priority: i32) -> serde_json::Value {
+    serde_json::json!({
+        "slug": model,
+        "display_name": display_name,
+        "description": format!("{} via Codex Account Manager proxy.", display_name),
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            { "effort": "low", "description": "Low" },
+            { "effort": "medium", "description": "Medium" },
+            { "effort": "high", "description": "High" }
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": priority,
+        "additional_speed_tiers": [],
+        "service_tiers": [
+            {
+                "id": CODEX_PRIORITY_SERVICE_TIER,
+                "name": CODEX_PROXY_FAST_TIER_NAME,
+                "description": CODEX_PROXY_FAST_TIER_DESCRIPTION
+            }
+        ],
+        "default_service_tier": null,
+        "availability_nux": null,
+        "upgrade": null,
+        "base_instructions": "",
+        "supports_reasoning_summaries": true,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": true,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "web_search_tool_type": "text",
+        "truncation_policy": { "mode": "tokens", "limit": 272000 },
+        "supports_parallel_tool_calls": true,
+        "supports_image_detail_original": true,
+        "context_window": 272000,
+        "max_context_window": 400000,
+        "auto_compact_token_limit": null,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": true,
+        "use_responses_lite": false
+    })
+}
+
 fn codex_proxy_models_response() -> String {
+    let models = [
+        ("gpt-5-codex", "GPT-5 Codex", 30),
+        ("gpt-5-codex-mini", "GPT-5 Codex Mini", 20),
+        ("gpt-5", "GPT-5", 10),
+    ];
     serde_json::json!({
         "object": "list",
-        "data": [
-            { "id": "gpt-5-codex", "object": "model", "created": 0, "owned_by": "openai" },
-            { "id": "gpt-5-codex-mini", "object": "model", "created": 0, "owned_by": "openai" },
-            { "id": "gpt-5", "object": "model", "created": 0, "owned_by": "openai" }
-        ]
+        "data": models
+            .iter()
+            .map(|(model, _, _)| codex_proxy_openai_model(model))
+            .collect::<Vec<_>>(),
+        "models": models
+            .iter()
+            .map(|(model, display_name, priority)| {
+                codex_proxy_model_info(model, display_name, *priority)
+            })
+            .collect::<Vec<_>>()
     })
     .to_string()
 }
@@ -2699,6 +2780,37 @@ fn random_proxy_session_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     BASE64.encode(bytes).replace(['/', '+', '='], "")
+}
+
+fn codex_proxy_fast_service_tier_enabled() -> bool {
+    let Ok(config_path) = get_codex_config_path() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    normalize_service_tier_speed(read_proxy_service_tier_from_config(&content).as_deref())
+        == CodexAppSpeed::Fast
+}
+
+fn codex_proxy_request_body_with_fast_service_tier(body: Vec<u8>, enabled: bool) -> Vec<u8> {
+    if !enabled || body.is_empty() {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body;
+    };
+    if object.contains_key("service_tier") {
+        return body;
+    }
+    object.insert(
+        "service_tier".to_string(),
+        serde_json::Value::String(CODEX_PRIORITY_SERVICE_TIER.to_string()),
+    );
+    serde_json::to_vec(&value).unwrap_or(body)
 }
 
 fn forward_codex_proxy_request(
@@ -2719,6 +2831,12 @@ fn forward_codex_proxy_request(
 
     let upstream_target = resolve_codex_proxy_upstream_target(&normalized_target)?;
     let upstream_url = format!("{}{}", CODEX_PROXY_UPSTREAM_BASE_URL, upstream_target);
+    let is_responses_request = upstream_target.starts_with("/responses");
+    let mut body = request.body;
+    body = codex_proxy_request_body_with_fast_service_tier(
+        body,
+        is_responses_request && codex_proxy_fast_service_tier_enabled(),
+    );
     let conn = Connection::open(db_path).map_err(|e| format!("代理打开账号库失败: {}", e))?;
     let (_id, _name, account_id, access_token) = proxy_account_credentials(&conn)?;
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
@@ -2761,17 +2879,17 @@ fn forward_codex_proxy_request(
     if !request.headers.contains_key("accept") {
         upstream = upstream.header(
             ACCEPT,
-            if proxy_request_is_stream(&request.headers, &request.body) {
+            if proxy_request_is_stream(&request.headers, &body) {
                 "text/event-stream"
             } else {
                 "application/json"
             },
         );
     }
-    if !request.headers.contains_key("content-type") && !request.body.is_empty() {
+    if !request.headers.contains_key("content-type") && !body.is_empty() {
         upstream = upstream.header(CONTENT_TYPE, "application/json");
     }
-    if upstream_target.starts_with("/responses") {
+    if is_responses_request {
         if !request.headers.contains_key("x-codex-turn-state") {
             upstream = upstream.header("x-codex-turn-state", "");
         }
@@ -2784,8 +2902,8 @@ fn forward_codex_proxy_request(
             upstream = upstream.header("Session_id", random_proxy_session_id());
         }
     }
-    if !request.body.is_empty() {
-        upstream = upstream.body(request.body);
+    if !body.is_empty() {
+        upstream = upstream.body(body);
     }
 
     let mut response = upstream
@@ -5571,8 +5689,7 @@ fn collect_codex_rollout_files_recursive(
     archived: bool,
     files: &mut Vec<CodexRolloutFile>,
 ) -> Result<(), String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("读取 Codex 会话目录失败: {}", e))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("读取 Codex 会话目录失败: {}", e))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("读取 Codex 会话文件失败: {}", e))?;
         let path = entry.path();
@@ -5721,8 +5838,7 @@ fn parse_codex_rollout_metadata(
                 {
                     sandbox_policy = policy;
                 }
-                if let Some(approval) = payload.get("approval_policy").and_then(json_state_string)
-                {
+                if let Some(approval) = payload.get("approval_policy").and_then(json_state_string) {
                     approval_mode = approval;
                 }
                 if cwd.is_empty() {
@@ -5759,8 +5875,9 @@ fn parse_codex_rollout_metadata(
                     }
                     Some("thread_goal_updated") => {
                         if preview.is_empty() {
-                            if let Some(objective) =
-                                payload.pointer("/goal/objective").and_then(|item| item.as_str())
+                            if let Some(objective) = payload
+                                .pointer("/goal/objective")
+                                .and_then(|item| item.as_str())
                             {
                                 let objective = objective.trim();
                                 if !objective.is_empty() {
@@ -5919,8 +6036,7 @@ fn scan_codex_session_visibility(
     if state_db_path.exists() {
         let conn = Connection::open_with_flags(
             &state_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
         for item in &metadata {
@@ -5970,8 +6086,7 @@ fn get_codex_session_visibility_status_for_home(
     let missing_sqlite_records = if state_db_path.exists() {
         let conn = Connection::open_with_flags(
             &state_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
         let mut count = 0;
@@ -6043,10 +6158,7 @@ fn create_session_visibility_backup(
     }
 
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let backup_dir = codex_home.join(format!(
-        "backup-{}-session-visibility-repair",
-        stamp
-    ));
+    let backup_dir = codex_home.join(format!("backup-{}-session-visibility-repair", stamp));
     let files_dir = backup_dir.join("files");
     std::fs::create_dir_all(&files_dir).map_err(|e| format!("创建修复备份目录失败: {}", e))?;
 
@@ -6074,7 +6186,10 @@ fn create_session_visibility_backup(
 
     let session_index_path = codex_session_index_path_for_home(codex_home);
     let has_session_index_backup = if include_session_index {
-        copy_file_to_backup(&session_index_path, &backup_dir.join(CODEX_SESSION_INDEX_FILE))?
+        copy_file_to_backup(
+            &session_index_path,
+            &backup_dir.join(CODEX_SESSION_INDEX_FILE),
+        )?
     } else {
         false
     };
@@ -6109,7 +6224,9 @@ fn rewrite_rollout_model_provider(path: &Path, target_provider: &str) -> Result<
         if !changed && !trimmed.is_empty() {
             if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) {
                 if value.get("type").and_then(|item| item.as_str()) == Some("session_meta") {
-                    if let Some(payload) = value.get_mut("payload").and_then(|item| item.as_object_mut())
+                    if let Some(payload) = value
+                        .get_mut("payload")
+                        .and_then(|item| item.as_object_mut())
                     {
                         let current = payload
                             .get("model_provider")
@@ -6280,8 +6397,7 @@ fn repair_codex_session_visibility_for_home(
     if state_db_path.exists() {
         let conn = Connection::open_with_flags(
             &state_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
         for item in &metadata {
@@ -6330,13 +6446,14 @@ fn repair_codex_session_visibility_for_home(
         let conn = Connection::open(&state_db_path)
             .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
         for item in &ready_metadata {
-            let state = sqlite_existing_states
-                .get(&item.id)
-                .cloned()
-                .unwrap_or(SqliteVisibilityState {
-                    exists: false,
-                    provider: String::new(),
-                });
+            let state =
+                sqlite_existing_states
+                    .get(&item.id)
+                    .cloned()
+                    .unwrap_or(SqliteVisibilityState {
+                        exists: false,
+                        provider: String::new(),
+                    });
             if state.exists {
                 sqlite_records_updated +=
                     update_sqlite_thread_provider(&conn, &item.id, &target_provider)?;
@@ -6852,6 +6969,89 @@ base_url = "https://manual.example.com/v1"
     }
 
     #[test]
+    fn codex_proxy_models_response_advertises_fast_service_tier() {
+        let value: serde_json::Value =
+            serde_json::from_str(&codex_proxy_models_response()).unwrap();
+        let models = value
+            .get("models")
+            .and_then(|item| item.as_array())
+            .unwrap();
+        let gpt_5_codex = models
+            .iter()
+            .find(|model| model.get("slug").and_then(|item| item.as_str()) == Some("gpt-5-codex"))
+            .unwrap();
+        let service_tiers = gpt_5_codex
+            .get("service_tiers")
+            .and_then(|item| item.as_array())
+            .unwrap();
+
+        assert_eq!(
+            service_tiers[0].get("id").and_then(|item| item.as_str()),
+            Some(CODEX_PRIORITY_SERVICE_TIER)
+        );
+        assert_eq!(
+            service_tiers[0].get("name").and_then(|item| item.as_str()),
+            Some(CODEX_PROXY_FAST_TIER_NAME)
+        );
+        assert_eq!(
+            value["data"][0]["service_tiers"][0]["id"].as_str(),
+            Some(CODEX_PRIORITY_SERVICE_TIER)
+        );
+    }
+
+    #[test]
+    fn codex_proxy_body_injects_fast_service_tier_when_enabled() {
+        let body = br#"{"model":"gpt-5-codex","input":[],"stream":true}"#.to_vec();
+        let next = codex_proxy_request_body_with_fast_service_tier(body, true);
+        let value: serde_json::Value = serde_json::from_slice(&next).unwrap();
+
+        assert_eq!(
+            value.get("service_tier").and_then(|item| item.as_str()),
+            Some(CODEX_PRIORITY_SERVICE_TIER)
+        );
+        assert_eq!(
+            value.get("stream").and_then(|item| item.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_proxy_body_preserves_existing_service_tier() {
+        let body = br#"{"model":"gpt-5-codex","service_tier":"flex"}"#.to_vec();
+        let next = codex_proxy_request_body_with_fast_service_tier(body, true);
+        let value: serde_json::Value = serde_json::from_slice(&next).unwrap();
+
+        assert_eq!(
+            value.get("service_tier").and_then(|item| item.as_str()),
+            Some("flex")
+        );
+    }
+
+    #[test]
+    fn proxy_service_tier_reads_root_or_desktop_config() {
+        assert_eq!(
+            read_proxy_service_tier_from_config(
+                r#"service_tier = "fast"
+
+[desktop]
+default-service-tier = "priority"
+"#,
+            )
+            .as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            read_proxy_service_tier_from_config(
+                r#"[desktop]
+default-service-tier = "priority"
+"#,
+            )
+            .as_deref(),
+            Some(CODEX_PRIORITY_SERVICE_TIER)
+        );
+    }
+
+    #[test]
     fn codex_speed_config_toggles_desktop_service_tier() {
         let original = r#"[model]
 name = "gpt-5"
@@ -6928,9 +7128,7 @@ goals = true
     }
 
     fn temp_codex_home(label: &str) -> PathBuf {
-        let unique = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or_default();
+        let unique = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let path = std::env::temp_dir().join(format!(
             "codex-account-manager-{}-{}-{}",
             label,
@@ -7094,7 +7292,9 @@ goals = true
         assert_eq!(report.rewritten_rollout_files, 1);
         assert_eq!(report.sqlite_records_updated, 1);
         assert_eq!(report.session_index_entries_added, 1);
-        assert!(PathBuf::from(&report.backup_dir).join("manifest.json").exists());
+        assert!(PathBuf::from(&report.backup_dir)
+            .join("manifest.json")
+            .exists());
         assert_eq!(rollout_provider(&rollout_path), "custom");
 
         let conn = Connection::open(codex_state_db_path_for_home(&codex_home)).unwrap();
@@ -7106,7 +7306,8 @@ goals = true
             )
             .unwrap();
         assert_eq!(provider, "custom");
-        let index = std::fs::read_to_string(codex_session_index_path_for_home(&codex_home)).unwrap();
+        let index =
+            std::fs::read_to_string(codex_session_index_path_for_home(&codex_home)).unwrap();
         assert!(index.contains(thread_id));
 
         let _ = std::fs::remove_dir_all(codex_home);

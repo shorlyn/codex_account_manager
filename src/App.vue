@@ -435,10 +435,16 @@ const codexProxySwitchDisabled = computed(() =>
   || (!codexProxySwitchActive.value && proxyAccountCandidates.value.length === 0),
 );
 
-const codexProxySelectedName = computed(() => {
-  const id = codexProxySelectedAccountId.value ?? codexProxyState.value?.active_account_id ?? null;
-  if (id === null) return '';
-  return accounts.value.find(account => account.id === id)?.name ?? '';
+const codexSpeedSwitchActive = computed(() => codexAppSpeed.value === 'fast');
+
+const codexSpeedSwitchLabel = computed(() => {
+  if (codexSpeedSaving.value) return '处理中';
+  return codexSpeedSwitchActive.value ? 'Fast' : '标准';
+});
+
+const codexProxyBaseUrlLabel = computed(() => {
+  const baseUrl = codexProxyState.value?.base_url ?? '';
+  return baseUrl.replace(/^https?:\/\//, '');
 });
 
 const filteredAccounts = computed(() => {
@@ -867,6 +873,10 @@ function toggleCodexProxy() {
   } else {
     void activateCodexProxy();
   }
+}
+
+function toggleCodexAppSpeed() {
+  void changeCodexAppSpeed(codexSpeedSwitchActive.value ? 'standard' : 'fast');
 }
 
 async function updateCodexProxyAccount() {
@@ -1579,18 +1589,21 @@ function editDetailAccount(account: Account) {
             <strong>Codex 代理</strong>
             <span>{{ codexProxyStatusLabel }}</span>
           </div>
-          <span
-            class="proxy-strip-account"
-            :title="codexProxySelectedName || codexProxyState?.active_account_name || '未选择账号'"
+          <button
+            v-if="codexProxyState?.base_url"
+            class="proxy-url-chip"
+            :title="`复制代理地址：${codexProxyState.base_url}`"
+            @click="copyText(codexProxyState.base_url, '代理地址')"
           >
-            {{ codexProxySelectedName || codexProxyState?.active_account_name || '未选择账号' }}
-          </span>
+            {{ codexProxyBaseUrlLabel }}
+          </button>
         </div>
 
         <div class="proxy-strip-controls">
           <select
             v-model.number="codexProxySelectedAccountId"
             :disabled="codexProxyBusy || proxyAccountCandidates.length === 0"
+            title="Token 来源：所选账号保存的 OAuth/auth.json"
             @change="updateCodexProxyAccount"
           >
             <option
@@ -1623,6 +1636,18 @@ function editDetailAccount(account: Account) {
               <span class="proxy-switch-thumb"></span>
             </span>
             <span>{{ codexProxyBusy ? '处理中' : (codexProxySwitchActive ? '启用' : '停用') }}</span>
+          </button>
+          <button
+            class="proxy-switch speed-switch"
+            :class="{ active: codexSpeedSwitchActive }"
+            :disabled="codexSpeedSaving"
+            title="切换 Codex Fast 模式"
+            @click="toggleCodexAppSpeed"
+          >
+            <span class="proxy-switch-track">
+              <span class="proxy-switch-thumb"></span>
+            </span>
+            <span>{{ codexSpeedSwitchLabel }}</span>
           </button>
         </div>
       </section>
@@ -1726,73 +1751,93 @@ function editDetailAccount(account: Account) {
 
       <section class="overview-panel">
         <div class="stat-grid">
-          <div class="stat-item">
-            <span class="stat-label">当前账号</span>
-            <strong :title="accountStats.currentName">{{ accountStats.currentName }}</strong>
-            <small v-if="accountStats.currentPrimaryRemaining !== null">
-              {{ accountStats.currentPrimaryLabel }} {{ accountStats.currentPrimaryRemaining }}%
-              <template v-if="accountStats.currentSecondaryVisible">
-                · {{ accountStats.currentSecondaryLabel }} {{ accountStats.currentSecondaryRemaining }}%
-              </template>
-            </small>
-            <small v-else>尚未写入当前 auth.json</small>
+          <div class="stat-item stat-current">
+            <div class="stat-icon">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Z"/>
+                <path d="M4 21a8 8 0 0 1 11.8-7"/>
+                <path d="m16 19 2 2 4-5"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <span class="stat-label">当前账号</span>
+              <strong :title="accountStats.currentName">{{ accountStats.currentName }}</strong>
+              <small v-if="accountStats.currentPrimaryRemaining !== null">
+                {{ accountStats.currentPrimaryLabel }} {{ accountStats.currentPrimaryRemaining }}%
+                <template v-if="accountStats.currentSecondaryVisible">
+                  · {{ accountStats.currentSecondaryLabel }} {{ accountStats.currentSecondaryRemaining }}%
+                </template>
+              </small>
+              <small v-else>尚未写入当前 auth.json</small>
+            </div>
+            <svg class="stat-sparkline" viewBox="0 0 96 28" preserveAspectRatio="none">
+              <polyline points="2,21 16,17 30,18 44,12 58,15 72,8 94,13" />
+            </svg>
           </div>
-          <div class="stat-item">
-            <span class="stat-label">账号数量</span>
-            <strong>{{ accountStats.total }}</strong>
-            <small>可用 {{ accountStats.usable }} 个</small>
+          <div class="stat-item stat-count">
+            <div class="stat-icon">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/>
+                <circle cx="9" cy="7" r="4"/>
+                <path d="M22 21v-2a4 4 0 0 0-3-3.87"/>
+                <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <span class="stat-label">账号数量</span>
+              <strong>{{ accountStats.total }}</strong>
+              <small>可用 {{ accountStats.usable }} 个</small>
+            </div>
+            <svg class="stat-sparkline" viewBox="0 0 96 28" preserveAspectRatio="none">
+              <polyline points="2,20 18,14 34,16 50,10 66,12 82,8 94,9" />
+            </svg>
           </div>
-          <div class="stat-item">
-            <span class="stat-label">剩余额度池</span>
-            <strong>{{ accountStats.totalPrimaryRemaining }}%</strong>
-            <small>
-              {{ accountStats.totalPrimaryLabel }}合计
-              <template v-if="accountStats.hasSecondaryQuota">
-                · {{ accountStats.totalSecondaryLabel }} {{ accountStats.totalSecondaryRemaining }}%
-              </template>
-            </small>
+          <div class="stat-item stat-quota">
+            <div class="stat-icon">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 13a8 8 0 1 1 16 0"/>
+                <path d="M12 13 16 8"/>
+                <path d="M3 17h18"/>
+                <path d="M7 21h10"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <span class="stat-label">剩余额度池</span>
+              <strong>{{ accountStats.totalPrimaryRemaining }}%</strong>
+              <small>
+                {{ accountStats.totalPrimaryLabel }}合计
+                <template v-if="accountStats.hasSecondaryQuota">
+                  · {{ accountStats.totalSecondaryLabel }} {{ accountStats.totalSecondaryRemaining }}%
+                </template>
+              </small>
+            </div>
+            <svg class="stat-sparkline" viewBox="0 0 96 28" preserveAspectRatio="none">
+              <polyline points="2,18 16,16 30,12 44,15 58,9 72,11 94,7" />
+            </svg>
           </div>
           <div class="stat-item stat-warn">
-            <span class="stat-label">状态问题</span>
-            <strong>{{ accountStats.issueCount }}</strong>
-            <small
-              v-if="accountStats.issueCount > 0"
-              class="stat-error-reasons"
-              :title="accountStats.errorReasons.map(item => `${item.label} ${item.count} 个`).join(' · ')"
-            >
-              不可用 {{ accountStats.unavailable }} · 额度受限 {{ accountStats.quotaLimited }} · 查询失败 {{ accountStats.queryFailed }}
-            </small>
-            <small v-else>没有问题</small>
-          </div>
-        </div>
-
-        <div class="overview-controls">
-          <div class="segmented" title="Codex 桌面速度">
-            <button
-              :class="{ active: codexAppSpeed === 'standard' }"
-              :disabled="codexSpeedSaving"
-              @click="changeCodexAppSpeed('standard')"
-            >
-              标准
-            </button>
-            <button
-              :class="{ active: codexAppSpeed === 'fast' }"
-              :disabled="codexSpeedSaving"
-              @click="changeCodexAppSpeed('fast')"
-            >
-              Fast
-            </button>
-          </div>
-          <div class="segmented view-segmented" title="账号展示方式">
-            <button :class="{ active: accountViewMode === 'cards' }" @click="setAccountViewMode('cards')">
-              卡片
-            </button>
-            <button :class="{ active: accountViewMode === 'compact' }" @click="setAccountViewMode('compact')">
-              紧凑
-            </button>
-            <button :class="{ active: accountViewMode === 'table' }" @click="setAccountViewMode('table')">
-              表格
-            </button>
+            <div class="stat-icon">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <path d="M12 7v6"/>
+                <path d="M12 17h.01"/>
+              </svg>
+            </div>
+            <div class="stat-content">
+              <span class="stat-label">状态问题</span>
+              <strong>{{ accountStats.issueCount }}</strong>
+              <small
+                v-if="accountStats.issueCount > 0"
+                class="stat-error-reasons"
+                :title="accountStats.errorReasons.map(item => `${item.label} ${item.count} 个`).join(' · ')"
+              >
+                不可用 {{ accountStats.unavailable }} · 额度受限 {{ accountStats.quotaLimited }} · 查询失败 {{ accountStats.queryFailed }}
+              </small>
+              <small v-else>没有问题</small>
+            </div>
+            <svg class="stat-sparkline" viewBox="0 0 96 28" preserveAspectRatio="none">
+              <polyline points="2,12 16,14 30,10 44,15 58,13 72,17 94,19" />
+            </svg>
           </div>
         </div>
       </section>
@@ -1842,9 +1887,6 @@ function editDetailAccount(account: Account) {
         </div>
 
         <div class="toolbar-actions">
-          <span class="toolbar-result">
-            {{ filteredAccounts.length }} / {{ accounts.length }} 个账号
-          </span>
           <button
             class="btn-toolbar btn-usage-toggle"
             :class="{ active: showUsageSidebar }"
@@ -1893,6 +1935,50 @@ function editDetailAccount(account: Account) {
             accept="application/json,.json"
             @change="importBackup"
           />
+          <div class="view-mode-actions" title="账号展示方式">
+            <button
+              class="btn-toolbar-icon view-mode-button"
+              :class="{ active: accountViewMode === 'cards' }"
+              title="卡片视图"
+              aria-label="卡片视图"
+              @click="setAccountViewMode('cards')"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+                <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+                <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+                <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+              </svg>
+            </button>
+            <button
+              class="btn-toolbar-icon view-mode-button"
+              :class="{ active: accountViewMode === 'compact' }"
+              title="紧凑视图"
+              aria-label="紧凑视图"
+              @click="setAccountViewMode('compact')"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 6h16"/>
+                <path d="M4 12h16"/>
+                <path d="M4 18h16"/>
+              </svg>
+            </button>
+            <button
+              class="btn-toolbar-icon view-mode-button"
+              :class="{ active: accountViewMode === 'table' }"
+              title="表格视图"
+              aria-label="表格视图"
+              @click="setAccountViewMode('table')"
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="16" rx="2"/>
+                <path d="M3 10h18"/>
+                <path d="M3 15h18"/>
+                <path d="M9 4v16"/>
+                <path d="M15 4v16"/>
+              </svg>
+            </button>
+          </div>
           <div class="tools-menu-wrap toolbar-tools" @click.stop>
             <button class="btn-toolbar btn-tools" @click="showToolsMenu = !showToolsMenu">
               <span>工具</span>
@@ -5709,18 +5795,6 @@ function editDetailAccount(account: Account) {
   white-space: nowrap;
 }
 
-.proxy-strip-account {
-  max-width: 260px;
-  overflow: hidden;
-  padding-left: 10px;
-  border-left: 1px solid var(--border-light);
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .proxy-strip-controls {
   min-width: 0;
   display: flex;
@@ -5917,13 +5991,6 @@ function editDetailAccount(account: Account) {
     flex-wrap: wrap;
   }
 
-  .proxy-strip-account {
-    width: 100%;
-    max-width: 100%;
-    padding-left: 0;
-    border-left: 0;
-  }
-
   .proxy-strip-controls {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 36px auto;
@@ -6117,10 +6184,26 @@ function editDetailAccount(account: Account) {
   font-weight: 800;
 }
 
-.proxy-strip-account {
-  max-width: 360px;
-  color: var(--text-secondary);
-  font-weight: 750;
+.proxy-url-chip {
+  max-width: 220px;
+  overflow: hidden;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: #f8fafc;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.proxy-url-chip:hover {
+  border-color: rgba(79, 107, 255, 0.22);
+  background: var(--primary-light);
+  color: var(--primary);
 }
 
 .proxy-strip-controls select,
@@ -6401,6 +6484,310 @@ function editDetailAccount(account: Account) {
 
   .overview-controls {
     flex-direction: column;
+  }
+}
+
+/* ── Refined dashboard controls ───────── */
+.speed-switch.active {
+  border-color: rgba(79, 107, 255, 0.26);
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.speed-switch.active .proxy-switch-track {
+  background: var(--primary);
+}
+
+.view-mode-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #f7f9fc;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.86);
+}
+
+.view-mode-button {
+  width: 32px;
+  height: 30px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.view-mode-button.active {
+  border-color: rgba(79, 107, 255, 0.2);
+  background: #fff;
+  color: var(--primary);
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.06), 0 8px 18px rgba(79, 107, 255, 0.08);
+}
+
+.overview-panel {
+  display: block;
+  margin-bottom: 10px;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stat-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 78px;
+  gap: 11px;
+  overflow: hidden;
+  padding: 11px 13px;
+  border: 1px solid rgba(219, 228, 238, 0.86);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.045), 0 16px 36px rgba(23, 32, 51, 0.055);
+}
+
+.stat-item::before {
+  display: none;
+}
+
+.stat-item::after {
+  content: "";
+  position: absolute;
+  right: -28px;
+  bottom: -34px;
+  width: 118px;
+  height: 76px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.075;
+}
+
+.stat-current {
+  color: var(--primary);
+}
+
+.stat-count {
+  color: var(--accent);
+}
+
+.stat-quota {
+  color: #f97316;
+}
+
+.stat-warn {
+  color: #f43f5e;
+}
+
+.stat-icon {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  border-radius: 12px;
+  background: var(--primary);
+  color: #fff;
+  box-shadow: 0 12px 22px rgba(23, 32, 51, 0.14);
+}
+
+.stat-count .stat-icon {
+  background: var(--accent);
+}
+
+.stat-quota .stat-icon {
+  background: #f97316;
+}
+
+.stat-warn .stat-icon {
+  background: #f43f5e;
+}
+
+.stat-content {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  flex: 1;
+  padding-right: 58px;
+}
+
+.stat-label {
+  display: block;
+  color: #46546a;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.stat-item strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  color: currentColor;
+  font-size: 21px;
+  line-height: 1;
+  font-weight: 950;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-current strong {
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.16;
+}
+
+.stat-item small {
+  display: block;
+  overflow: hidden;
+  margin-top: 4px;
+  color: #7d8aa0;
+  font-size: 11px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stat-sparkline {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  width: 70px;
+  height: 20px;
+  color: currentColor;
+  opacity: 0.68;
+  z-index: 1;
+}
+
+.stat-sparkline polyline {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 1180px) {
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .header-inner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .header-right {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .content {
+    overflow-x: hidden;
+  }
+
+  .proxy-strip-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    justify-content: flex-start;
+  }
+
+  .proxy-strip-controls select {
+    flex: 1 1 calc(100% - 44px);
+    min-width: 0;
+    max-width: none;
+    width: auto;
+  }
+
+  .proxy-refresh {
+    flex: 0 0 36px;
+    width: 36px;
+  }
+
+  .proxy-switch {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0;
+    justify-content: center;
+  }
+
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .stat-item {
+    min-height: 86px;
+    border-bottom: 1px solid rgba(219, 228, 238, 0.86);
+  }
+
+  .stat-content {
+    padding-right: 58px;
+  }
+
+  .account-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar-main,
+  .toolbar-actions {
+    width: 100%;
+    min-width: 0;
+    flex: 0 0 auto;
+  }
+
+  .toolbar-main {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar-selects {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 36px;
+    width: 100%;
+  }
+
+  .toolbar-selects label,
+  .toolbar-selects select {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .toolbar-actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .btn-usage-toggle {
+    flex: 1 1 calc(50% - 4px);
+  }
+
+  .toolbar-actions > .btn-toolbar:not(.btn-usage-toggle):not(.btn-tools) {
+    flex: 1 1 100%;
+    justify-content: center;
+  }
+
+  .view-mode-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .view-mode-button {
+    flex: 1;
+    width: auto;
   }
 }
 </style>
