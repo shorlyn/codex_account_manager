@@ -6541,7 +6541,7 @@ function editDetailAccount(account: Account) {
 
 .overview-panel {
   display: block;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
   overflow: visible;
   border: 0;
   border-radius: 0;
@@ -6552,8 +6552,8 @@ function editDetailAccount(account: Account) {
 
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(4, minmax(148px, 1fr));
+  gap: 8px;
 }
 
 .stat-item {
@@ -6561,14 +6561,14 @@ function editDetailAccount(account: Account) {
   display: flex;
   align-items: center;
   min-width: 0;
-  min-height: 78px;
-  gap: 11px;
+  min-height: 64px;
+  gap: 9px;
   overflow: hidden;
-  padding: 11px 13px;
+  padding: 9px 10px;
   border: 1px solid rgba(219, 228, 238, 0.86);
   border-radius: var(--radius-sm);
   background: #fff;
-  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.045), 0 16px 36px rgba(23, 32, 51, 0.055);
+  box-shadow: 0 1px 2px rgba(23, 32, 51, 0.05), 0 10px 24px rgba(23, 32, 51, 0.055);
 }
 
 .stat-item::before {
@@ -6578,13 +6578,13 @@ function editDetailAccount(account: Account) {
 .stat-item::after {
   content: "";
   position: absolute;
-  right: -28px;
-  bottom: -34px;
-  width: 118px;
-  height: 76px;
+  right: -34px;
+  bottom: -40px;
+  width: 104px;
+  height: 68px;
   border-radius: 999px;
   background: currentColor;
-  opacity: 0.075;
+  opacity: 0.07;
 }
 
 .stat-current {
@@ -6609,13 +6609,18 @@ function editDetailAccount(account: Account) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 42px;
-  height: 42px;
-  flex: 0 0 42px;
-  border-radius: 12px;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 10px;
   background: var(--primary);
   color: #fff;
-  box-shadow: 0 12px 22px rgba(23, 32, 51, 0.14);
+  box-shadow: 0 8px 16px rgba(23, 32, 51, 0.13);
+}
+
+.stat-icon svg {
+  width: 20px;
+  height: 20px;
 }
 
 .stat-count .stat-icon {
@@ -6635,22 +6640,23 @@ function editDetailAccount(account: Account) {
   z-index: 1;
   min-width: 0;
   flex: 1;
-  padding-right: 58px;
+  padding-right: 0;
 }
 
 .stat-label {
   display: block;
   color: #46546a;
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 1;
   font-weight: 900;
 }
 
 .stat-item strong {
   display: block;
   overflow: hidden;
-  margin-top: 3px;
+  margin-top: 4px;
   color: currentColor;
-  font-size: 21px;
+  font-size: 18px;
   line-height: 1;
   font-weight: 950;
   text-overflow: ellipsis;
@@ -6660,7 +6666,7 @@ function editDetailAccount(account: Account) {
 
 .stat-current strong {
   color: var(--text);
-  font-size: 16px;
+  font-size: 14px;
   line-height: 1.16;
 }
 
@@ -6669,21 +6675,15 @@ function editDetailAccount(account: Account) {
   overflow: hidden;
   margin-top: 4px;
   color: #7d8aa0;
-  font-size: 11px;
+  font-size: 10px;
+  line-height: 1.1;
   font-weight: 750;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .stat-sparkline {
-  position: absolute;
-  right: 12px;
-  bottom: 10px;
-  width: 70px;
-  height: 20px;
-  color: currentColor;
-  opacity: 0.68;
-  z-index: 1;
+  display: none;
 }
 
 .stat-sparkline polyline {
@@ -6694,7 +6694,7 @@ function editDetailAccount(account: Account) {
   stroke-linejoin: round;
 }
 
-@media (max-width: 1180px) {
+@media (max-width: 860px) {
   .stat-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -6741,16 +6741,16 @@ function editDetailAccount(account: Account) {
   }
 
   .stat-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .stat-item {
-    min-height: 86px;
+    min-height: 64px;
     border-bottom: 1px solid rgba(219, 228, 238, 0.86);
   }
 
   .stat-content {
-    padding-right: 58px;
+    padding-right: 0;
   }
 
   .account-toolbar {
@@ -6804,6 +6804,12 @@ function editDetailAccount(account: Account) {
   .view-mode-button {
     flex: 1;
     width: auto;
+  }
+}
+
+@media (max-width: 520px) {
+  .stat-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>
