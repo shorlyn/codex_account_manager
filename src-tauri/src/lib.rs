@@ -5289,13 +5289,23 @@ async fn normalized_backup_accounts(
     Ok((payload.version, normalized_accounts))
 }
 
-fn existing_account_ids(
+#[derive(Debug, Clone)]
+struct ExistingAccountEntry {
+    id: i64,
+    name: String,
+    json_info: String,
+    has_credential: bool,
+}
+
+fn existing_account_lookup(
     conn: &Connection,
-) -> Result<std::collections::HashMap<String, i64>, String> {
+) -> Result<std::collections::HashMap<String, Vec<ExistingAccountEntry>>, String> {
     let mut stmt = conn
         .prepare(
             "
             SELECT id,
+                   name,
+                   json_info,
                    CASE
                        WHEN json_valid(json_info)
                        THEN COALESCE(json_extract(json_info, '$.tokens.account_id'), '')
@@ -5313,17 +5323,102 @@ fn existing_account_ids(
         .map_err(|e| format!("Failed to prepare existing account lookup: {}", e))?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            let json_info = row.get::<_, String>(2)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                json_info.clone(),
+                row.get::<_, String>(3)?,
+                json_info_has_credential(&json_info),
+            ))
         })
         .map_err(|e| format!("Failed to query existing accounts: {}", e))?;
 
     let mut existing = std::collections::HashMap::new();
     for row in rows {
-        let (id, account_id) =
+        let (id, name, json_info, account_id, has_credential) =
             row.map_err(|e| format!("Failed to read existing account lookup: {}", e))?;
-        existing.entry(account_id).or_insert(id);
+        existing
+            .entry(account_id)
+            .or_insert_with(Vec::new)
+            .push(ExistingAccountEntry {
+                id,
+                name,
+                json_info,
+                has_credential,
+            });
     }
     Ok(existing)
+}
+
+fn backup_account_identity_target(account: &BackupAccount) -> Option<String> {
+    extract_email_from_auth_json(&account.json_info).or_else(|| {
+        normalize_email_for_match(Some(&account.name)).and_then(|name| {
+            if name.contains('@') {
+                Some(name)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn backup_account_matches_existing(
+    account: &BackupAccount,
+    existing: &ExistingAccountEntry,
+) -> bool {
+    match backup_account_identity_target(account) {
+        Some(target_email) => oauth_existing_account_matches_identity(
+            &existing.name,
+            &existing.json_info,
+            Some(&target_email),
+        ),
+        None => true,
+    }
+}
+
+fn matching_backup_account_entry(
+    existing: &std::collections::HashMap<String, Vec<ExistingAccountEntry>>,
+    account: &BackupAccount,
+    prefer_credential: bool,
+) -> Option<ExistingAccountEntry> {
+    let account_id = extract_account_id(&account.json_info)?;
+    existing
+        .get(&account_id)?
+        .iter()
+        .filter(|entry| backup_account_matches_existing(account, entry))
+        .min_by_key(|entry| {
+            let credential_rank = if prefer_credential {
+                !entry.has_credential
+            } else {
+                entry.has_credential
+            };
+            (credential_rank, std::cmp::Reverse(entry.id))
+        })
+        .cloned()
+}
+
+fn upsert_existing_account_lookup(
+    existing: &mut std::collections::HashMap<String, Vec<ExistingAccountEntry>>,
+    account_id: Option<String>,
+    id: i64,
+    account: &BackupAccount,
+) {
+    let Some(account_id) = account_id else {
+        return;
+    };
+    let next = ExistingAccountEntry {
+        id,
+        name: account.name.clone(),
+        json_info: account.json_info.clone(),
+        has_credential: json_info_has_credential(&account.json_info),
+    };
+    let entries = existing.entry(account_id).or_insert_with(Vec::new);
+    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+        *entry = next;
+    } else {
+        entries.insert(0, next);
+    }
 }
 
 fn insert_backup_account(
@@ -5428,15 +5523,10 @@ async fn preview_encrypted_backup(
 ) -> Result<BackupPreview, String> {
     let (version, accounts) = normalized_backup_accounts(&backup_text, &password).await?;
     let conn = open_accounts_db(&app)?;
-    let existing = existing_account_ids(&conn)?;
+    let existing = existing_account_lookup(&conn)?;
     let duplicate_accounts = accounts
         .iter()
-        .filter(|account| {
-            extract_account_id(&account.json_info)
-                .as_ref()
-                .map(|account_id| existing.contains_key(account_id))
-                .unwrap_or(false)
-        })
+        .filter(|account| matching_backup_account_entry(&existing, account, true).is_some())
         .count();
     let account_names = accounts
         .iter()
@@ -5463,43 +5553,67 @@ async fn import_encrypted_backup(
     let (_, normalized_accounts) = normalized_backup_accounts(&backup_text, &password).await?;
 
     let conn = open_accounts_db(&app)?;
-    let mut existing = existing_account_ids(&conn)?;
+    let strategy = strategy.unwrap_or_else(|| "add".to_string());
+    import_backup_accounts_with_strategy(&conn, normalized_accounts, &strategy)
+}
+
+fn import_backup_accounts_with_strategy(
+    conn: &Connection,
+    normalized_accounts: Vec<BackupAccount>,
+    strategy: &str,
+) -> Result<ImportBackupResult, String> {
+    let mut existing = existing_account_lookup(conn)?;
     let mut imported = 0usize;
     let mut skipped = 0usize;
     let mut updated = 0usize;
     let mut imported_credentials: Vec<(i64, String)> = Vec::new();
-    let strategy = strategy.unwrap_or_else(|| "add".to_string());
 
     for account in normalized_accounts {
         let account_id = extract_account_id(&account.json_info);
-        let existing_id = account_id
-            .as_ref()
-            .and_then(|item| existing.get(item).copied());
-        let result = match (strategy.as_str(), existing_id) {
-            ("skip_duplicates", Some(_)) => {
-                skipped += 1;
-                Ok(())
+        let existing_entry = matching_backup_account_entry(&existing, &account, true);
+        let result = match (strategy, existing_entry) {
+            ("skip_duplicates", Some(entry)) => {
+                if entry.has_credential {
+                    skipped += 1;
+                    Ok(())
+                } else {
+                    merge_backup_account(conn, entry.id, &account).map(|_| {
+                        updated += 1;
+                        upsert_existing_account_lookup(
+                            &mut existing,
+                            account_id.clone(),
+                            entry.id,
+                            &account,
+                        );
+                    })
+                }
             }
-            ("merge_by_account_id", Some(id)) => {
-                merge_backup_account(&conn, id, &account).map(|_| {
+            ("merge_by_account_id", Some(entry)) => merge_backup_account(conn, entry.id, &account)
+                .map(|_| {
                     updated += 1;
-                })
-            }
+                    upsert_existing_account_lookup(
+                        &mut existing,
+                        account_id.clone(),
+                        entry.id,
+                        &account,
+                    );
+                }),
             ("add" | "skip_duplicates" | "merge_by_account_id", _) => {
-                insert_backup_account(&conn, &account, &mut imported_credentials).map(|_| {
+                insert_backup_account(conn, &account, &mut imported_credentials).map(|_| {
                     imported += 1;
-                    if let Some(account_id) = account_id {
-                        existing
-                            .entry(account_id)
-                            .or_insert(conn.last_insert_rowid());
-                    }
+                    upsert_existing_account_lookup(
+                        &mut existing,
+                        account_id.clone(),
+                        conn.last_insert_rowid(),
+                        &account,
+                    );
                 })
             }
             _ => Err("Unsupported import strategy".to_string()),
         };
 
         if let Err(e) = result {
-            cleanup_imported_accounts(&conn, &imported_credentials);
+            cleanup_imported_accounts(conn, &imported_credentials);
             return Err(e);
         }
     }
@@ -7478,6 +7592,55 @@ mod tests {
         conn
     }
 
+    fn create_backup_test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                activation_date TEXT DEFAULT '',
+                credential_key TEXT DEFAULT '',
+                json_info TEXT NOT NULL DEFAULT '',
+                plan_type TEXT DEFAULT 'unknown',
+                primary_used_percent INTEGER DEFAULT 0,
+                primary_reset_at INTEGER DEFAULT 0,
+                primary_window_minutes INTEGER,
+                primary_window_present INTEGER DEFAULT 1,
+                secondary_used_percent INTEGER DEFAULT 0,
+                secondary_reset_at INTEGER DEFAULT 0,
+                secondary_window_minutes INTEGER,
+                secondary_window_present INTEGER DEFAULT 1,
+                last_quota_checked_at TEXT DEFAULT '',
+                last_quota_error TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn backup_test_account(name: &str, json_info: &str) -> BackupAccount {
+        BackupAccount {
+            name: name.to_string(),
+            activation_date: "2026-06-06".to_string(),
+            json_info: json_info.to_string(),
+            plan_type: "plus".to_string(),
+            primary_used_percent: 12,
+            primary_reset_at: 123,
+            primary_window_minutes: Some(300),
+            primary_window_present: true,
+            secondary_used_percent: 34,
+            secondary_reset_at: 456,
+            secondary_window_minutes: Some(10080),
+            secondary_window_present: true,
+            last_quota_checked_at: "2026-06-06 12:00:00".to_string(),
+            last_quota_error: String::new(),
+        }
+    }
+
     fn insert_proxy_test_account(
         conn: &Connection,
         id: i64,
@@ -8187,6 +8350,158 @@ goals = true
 
         assert!(encrypt_backup_payload(&payload, "short").is_err());
         assert!(decrypt_backup_payload("{}", "short").is_err());
+    }
+
+    #[test]
+    fn import_backup_skip_restores_duplicate_without_credential() {
+        let conn = create_backup_test_conn();
+        let auth_json = sample_auth_json_with_email("restore@example.com", "shared-account-id");
+        let stub_json = account_stub_from_json(&auth_json);
+        conn.execute(
+            "INSERT INTO accounts (name, json_info) VALUES (?1, ?2)",
+            params!["restore@example.com", stub_json],
+        )
+        .unwrap();
+
+        let result = import_backup_accounts_with_strategy(
+            &conn,
+            vec![backup_test_account("restore@example.com", &auth_json)],
+            "skip_duplicates",
+        )
+        .unwrap();
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.skipped, 0);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+            .unwrap();
+        let stored_json: String = conn
+            .query_row("SELECT json_info FROM accounts WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert!(json_info_has_credential(&stored_json));
+        assert_eq!(
+            extract_email_from_auth_json(&stored_json).unwrap(),
+            "restore@example.com"
+        );
+    }
+
+    #[test]
+    fn import_backup_skip_keeps_duplicate_with_credential() {
+        let conn = create_backup_test_conn();
+        let auth_json = sample_auth_json_with_email("same@example.com", "shared-account-id");
+        conn.execute(
+            "INSERT INTO accounts (name, json_info) VALUES (?1, ?2)",
+            params!["same@example.com", auth_json],
+        )
+        .unwrap();
+
+        let result = import_backup_accounts_with_strategy(
+            &conn,
+            vec![backup_test_account(
+                "same@example.com",
+                &sample_auth_json_with_email("same@example.com", "shared-account-id"),
+            )],
+            "skip_duplicates",
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn import_backup_skip_prefers_existing_credential_over_stub() {
+        let conn = create_backup_test_conn();
+        let auth_json = sample_auth_json_with_email("same@example.com", "shared-account-id");
+        conn.execute(
+            "INSERT INTO accounts (name, json_info) VALUES (?1, ?2)",
+            params!["same@example.com", auth_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO accounts (name, json_info) VALUES (?1, ?2)",
+            params![
+                "same@example.com",
+                account_stub_from_json(&sample_auth_json_with_email(
+                    "same@example.com",
+                    "shared-account-id"
+                ))
+            ],
+        )
+        .unwrap();
+
+        let result = import_backup_accounts_with_strategy(
+            &conn,
+            vec![backup_test_account(
+                "same@example.com",
+                &sample_auth_json_with_email("same@example.com", "shared-account-id"),
+            )],
+            "skip_duplicates",
+        )
+        .unwrap();
+
+        let stub_json: String = conn
+            .query_row("SELECT json_info FROM accounts WHERE id = 2", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.skipped, 1);
+        assert!(!json_info_has_credential(&stub_json));
+    }
+
+    #[test]
+    fn import_backup_does_not_merge_same_account_id_with_different_email() {
+        let conn = create_backup_test_conn();
+        conn.execute(
+            "INSERT INTO accounts (name, json_info) VALUES (?1, ?2)",
+            params![
+                "old@example.com",
+                sample_auth_json_with_email("old@example.com", "shared-account-id")
+            ],
+        )
+        .unwrap();
+
+        let result = import_backup_accounts_with_strategy(
+            &conn,
+            vec![backup_test_account(
+                "new@example.com",
+                &sample_auth_json_with_email("new@example.com", "shared-account-id"),
+            )],
+            "merge_by_account_id",
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+            .unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM accounts ORDER BY id ASC")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(count, 2);
+        assert_eq!(names, vec!["old@example.com", "new@example.com"]);
     }
 
     #[test]

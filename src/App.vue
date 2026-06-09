@@ -1138,7 +1138,7 @@ async function runImportPreview(file: File, password: string) {
     importBackupText.value = backupText;
     importPassword.value = password;
     importPreview.value = preview;
-    importStrategy.value = preview.duplicate_accounts > 0 ? 'skip_duplicates' : 'add';
+    importStrategy.value = preview.duplicate_accounts > 0 ? 'merge_by_account_id' : 'add';
     showImportPreviewDialog.value = true;
   } catch (err) {
     showMessage(`读取备份失败: ${err}`, 'error');
@@ -2570,21 +2570,21 @@ function editDetailAccount(account: Account) {
                 <input v-model="importStrategy" type="radio" value="add" />
                 <span>
                   <strong>全部新增</strong>
-                  <small>即使 account_id 重复，也作为新记录导入。</small>
+                  <small>不合并现有账号，备份内账号全部作为新记录导入。</small>
                 </span>
               </label>
               <label class="import-strategy">
                 <input v-model="importStrategy" type="radio" value="skip_duplicates" />
                 <span>
                   <strong>跳过重复</strong>
-                  <small>重复 account_id 不导入，只新增缺失账号。</small>
+                  <small>已有完整凭据的账号会跳过；缺 auth.json 的历史记录会自动恢复。</small>
                 </span>
               </label>
               <label class="import-strategy">
                 <input v-model="importStrategy" type="radio" value="merge_by_account_id" />
                 <span>
                   <strong>合并更新</strong>
-                  <small>重复 account_id 会更新现有记录和凭据。</small>
+                  <small>按账号身份更新同一账号，恢复 auth.json 和额度信息。</small>
                 </span>
               </label>
             </div>
