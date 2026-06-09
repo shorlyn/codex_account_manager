@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tauri::{
@@ -138,9 +138,14 @@ pub struct CodexProxyState {
     pub enabled: bool,
     pub port: u16,
     pub base_url: String,
+    pub auth_token: String,
+    pub config_snippet: String,
     pub active_account_id: Option<i64>,
     pub active_account_name: String,
     pub config_installed: bool,
+    pub auth_enabled: bool,
+    pub active_requests: usize,
+    pub max_concurrent_requests: usize,
     pub config_path: String,
     pub last_error: String,
 }
@@ -424,7 +429,9 @@ const CODEX_PROXY_SETTING_ENABLED: &str = "codex_proxy_enabled";
 const CODEX_PROXY_SETTING_PORT: &str = "codex_proxy_port";
 const CODEX_PROXY_SETTING_ACTIVE_ACCOUNT_ID: &str = "codex_proxy_active_account_id";
 const CODEX_PROXY_SETTING_CONFIG_BACKUP: &str = "codex_proxy_config_backup";
+const CODEX_PROXY_SETTING_AUTH_TOKEN: &str = "codex_proxy_auth_token";
 const CODEX_PROXY_LOW_QUOTA_REMAINING_PERCENT: i32 = 5;
+const CODEX_PROXY_MAX_CONCURRENT_REQUESTS: usize = 16;
 const CODEX_PROXY_DEFAULT_USER_AGENT: &str =
     "codex-tui/0.135.0 (Mac OS; arm64) CodexAccountManagerProxy/0.1.0";
 const CODEX_PROXY_DEFAULT_ORIGINATOR: &str = "codex-tui";
@@ -435,7 +442,9 @@ static OAUTH_STATE: Mutex<Option<OAuthState>> = Mutex::new(None);
 
 struct CodexProxyRuntime {
     port: u16,
+    auth_token: String,
     stop: Arc<AtomicBool>,
+    active_requests: Arc<AtomicUsize>,
     last_error: Arc<Mutex<String>>,
 }
 
@@ -470,6 +479,31 @@ fn get_codex_global_state_path() -> Result<std::path::PathBuf, String> {
 
 fn get_codex_logs_path() -> Result<std::path::PathBuf, String> {
     Ok(get_codex_home_path()?.join("logs_2.sqlite"))
+}
+
+fn atomic_write_text(path: &Path, content: &str, label: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建{}目录失败: {}", label, e))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("atomic-write");
+    let temp_path = path.with_file_name(format!(".{}.{}.tmp", file_name, random_base64url_token()));
+
+    let mut file = std::fs::File::create(&temp_path)
+        .map_err(|e| format!("创建{}临时文件失败: {}", label, e))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("写入{}临时文件失败: {}", label, e))?;
+    file.sync_all()
+        .map_err(|e| format!("同步{}临时文件失败: {}", label, e))?;
+    drop(file);
+
+    std::fs::rename(&temp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!("替换{}失败: {}", label, e)
+    })
 }
 
 fn local_day_bounds_ts() -> Result<(i64, i64), String> {
@@ -1111,17 +1145,18 @@ fn codex_proxy_config_installed(content: &str) -> bool {
         && content.contains(&format!("[model_providers.{}]", CODEX_PROXY_PROVIDER_ID))
 }
 
-fn codex_proxy_config_toml(content: &str, port: u16) -> String {
+fn codex_proxy_config_toml(content: &str, port: u16, auth_token: &str) -> String {
     let without_root = remove_root_toml_keys(content, &["model_provider", "openai_base_url"]);
     let without_provider =
         remove_toml_section(&without_root, codex_proxy_provider_section_name().as_str());
     let preserved = without_provider.trim();
     let provider = format!(
-        "model_provider = \"{}\"\n\n[model_providers.{}]\nname = \"{}\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\n",
+        "model_provider = \"{}\"\n\n[model_providers.{}]\nname = \"{}\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\nexperimental_bearer_token = \"{}\"\n",
         CODEX_PROXY_PROVIDER_ID,
         CODEX_PROXY_PROVIDER_ID,
         CODEX_PROXY_PROVIDER_NAME,
         codex_proxy_base_url(port),
+        auth_token,
     );
 
     if preserved.is_empty() {
@@ -1148,6 +1183,7 @@ fn install_codex_proxy_config_to_path(
     config_path: &std::path::Path,
     conn: &Connection,
     port: u16,
+    auth_token: &str,
 ) -> Result<(), String> {
     let content = match std::fs::read_to_string(config_path) {
         Ok(content) => content,
@@ -1159,11 +1195,8 @@ fn install_codex_proxy_config_to_path(
         write_setting_to_conn(conn, CODEX_PROXY_SETTING_CONFIG_BACKUP, &content)?;
     }
 
-    let next = codex_proxy_config_toml(&content, port);
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
-    }
-    std::fs::write(config_path, next).map_err(|e| format!("写入 Codex config.toml 失败: {}", e))
+    let next = codex_proxy_config_toml(&content, port, auth_token);
+    atomic_write_text(config_path, &next, "Codex config.toml")
 }
 
 fn restore_codex_proxy_config_from_backup(
@@ -1175,15 +1208,14 @@ fn restore_codex_proxy_config_from_backup(
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
         }
-        std::fs::write(config_path, backup)
-            .map_err(|e| format!("恢复 Codex config.toml 失败: {}", e))?;
+        atomic_write_text(config_path, &backup, "Codex config.toml")?;
         delete_setting_from_conn(conn, CODEX_PROXY_SETTING_CONFIG_BACKUP)?;
         return Ok(());
     }
 
     let content = std::fs::read_to_string(config_path).unwrap_or_default();
     let next = remove_codex_proxy_config_toml(&content);
-    std::fs::write(config_path, next).map_err(|e| format!("清理 Codex 代理配置失败: {}", e))
+    atomic_write_text(config_path, &next, "Codex config.toml")
 }
 
 fn read_codex_app_speed_from_path(path: &std::path::Path) -> Result<CodexAppSpeed, String> {
@@ -1253,7 +1285,7 @@ fn sync_codex_global_state(path: &std::path::Path, speed: &CodexAppSpeed) -> Res
     }
     let next = serde_json::to_string_pretty(&serde_json::Value::Object(state))
         .map_err(|e| format!("序列化 Codex 全局状态失败: {}", e))?;
-    std::fs::write(path, next).map_err(|e| format!("写入 Codex 全局状态失败: {}", e))
+    atomic_write_text(path, &next, "Codex 全局状态")
 }
 
 fn write_codex_app_speed_to_path(
@@ -1277,12 +1309,7 @@ fn write_codex_app_speed_to_path(
     };
     if should_update_config {
         let next = codex_config_toml_with_speed(&content, &speed);
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
-        }
-        std::fs::write(config_path, next)
-            .map_err(|e| format!("写入 Codex config.toml 失败: {}", e))?;
+        atomic_write_text(config_path, &next, "Codex config.toml")?;
     }
     sync_codex_global_state(global_state_path, &speed)?;
     Ok(CodexAppSpeedConfig {
@@ -1564,17 +1591,18 @@ fn account_log_context(conn: &Connection, id: i64) -> (String, String) {
     .unwrap_or_else(|_| (format!("#{}", id), String::new()))
 }
 
-fn insert_operation_log(
-    conn: &Connection,
-    level: &str,
-    action: &str,
+struct OperationLogEntry<'a> {
+    level: &'a str,
+    action: &'a str,
     account_id: Option<i64>,
-    account_name: &str,
-    account_identifier: &str,
-    stage: &str,
-    message: &str,
-    details: &str,
-) -> Result<(), String> {
+    account_name: &'a str,
+    account_identifier: &'a str,
+    stage: &'a str,
+    message: &'a str,
+    details: &'a str,
+}
+
+fn insert_operation_log(conn: &Connection, entry: OperationLogEntry<'_>) -> Result<(), String> {
     conn.execute(
         "
         INSERT INTO operation_logs (
@@ -1584,14 +1612,14 @@ fn insert_operation_log(
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ",
         params![
-            level,
-            action,
-            account_id,
-            account_name,
-            account_identifier,
-            stage,
-            truncate_log_text(message, 1000),
-            truncate_log_text(details, 6000),
+            entry.level,
+            entry.action,
+            entry.account_id,
+            entry.account_name,
+            entry.account_identifier,
+            entry.stage,
+            truncate_log_text(entry.message, 1000),
+            truncate_log_text(entry.details, 6000),
         ],
     )
     .map_err(|e| format!("Failed to write operation log: {}", e))?;
@@ -1757,9 +1785,7 @@ fn decode_jwt_payload_value(token: &str) -> Option<serde_json::Value> {
     let mut parts = token.split('.');
     parts.next()?;
     let payload = parts.next()?;
-    if parts.next().is_none() {
-        return None;
-    }
+    parts.next()?;
     let payload_bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&payload_bytes).ok()
 }
@@ -2000,7 +2026,7 @@ fn write_http_response(stream: &mut std::net::TcpStream, status: &str, body: &st
     let response = format!(
         "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
-        body.as_bytes().len(),
+        body.len(),
         body
     );
     let _ = stream.write_all(response.as_bytes());
@@ -2475,6 +2501,19 @@ fn write_proxy_active_account_id(conn: &Connection, id: i64) -> Result<(), Strin
     write_setting_to_conn(conn, CODEX_PROXY_SETTING_ACTIVE_ACCOUNT_ID, &id.to_string())
 }
 
+fn proxy_auth_token(conn: &Connection) -> Result<String, String> {
+    if let Some(token) = read_setting_from_conn(conn, CODEX_PROXY_SETTING_AUTH_TOKEN)?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(token);
+    }
+
+    let token = random_base64url_token();
+    write_setting_to_conn(conn, CODEX_PROXY_SETTING_AUTH_TOKEN, &token)?;
+    Ok(token)
+}
+
 fn fallback_proxy_account_id(conn: &Connection) -> Result<Option<i64>, String> {
     let result = conn.query_row(
         "
@@ -2741,14 +2780,16 @@ fn log_proxy_account_switch(
     };
     let _ = insert_operation_log(
         conn,
-        "info",
-        "proxy_auto_switch",
-        Some(next.id),
-        &next.name,
-        &next.identifier,
-        stage,
-        &message,
-        &details,
+        OperationLogEntry {
+            level: "info",
+            action: "proxy_auto_switch",
+            account_id: Some(next.id),
+            account_name: &next.name,
+            account_identifier: &next.identifier,
+            stage,
+            message: &message,
+            details: &details,
+        },
     );
     if let Some(app) = app {
         let _ = app.emit(
@@ -2775,14 +2816,16 @@ fn log_proxy_account_warning(
 ) {
     let _ = insert_operation_log(
         conn,
-        "warn",
-        "proxy_auto_switch",
-        Some(candidate.id),
-        &candidate.name,
-        &candidate.identifier,
-        stage,
-        message,
-        details,
+        OperationLogEntry {
+            level: "warn",
+            action: "proxy_auto_switch",
+            account_id: Some(candidate.id),
+            account_name: &candidate.name,
+            account_identifier: &candidate.identifier,
+            stage,
+            message,
+            details,
+        },
     );
 }
 
@@ -2959,6 +3002,40 @@ struct ProxyHttpRequest {
     body: Vec<u8>,
 }
 
+struct ProxyConnectionPermit {
+    active_requests: Arc<AtomicUsize>,
+}
+
+impl Drop for ProxyConnectionPermit {
+    fn drop(&mut self) {
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn try_acquire_proxy_connection(
+    active_requests: Arc<AtomicUsize>,
+) -> Option<ProxyConnectionPermit> {
+    let acquired = active_requests
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            (current < CODEX_PROXY_MAX_CONCURRENT_REQUESTS).then_some(current + 1)
+        })
+        .is_ok();
+    acquired.then_some(ProxyConnectionPermit { active_requests })
+}
+
+fn proxy_request_authorized(request: &ProxyHttpRequest, auth_token: &str) -> bool {
+    if request.method.eq_ignore_ascii_case("OPTIONS") {
+        return true;
+    }
+
+    let expected = format!("Bearer {}", auth_token);
+    request
+        .headers
+        .get("authorization")
+        .map(|value| value.trim() == expected)
+        .unwrap_or(false)
+}
+
 fn proxy_header_end(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(4)
@@ -3113,7 +3190,7 @@ fn write_proxy_json_response(stream: &mut TcpStream, status: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
-        body.as_bytes().len(),
+        body.len(),
         body
     );
     let _ = stream.write_all(response.as_bytes());
@@ -3391,14 +3468,16 @@ fn log_proxy_upstream_failover(
     );
     let _ = insert_operation_log(
         conn,
-        "warn",
-        "proxy_failover",
-        Some(from.id),
-        &from.name,
-        &from.identifier,
-        "upstream_failover",
-        &message,
-        &details,
+        OperationLogEntry {
+            level: "warn",
+            action: "proxy_failover",
+            account_id: Some(from.id),
+            account_name: &from.name,
+            account_identifier: &from.identifier,
+            stage: "upstream_failover",
+            message: &message,
+            details: &details,
+        },
     );
 }
 
@@ -3425,14 +3504,16 @@ fn log_proxy_upstream_no_fallback(
     let _ = mark_quota_error(conn, credentials.id, &message);
     let _ = insert_operation_log(
         conn,
-        "warn",
-        "proxy_failover",
-        Some(credentials.id),
-        &credentials.name,
-        &credentials.identifier,
-        "no_fallback",
-        &message,
-        &details,
+        OperationLogEntry {
+            level: "warn",
+            action: "proxy_failover",
+            account_id: Some(credentials.id),
+            account_name: &credentials.name,
+            account_identifier: &credentials.identifier,
+            stage: "no_fallback",
+            message: &message,
+            details: &details,
+        },
     );
 }
 
@@ -3471,11 +3552,20 @@ fn forward_codex_proxy_request(
     app: &AppHandle,
     stream: &mut TcpStream,
     db_path: &std::path::Path,
+    auth_token: &str,
     request: ProxyHttpRequest,
 ) -> Result<(), String> {
     let normalized_target = normalize_proxy_target(&request.target)?;
     if request.method.eq_ignore_ascii_case("OPTIONS") {
         write_proxy_options_response(stream);
+        return Ok(());
+    }
+    if !proxy_request_authorized(&request, auth_token) {
+        write_proxy_error(
+            stream,
+            "401 Unauthorized",
+            "Codex Account Manager proxy requires its managed bearer token.",
+        );
         return Ok(());
     }
 
@@ -3556,10 +3646,13 @@ fn handle_codex_proxy_connection(
     app: AppHandle,
     mut stream: TcpStream,
     db_path: std::path::PathBuf,
+    auth_token: String,
     last_error: Arc<Mutex<String>>,
+    _permit: ProxyConnectionPermit,
 ) {
-    let result = read_proxy_http_request(&mut stream)
-        .and_then(|request| forward_codex_proxy_request(&app, &mut stream, &db_path, request));
+    let result = read_proxy_http_request(&mut stream).and_then(|request| {
+        forward_codex_proxy_request(&app, &mut stream, &db_path, &auth_token, request)
+    });
     match result {
         Ok(()) => {
             if let Ok(mut guard) = last_error.lock() {
@@ -3590,13 +3683,17 @@ fn start_codex_proxy_runtime(
     app: AppHandle,
     db_path: std::path::PathBuf,
     port: u16,
+    auth_token: String,
 ) -> Result<(), String> {
     {
         let guard = CODEX_PROXY_RUNTIME
             .lock()
             .map_err(|_| "Codex proxy runtime lock is poisoned".to_string())?;
         if let Some(runtime) = guard.as_ref() {
-            if runtime.port == port && !runtime.stop.load(Ordering::Relaxed) {
+            if runtime.port == port
+                && runtime.auth_token == auth_token
+                && !runtime.stop.load(Ordering::Relaxed)
+            {
                 return Ok(());
             }
         }
@@ -3612,21 +3709,38 @@ fn start_codex_proxy_runtime(
     let last_error = Arc::new(Mutex::new(String::new()));
     let stop_for_thread = stop.clone();
     let last_error_for_thread = last_error.clone();
+    let active_requests = Arc::new(AtomicUsize::new(0));
+    let active_requests_for_thread = active_requests.clone();
+    let auth_token_for_thread = auth_token.clone();
     std::thread::spawn(move || {
         while !stop_for_thread.load(Ordering::Relaxed) {
             match listener.accept() {
-                Ok((stream, _addr)) => {
+                Ok((mut stream, _addr)) => {
                     if let Err(e) = stream.set_nonblocking(false) {
                         if let Ok(mut guard) = last_error_for_thread.lock() {
                             *guard = format!("Codex 代理连接初始化失败: {}", e);
                         }
                         continue;
                     }
+                    let Some(permit) =
+                        try_acquire_proxy_connection(active_requests_for_thread.clone())
+                    else {
+                        write_proxy_error(
+                            &mut stream,
+                            "503 Service Unavailable",
+                            "Codex Account Manager proxy is busy. Please retry shortly.",
+                        );
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
                     let db_path = db_path.clone();
                     let last_error = last_error_for_thread.clone();
                     let app = app.clone();
+                    let auth_token = auth_token_for_thread.clone();
                     std::thread::spawn(move || {
-                        handle_codex_proxy_connection(app, stream, db_path, last_error);
+                        handle_codex_proxy_connection(
+                            app, stream, db_path, auth_token, last_error, permit,
+                        );
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3647,7 +3761,9 @@ fn start_codex_proxy_runtime(
         .map_err(|_| "Codex proxy runtime lock is poisoned".to_string())?;
     *guard = Some(CodexProxyRuntime {
         port,
+        auth_token,
         stop,
+        active_requests,
         last_error,
     });
     Ok(())
@@ -4193,7 +4309,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_main_window(&tray.app_handle());
+                show_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -4588,20 +4704,23 @@ fn save_oauth_account(
         .map_err(|e| format!("Failed to restore OAuth account credential: {}", e))?;
 
         let (account_name, account_identifier) = account_log_context(&conn, id);
+        let details = format!(
+            "email={}, account_id={}",
+            identity.email.as_deref().unwrap_or(""),
+            account_id
+        );
         let _ = insert_operation_log(
             &conn,
-            "info",
-            "oauth_login",
-            Some(id),
-            &account_name,
-            &account_identifier,
-            "updated",
-            "OAuth 账号凭据已更新",
-            &format!(
-                "email={}, account_id={}",
-                identity.email.as_deref().unwrap_or(""),
-                account_id
-            ),
+            OperationLogEntry {
+                level: "info",
+                action: "oauth_login",
+                account_id: Some(id),
+                account_name: &account_name,
+                account_identifier: &account_identifier,
+                stage: "updated",
+                message: "OAuth 账号凭据已更新",
+                details: &details,
+            },
         );
 
         return Ok(OAuthSaveResult {
@@ -4622,20 +4741,23 @@ fn save_oauth_account(
     .map_err(|e| format!("Failed to add OAuth account: {}", e))?;
     let id = conn.last_insert_rowid();
 
+    let details = format!(
+        "email={}, account_id={}",
+        identity.email.as_deref().unwrap_or(""),
+        account_id
+    );
     let _ = insert_operation_log(
         &conn,
-        "info",
-        "oauth_login",
-        Some(id),
-        name,
-        account_id,
-        "created",
-        "OAuth 账号已新增",
-        &format!(
-            "email={}, account_id={}",
-            identity.email.as_deref().unwrap_or(""),
-            account_id
-        ),
+        OperationLogEntry {
+            level: "info",
+            action: "oauth_login",
+            account_id: Some(id),
+            account_name: name,
+            account_identifier: account_id,
+            stage: "created",
+            message: "OAuth 账号已新增",
+            details: &details,
+        },
     );
 
     Ok(OAuthSaveResult {
@@ -5272,7 +5394,7 @@ async fn normalized_backup_accounts(
     backup_text: &str,
     password: &str,
 ) -> Result<(u32, Vec<BackupAccount>), String> {
-    let payload = decrypt_backup_payload(&backup_text, &password)?;
+    let payload = decrypt_backup_payload(backup_text, password)?;
     if payload.version != 1 {
         return Err("Unsupported backup payload version".to_string());
     }
@@ -5413,7 +5535,7 @@ fn upsert_existing_account_lookup(
         json_info: account.json_info.clone(),
         has_credential: json_info_has_credential(&account.json_info),
     };
-    let entries = existing.entry(account_id).or_insert_with(Vec::new);
+    let entries = existing.entry(account_id).or_default();
     if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
         *entry = next;
     } else {
@@ -5638,14 +5760,16 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
         let (account_name, account_identifier) = account_log_context(&conn, id);
         let _ = insert_operation_log(
             &conn,
-            "info",
-            "refresh_quota",
-            Some(id),
-            &account_name,
-            &account_identifier,
-            "start",
-            "开始刷新额度",
-            "",
+            OperationLogEntry {
+                level: "info",
+                action: "refresh_quota",
+                account_id: Some(id),
+                account_name: &account_name,
+                account_identifier: &account_identifier,
+                stage: "start",
+                message: "开始刷新额度",
+                details: "",
+            },
         );
         let json_info = account_json_info(&conn, id)?;
         let refreshed_json = match refresh_auth_json_if_needed(&json_info, false).await {
@@ -5658,14 +5782,16 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
             Err(e) => {
                 let _ = insert_operation_log(
                     &conn,
-                    "error",
-                    "refresh_quota",
-                    Some(id),
-                    &account_name,
-                    &account_identifier,
-                    "refresh_token",
-                    &e,
-                    "",
+                    OperationLogEntry {
+                        level: "error",
+                        action: "refresh_quota",
+                        account_id: Some(id),
+                        account_name: &account_name,
+                        account_identifier: &account_identifier,
+                        stage: "refresh_token",
+                        message: &e,
+                        details: "",
+                    },
                 );
                 mark_quota_error(&conn, id, &e)?;
                 return Err(e);
@@ -5676,14 +5802,16 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
             Err(e) => {
                 let _ = insert_operation_log(
                     &conn,
-                    "error",
-                    "refresh_quota",
-                    Some(id),
-                    &account_name,
-                    &account_identifier,
-                    "extract_access_token",
-                    &e,
-                    "",
+                    OperationLogEntry {
+                        level: "error",
+                        action: "refresh_quota",
+                        account_id: Some(id),
+                        account_name: &account_name,
+                        account_identifier: &account_identifier,
+                        stage: "extract_access_token",
+                        message: &e,
+                        details: "",
+                    },
                 );
                 mark_quota_error(&conn, id, &e)?;
                 return Err(e);
@@ -5709,14 +5837,16 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
             .to_string();
             let _ = insert_operation_log(
                 &conn,
-                "info",
-                "refresh_quota",
-                Some(id),
-                &account_name,
-                &account_identifier,
-                "quota_api",
-                "额度刷新成功",
-                &details,
+                OperationLogEntry {
+                    level: "info",
+                    action: "refresh_quota",
+                    account_id: Some(id),
+                    account_name: &account_name,
+                    account_identifier: &account_identifier,
+                    stage: "quota_api",
+                    message: "额度刷新成功",
+                    details: &details,
+                },
             );
             Ok(quota)
         }
@@ -5724,14 +5854,16 @@ async fn refresh_account_quota(app: AppHandle, id: i64) -> Result<QuotaInfo, Str
             let conn = open_accounts_db(&app)?;
             let _ = insert_operation_log(
                 &conn,
-                "error",
-                "refresh_quota",
-                Some(id),
-                &account_name,
-                &account_identifier,
-                "quota_api",
-                &e.message,
-                &e.details,
+                OperationLogEntry {
+                    level: "error",
+                    action: "refresh_quota",
+                    account_id: Some(id),
+                    account_name: &account_name,
+                    account_identifier: &account_identifier,
+                    stage: "quota_api",
+                    message: &e.message,
+                    details: &e.details,
+                },
             );
             mark_quota_error(&conn, id, &e.message)?;
             Err(e.message)
@@ -5902,14 +6034,16 @@ async fn switch_account_by_id(
     };
     let _ = insert_operation_log(
         &conn,
-        level,
-        "switch_account",
-        Some(id),
-        &account_name,
-        &account_identifier,
-        stage,
-        &result.hot_switch.message,
-        &result.hot_switch.detail,
+        OperationLogEntry {
+            level,
+            action: "switch_account",
+            account_id: Some(id),
+            account_name: &account_name,
+            account_identifier: &account_identifier,
+            stage,
+            message: &result.hot_switch.message,
+            details: &result.hot_switch.detail,
+        },
     );
     Ok(result)
 }
@@ -5963,25 +6097,33 @@ fn saved_codex_proxy_port(conn: &Connection) -> Result<u16, String> {
         .unwrap_or(CODEX_PROXY_DEFAULT_PORT))
 }
 
-fn runtime_proxy_snapshot() -> Result<(bool, Option<u16>, String), String> {
+fn runtime_proxy_snapshot() -> Result<(bool, Option<u16>, bool, usize, String), String> {
     let guard = CODEX_PROXY_RUNTIME
         .lock()
         .map_err(|_| "Codex proxy runtime lock is poisoned".to_string())?;
     if let Some(runtime) = guard.as_ref() {
         let enabled = !runtime.stop.load(Ordering::Relaxed);
+        let active_requests = runtime.active_requests.load(Ordering::Relaxed);
         let last_error = runtime
             .last_error
             .lock()
             .map(|item| item.clone())
             .unwrap_or_default();
-        Ok((enabled, Some(runtime.port), last_error))
+        Ok((
+            enabled,
+            Some(runtime.port),
+            !runtime.auth_token.trim().is_empty(),
+            active_requests,
+            last_error,
+        ))
     } else {
-        Ok((false, None, String::new()))
+        Ok((false, None, false, 0, String::new()))
     }
 }
 
 fn codex_proxy_state(app: &AppHandle, conn: &Connection) -> Result<CodexProxyState, String> {
-    let (enabled, runtime_port, last_error) = runtime_proxy_snapshot()?;
+    let (enabled, runtime_port, runtime_auth_enabled, active_requests, last_error) =
+        runtime_proxy_snapshot()?;
     let port = runtime_port.unwrap_or(saved_codex_proxy_port(conn)?);
     let active_account_id = read_proxy_active_account_id(conn)?;
     let active_account_name = active_account_id
@@ -5989,23 +6131,45 @@ fn codex_proxy_state(app: &AppHandle, conn: &Connection) -> Result<CodexProxySta
         .unwrap_or_default();
     let config_path = get_codex_config_path()?;
     let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let auth_token = read_setting_from_conn(conn, CODEX_PROXY_SETTING_AUTH_TOKEN)?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let config_snippet = if auth_token.is_empty() {
+        String::new()
+    } else {
+        codex_proxy_config_toml("", port, &auth_token)
+    };
+    let auth_enabled = runtime_auth_enabled
+        || !auth_token.is_empty();
     let _ = app;
 
     Ok(CodexProxyState {
         enabled,
         port,
         base_url: codex_proxy_base_url(port),
+        auth_token,
+        config_snippet,
         active_account_id,
         active_account_name,
         config_installed: codex_proxy_config_installed(&config_text),
+        auth_enabled,
+        active_requests,
+        max_concurrent_requests: CODEX_PROXY_MAX_CONCURRENT_REQUESTS,
         config_path: config_path.to_string_lossy().to_string(),
         last_error,
     })
 }
 
-fn start_codex_proxy_for_app(app: &AppHandle, port: u16) -> Result<(), String> {
+fn start_codex_proxy_for_app(
+    app: &AppHandle,
+    conn: &Connection,
+    port: u16,
+) -> Result<String, String> {
     let db_path = get_database_path(app)?;
-    start_codex_proxy_runtime(app.clone(), db_path, port)
+    let auth_token = proxy_auth_token(conn)?;
+    start_codex_proxy_runtime(app.clone(), db_path, port, auth_token.clone())?;
+    Ok(auth_token)
 }
 
 fn restore_codex_proxy_on_startup(app: AppHandle) {
@@ -6016,7 +6180,13 @@ fn restore_codex_proxy_on_startup(app: AppHandle) {
             .unwrap_or(false);
         if enabled {
             let port = saved_codex_proxy_port(&conn)?;
-            start_codex_proxy_for_app(&app, port)?;
+            let auth_token = start_codex_proxy_for_app(&app, &conn, port)?;
+            install_codex_proxy_config_to_path(
+                &get_codex_config_path()?,
+                &conn,
+                port,
+                &auth_token,
+            )?;
         }
         Ok(())
     })();
@@ -6048,8 +6218,9 @@ fn activate_codex_proxy(
     write_proxy_active_account_id(&conn, account_id)?;
     write_setting_to_conn(&conn, CODEX_PROXY_SETTING_PORT, &port.to_string())?;
     write_setting_to_conn(&conn, CODEX_PROXY_SETTING_ENABLED, "true")?;
-    install_codex_proxy_config_to_path(&get_codex_config_path()?, &conn, port)?;
-    start_codex_proxy_for_app(&app, port)?;
+    let auth_token = proxy_auth_token(&conn)?;
+    install_codex_proxy_config_to_path(&get_codex_config_path()?, &conn, port, &auth_token)?;
+    start_codex_proxy_runtime(app.clone(), get_database_path(&app)?, port, auth_token)?;
     codex_proxy_state(&app, &conn)
 }
 
@@ -6065,7 +6236,8 @@ fn deactivate_codex_proxy(app: AppHandle) -> Result<CodexProxyState, String> {
 #[command]
 fn set_codex_proxy_account(app: AppHandle, account_id: i64) -> Result<CodexProxyState, String> {
     let conn = open_accounts_db(&app)?;
-    let (was_running, _runtime_port, _last_error) = runtime_proxy_snapshot()?;
+    let (was_running, _runtime_port, _auth_enabled, _active_requests, _last_error) =
+        runtime_proxy_snapshot()?;
     let config_path = get_codex_config_path()?;
     let config_text = std::fs::read_to_string(&config_path).unwrap_or_default();
     let should_keep_enabled = was_running
@@ -6080,8 +6252,9 @@ fn set_codex_proxy_account(app: AppHandle, account_id: i64) -> Result<CodexProxy
     if should_keep_enabled {
         let port = saved_codex_proxy_port(&conn)?;
         write_setting_to_conn(&conn, CODEX_PROXY_SETTING_ENABLED, "true")?;
-        install_codex_proxy_config_to_path(&config_path, &conn, port)?;
-        start_codex_proxy_for_app(&app, port)?;
+        let auth_token = proxy_auth_token(&conn)?;
+        install_codex_proxy_config_to_path(&config_path, &conn, port, &auth_token)?;
+        start_codex_proxy_runtime(app.clone(), get_database_path(&app)?, port, auth_token)?;
     }
 
     codex_proxy_state(&app, &conn)
@@ -6118,12 +6291,7 @@ async fn switch_account(
     }
 
     let auth_path = get_auth_path()?;
-    if let Some(parent) = auth_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create .codex directory: {}", e))?;
-    }
-    std::fs::write(&auth_path, &json_info)
-        .map_err(|e| format!("Failed to write auth.json: {}", e))?;
+    atomic_write_text(&auth_path, &json_info, "auth.json")?;
 
     if should_restart {
         restart_codex_process()?;
@@ -6152,12 +6320,7 @@ async fn write_auth_json(json_info: String) -> Result<(), String> {
     let json_info = canonicalize_auth_json(&json_info)?;
 
     let auth_path = get_auth_path()?;
-    if let Some(parent) = auth_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create .codex directory: {}", e))?;
-    }
-    std::fs::write(&auth_path, &json_info)
-        .map_err(|e| format!("Failed to write auth.json: {}", e))?;
+    atomic_write_text(&auth_path, &json_info, "auth.json")?;
 
     Ok(())
 }
@@ -6357,12 +6520,7 @@ async fn repair_codex_project_visibility(
     let (next, changed) = codex_config_toml_with_trusted_project(&content, &project_path);
 
     if changed {
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("创建 Codex 配置目录失败: {}", e))?;
-        }
-        std::fs::write(&config_path, next)
-            .map_err(|e| format!("写入 Codex config.toml 失败: {}", e))?;
+        atomic_write_text(&config_path, &next, "Codex config.toml")?;
     }
 
     Ok(CodexProjectVisibilityStatus {
@@ -6410,6 +6568,15 @@ struct CodexRolloutThreadMetadata {
 struct SqliteVisibilityState {
     exists: bool,
     provider: String,
+}
+
+struct CodexSessionVisibilityScan {
+    target_provider: String,
+    metadata: Vec<CodexRolloutThreadMetadata>,
+    scanned_rollout_files: usize,
+    mismatched_rollout_files: usize,
+    mismatched_sqlite_records: usize,
+    missing_total: usize,
 }
 
 const USER_MESSAGE_BEGIN_MARKER: &str = "## My request for Codex:";
@@ -6760,17 +6927,7 @@ fn sqlite_visibility_state(
 fn scan_codex_session_visibility(
     codex_home: &Path,
     target_provider: Option<String>,
-) -> Result<
-    (
-        String,
-        Vec<CodexRolloutThreadMetadata>,
-        usize,
-        usize,
-        usize,
-        usize,
-    ),
-    String,
-> {
+) -> Result<CodexSessionVisibilityScan, String> {
     let rollout_files = collect_codex_rollout_files(codex_home)?;
     let mut metadata = Vec::new();
     for file in &rollout_files {
@@ -6813,28 +6970,21 @@ fn scan_codex_session_visibility(
         .filter(|item| !index_ids.contains(&item.id))
         .count();
 
-    Ok((
+    Ok(CodexSessionVisibilityScan {
         target_provider,
         metadata,
-        rollout_files.len(),
+        scanned_rollout_files: rollout_files.len(),
         mismatched_rollout_files,
         mismatched_sqlite_records,
-        missing_sqlite_records + missing_session_index_entries,
-    ))
+        missing_total: missing_sqlite_records + missing_session_index_entries,
+    })
 }
 
 fn get_codex_session_visibility_status_for_home(
     codex_home: &Path,
     target_provider: Option<String>,
 ) -> Result<CodexSessionVisibilityStatus, String> {
-    let (
-        target_provider,
-        metadata,
-        scanned_rollout_files,
-        mismatched_rollout_files,
-        mismatched_sqlite_records,
-        missing_total,
-    ) = scan_codex_session_visibility(codex_home, target_provider)?;
+    let scan = scan_codex_session_visibility(codex_home, target_provider)?;
     let state_db_path = codex_state_db_path_for_home(codex_home);
     let session_index_path = codex_session_index_path_for_home(codex_home);
 
@@ -6845,19 +6995,19 @@ fn get_codex_session_visibility_status_for_home(
         )
         .map_err(|e| format!("打开 Codex state_5.sqlite 失败: {}", e))?;
         let mut count = 0;
-        for item in &metadata {
+        for item in &scan.metadata {
             if !sqlite_visibility_state(&conn, &item.id)?.exists {
                 count += 1;
             }
         }
         count
     } else {
-        metadata.len()
+        scan.metadata.len()
     };
     let session_index_ids = read_session_index_ids(&session_index_path)?;
-    let missing_session_index_entries = missing_total.saturating_sub(missing_sqlite_records);
+    let missing_session_index_entries = scan.missing_total.saturating_sub(missing_sqlite_records);
     let missing_session_index_entries = if missing_session_index_entries == 0 {
-        metadata
+        scan.metadata
             .iter()
             .filter(|item| !session_index_ids.contains(&item.id))
             .count()
@@ -6869,10 +7019,10 @@ fn get_codex_session_visibility_status_for_home(
         codex_home: codex_home.to_string_lossy().to_string(),
         state_db_path: state_db_path.to_string_lossy().to_string(),
         session_index_path: session_index_path.to_string_lossy().to_string(),
-        target_provider,
-        scanned_rollout_files,
-        mismatched_rollout_files,
-        mismatched_sqlite_records,
+        target_provider: scan.target_provider,
+        scanned_rollout_files: scan.scanned_rollout_files,
+        mismatched_rollout_files: scan.mismatched_rollout_files,
+        mismatched_sqlite_records: scan.mismatched_sqlite_records,
         missing_sqlite_records,
         missing_session_index_entries,
     })
@@ -6957,12 +7107,13 @@ fn create_session_visibility_backup(
         "hasSqliteBackup": has_sqlite_backup,
         "hasSessionIndexBackup": has_session_index_backup,
     });
-    std::fs::write(
-        backup_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)
-            .map_err(|e| format!("生成修复备份清单失败: {}", e))?,
-    )
-    .map_err(|e| format!("写入修复备份清单失败: {}", e))?;
+    let manifest_text = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("生成修复备份清单失败: {}", e))?;
+    atomic_write_text(
+        &backup_dir.join("manifest.json"),
+        &manifest_text,
+        "修复备份清单",
+    )?;
 
     Ok(backup_dir.to_string_lossy().to_string())
 }
@@ -7011,8 +7162,8 @@ fn rewrite_rollout_model_provider(path: &Path, target_provider: &str) -> Result<
         if had_trailing_newline {
             next.push('\n');
         }
-        std::fs::write(path, next)
-            .map_err(|e| format!("写入 rollout 文件失败 {}: {}", path.display(), e))?;
+        atomic_write_text(path, &next, "rollout 文件")
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
     }
     Ok(changed)
 }
@@ -7641,16 +7792,17 @@ mod tests {
         }
     }
 
-    fn insert_proxy_test_account(
-        conn: &Connection,
+    struct ProxyTestAccount {
         id: i64,
-        name: &str,
+        name: &'static str,
         primary_used_percent: i32,
         primary_window_present: bool,
         secondary_used_percent: i32,
         secondary_window_present: bool,
-        last_quota_error: &str,
-    ) {
+        last_quota_error: &'static str,
+    }
+
+    fn insert_proxy_test_account(conn: &Connection, account: ProxyTestAccount) {
         conn.execute(
             r#"
             INSERT INTO accounts (
@@ -7661,14 +7813,18 @@ mod tests {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
-                id,
-                name,
+                account.id,
+                account.name,
                 sample_auth_json(),
-                primary_used_percent,
-                if primary_window_present { 1 } else { 0 },
-                secondary_used_percent,
-                if secondary_window_present { 1 } else { 0 },
-                last_quota_error
+                account.primary_used_percent,
+                if account.primary_window_present { 1 } else { 0 },
+                account.secondary_used_percent,
+                if account.secondary_window_present {
+                    1
+                } else {
+                    0
+                },
+                account.last_quota_error
             ],
         )
         .unwrap();
@@ -7800,13 +7956,14 @@ openai_base_url = "https://legacy.example.com/v1"
 [features]
 goals = true
 "#;
-        let next = codex_proxy_config_toml(original, 14998);
+        let next = codex_proxy_config_toml(original, 14998, "test-proxy-token");
 
         assert!(codex_proxy_config_installed(&next));
         assert!(next.contains("model_provider = \"codex_account_manager_proxy\""));
         assert!(next.contains("[model_providers.codex_account_manager_proxy]"));
         assert!(next.contains("base_url = \"http://127.0.0.1:14998/v1\""));
         assert!(next.contains("wire_api = \"responses\""));
+        assert!(next.contains("experimental_bearer_token = \"test-proxy-token\""));
         assert!(next.contains("[features]\ngoals = true"));
         assert!(!next.contains("openai_base_url"));
     }
@@ -7819,6 +7976,7 @@ name = "Manual"
 base_url = "https://manual.example.com/v1"
 "#,
             14998,
+            "test-proxy-token",
         );
         let cleaned = remove_codex_proxy_config_toml(&installed);
 
@@ -7839,6 +7997,25 @@ base_url = "https://manual.example.com/v1"
             "/responses"
         );
         assert!(resolve_codex_proxy_upstream_target("/other/responses").is_err());
+    }
+
+    #[test]
+    fn codex_proxy_requires_managed_bearer_token() {
+        let ok = parse_proxy_http_request(
+            b"POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer test-token\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        let missing =
+            parse_proxy_http_request(b"POST /v1/responses HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        let options = parse_proxy_http_request(
+            b"OPTIONS /v1/responses HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        assert!(proxy_request_authorized(&ok, "test-token"));
+        assert!(!proxy_request_authorized(&missing, "test-token"));
+        assert!(proxy_request_authorized(&options, "test-token"));
     }
 
     #[test]
@@ -7924,8 +8101,30 @@ base_url = "https://manual.example.com/v1"
     #[test]
     fn proxy_selector_switches_to_next_account_when_active_quota_is_low() {
         let conn = create_proxy_test_conn();
-        insert_proxy_test_account(&conn, 1, "Low", 96, true, 10, true, "");
-        insert_proxy_test_account(&conn, 2, "Ready", 20, true, 10, true, "");
+        insert_proxy_test_account(
+            &conn,
+            ProxyTestAccount {
+                id: 1,
+                name: "Low",
+                primary_used_percent: 96,
+                primary_window_present: true,
+                secondary_used_percent: 10,
+                secondary_window_present: true,
+                last_quota_error: "",
+            },
+        );
+        insert_proxy_test_account(
+            &conn,
+            ProxyTestAccount {
+                id: 2,
+                name: "Ready",
+                primary_used_percent: 20,
+                primary_window_present: true,
+                secondary_used_percent: 10,
+                secondary_window_present: true,
+                last_quota_error: "",
+            },
+        );
         write_proxy_active_account_id(&conn, 1).unwrap();
 
         let selected = select_proxy_account_for_request(
@@ -7944,9 +8143,42 @@ base_url = "https://manual.example.com/v1"
     #[test]
     fn proxy_selector_wraps_to_first_usable_account() {
         let conn = create_proxy_test_conn();
-        insert_proxy_test_account(&conn, 1, "Ready", 20, true, 10, true, "");
-        insert_proxy_test_account(&conn, 2, "Blocked", 20, true, 10, true, "登录已失效");
-        insert_proxy_test_account(&conn, 3, "Low", 99, true, 10, true, "");
+        insert_proxy_test_account(
+            &conn,
+            ProxyTestAccount {
+                id: 1,
+                name: "Ready",
+                primary_used_percent: 20,
+                primary_window_present: true,
+                secondary_used_percent: 10,
+                secondary_window_present: true,
+                last_quota_error: "",
+            },
+        );
+        insert_proxy_test_account(
+            &conn,
+            ProxyTestAccount {
+                id: 2,
+                name: "Blocked",
+                primary_used_percent: 20,
+                primary_window_present: true,
+                secondary_used_percent: 10,
+                secondary_window_present: true,
+                last_quota_error: "登录已失效",
+            },
+        );
+        insert_proxy_test_account(
+            &conn,
+            ProxyTestAccount {
+                id: 3,
+                name: "Low",
+                primary_used_percent: 99,
+                primary_window_present: true,
+                secondary_used_percent: 10,
+                secondary_window_present: true,
+                last_quota_error: "",
+            },
+        );
         write_proxy_active_account_id(&conn, 3).unwrap();
 
         let selected = select_proxy_account_for_request(
@@ -7964,8 +8196,30 @@ base_url = "https://manual.example.com/v1"
     #[test]
     fn proxy_selector_keeps_active_account_without_quota_windows() {
         let conn = create_proxy_test_conn();
-        insert_proxy_test_account(&conn, 1, "Monthly", 100, false, 100, false, "");
-        insert_proxy_test_account(&conn, 2, "Ready", 20, true, 10, true, "");
+        insert_proxy_test_account(
+            &conn,
+            ProxyTestAccount {
+                id: 1,
+                name: "Monthly",
+                primary_used_percent: 100,
+                primary_window_present: false,
+                secondary_used_percent: 100,
+                secondary_window_present: false,
+                last_quota_error: "",
+            },
+        );
+        insert_proxy_test_account(
+            &conn,
+            ProxyTestAccount {
+                id: 2,
+                name: "Ready",
+                primary_used_percent: 20,
+                primary_window_present: true,
+                secondary_used_percent: 10,
+                secondary_window_present: true,
+                last_quota_error: "",
+            },
+        );
         write_proxy_active_account_id(&conn, 1).unwrap();
 
         let selected = select_proxy_account_for_request(

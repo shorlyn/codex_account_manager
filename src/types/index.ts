@@ -42,9 +42,14 @@ export interface CodexProxyState {
   enabled: boolean;
   port: number;
   base_url: string;
+  auth_token: string;
+  config_snippet: string;
   active_account_id: number | null;
   active_account_name: string;
   config_installed: boolean;
+  auth_enabled: boolean;
+  active_requests: number;
+  max_concurrent_requests: number;
   config_path: string;
   last_error: string;
 }

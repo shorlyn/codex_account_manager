@@ -4,6 +4,18 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import appLogoUrl from '../src-tauri/icons/128x128.png';
 import { useAccounts } from './composables/useAccounts';
+import {
+  formatCheckedTime,
+  formatCredits,
+  formatExactNumber,
+  formatResetTime,
+  formatTokenAmount,
+  formatUsd,
+  quotaRemaining,
+  quotaSummaryLabel,
+  quotaWindowLabel,
+  usageSuccessRate,
+} from './utils/formatters';
 import AccountList from './components/AccountList.vue';
 import AccountDialog from './components/AccountDialog.vue';
 import type {
@@ -17,7 +29,6 @@ import type {
   CodexProxyState,
   CodexSessionVisibilityRepairReport,
   CodexSessionVisibilityStatus,
-  CodexUsageRollup,
   CodexUsageSummary,
   BatchRefreshFailure,
   BatchRefreshProgress,
@@ -152,84 +163,6 @@ const sortOptions: Array<{ label: string; value: AccountSortBy }> = [
   { label: '额度二重置', value: 'secondary_reset' },
   { label: '最近检查', value: 'last_checked' },
 ];
-
-function quotaRemaining(used: number): number {
-  return Math.max(0, Math.min(100, 100 - used));
-}
-
-function quotaWindowLabel(minutes: number | null, fallback: 'primary' | 'secondary', compact = false): string {
-  if (!minutes || minutes <= 0) {
-    return fallback === 'secondary' ? (compact ? '周' : '周额度') : (compact ? '5h' : '5 小时额度');
-  }
-
-  const hourMinutes = 60;
-  const dayMinutes = 24 * hourMinutes;
-  const weekMinutes = 7 * dayMinutes;
-  if (minutes >= 28 * dayMinutes && minutes <= 31 * dayMinutes) return compact ? '月' : '月额度';
-  if (minutes >= weekMinutes - 1) {
-    const weeks = Math.ceil(minutes / weekMinutes);
-    return weeks <= 1 ? (compact ? '周' : '周额度') : `${weeks} 周额度`;
-  }
-  if (minutes >= dayMinutes - 1) return `${Math.ceil(minutes / dayMinutes)}d 额度`;
-  if (minutes >= hourMinutes) return `${Math.ceil(minutes / hourMinutes)}h 额度`;
-  return `${Math.ceil(minutes)}m 额度`;
-}
-
-function quotaSummaryLabel(accounts: Account[], field: 'primary' | 'secondary'): string {
-  const minutes = Array.from(new Set(
-    accounts
-      .map(account => field === 'primary' ? account.primary_window_minutes : account.secondary_window_minutes)
-      .filter((value): value is number => typeof value === 'number' && value > 0),
-  ));
-  if (minutes.length === 1) return quotaWindowLabel(minutes[0], field, true);
-  return field === 'primary' ? '额度一' : '额度二';
-}
-
-function formatResetTime(timestamp: number): string {
-  if (!timestamp) return '-';
-  const d = new Date(timestamp * 1000);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
-
-function formatCheckedTime(value: string): string {
-  if (!value) return '尚未检查';
-  return value.replace('T', ' ');
-}
-
-function formatTokenAmount(value: number | null | undefined): string {
-  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
-  if (normalized >= 100_000_000) return `${(normalized / 100_000_000).toFixed(2).replace(/\.00$/, '')}亿`;
-  if (normalized >= 10_000) return `${(normalized / 10_000).toFixed(1).replace(/\.0$/, '')}万`;
-  return Math.round(normalized).toLocaleString('zh-CN');
-}
-
-function formatExactNumber(value: number | null | undefined): string {
-  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
-  return Math.round(normalized).toLocaleString('zh-CN');
-}
-
-function formatUsd(value: number | null | undefined): string {
-  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: normalized >= 100 ? 2 : 4,
-  }).format(normalized);
-}
-
-function formatCredits(value: number | null | undefined): string {
-  const normalized = typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
-  return normalized.toLocaleString('zh-CN', {
-    maximumFractionDigits: normalized >= 100 ? 1 : 3,
-  });
-}
-
-function usageSuccessRate(usage: CodexUsageRollup | null | undefined): string {
-  if (!usage || usage.request_count <= 0) return '-';
-  return `${((usage.success_count / usage.request_count) * 100).toFixed(1)}%`;
-}
 
 function hasQuotaError(account: Account): boolean {
   return Boolean(account.last_quota_error?.trim());
@@ -447,6 +380,12 @@ const codexSpeedSwitchLabel = computed(() => {
 const codexProxyBaseUrlLabel = computed(() => {
   const baseUrl = codexProxyState.value?.base_url ?? '';
   return baseUrl.replace(/^https?:\/\//, '');
+});
+
+const codexProxyAuthLabel = computed(() => {
+  const state = codexProxyState.value;
+  if (!state?.auth_enabled) return '未鉴权';
+  return `鉴权 ${state.active_requests}/${state.max_concurrent_requests}`;
 });
 
 const filteredAccounts = computed(() => {
@@ -864,6 +803,34 @@ async function activateCodexProxy() {
     showMessage('Codex 代理已启用');
   } catch (e) {
     showMessage(`启用 Codex 代理失败: ${e}`, 'error');
+  } finally {
+    codexProxyBusy.value = false;
+  }
+}
+
+async function reinstallCodexProxyConfig() {
+  if (codexProxyBusy.value) return;
+  const accountId =
+    codexProxySelectedAccountId.value
+    ?? codexProxyState.value?.active_account_id
+    ?? currentAccountRecordId.value
+    ?? proxyAccountCandidates.value[0]?.id
+    ?? null;
+  if (accountId === null) {
+    showMessage('没有可用于代理的账号', 'error');
+    return;
+  }
+  codexProxyBusy.value = true;
+  try {
+    codexProxyState.value = await invoke<CodexProxyState>('activate_codex_proxy', {
+      accountId,
+      port: codexProxyState.value?.port ?? null,
+    });
+    codexProxySelectedAccountId.value = codexProxyState.value.active_account_id;
+    await loadCodexFeatureStatus();
+    showMessage('Codex 代理配置已重写');
+  } catch (e) {
+    showMessage(`重写 Codex 代理配置失败: ${e}`, 'error');
   } finally {
     codexProxyBusy.value = false;
   }
@@ -1604,6 +1571,12 @@ function editDetailAccount(account: Account) {
           <div class="proxy-strip-copy">
             <strong>Codex 代理</strong>
             <span>{{ codexProxyStatusLabel }}</span>
+            <span
+              v-if="codexProxyState?.auth_enabled"
+              :title="`代理请求需要 bearer token，当前并发 ${codexProxyState.active_requests}/${codexProxyState.max_concurrent_requests}`"
+            >
+              {{ codexProxyAuthLabel }}
+            </span>
           </div>
           <button
             v-if="codexProxyState?.base_url"
@@ -1612,6 +1585,22 @@ function editDetailAccount(account: Account) {
             @click="copyText(codexProxyState.base_url, '代理地址')"
           >
             {{ codexProxyBaseUrlLabel }}
+          </button>
+          <button
+            v-if="codexProxyState?.auth_token"
+            class="proxy-url-chip proxy-token-chip"
+            title="复制代理 bearer token"
+            @click="copyText(codexProxyState.auth_token, '代理 token')"
+          >
+            Token
+          </button>
+          <button
+            v-if="codexProxyState?.config_snippet"
+            class="proxy-url-chip proxy-config-chip"
+            title="复制 Codex 代理配置片段"
+            @click="copyText(codexProxyState.config_snippet, '代理配置')"
+          >
+            配置
           </button>
         </div>
 
@@ -1639,6 +1628,19 @@ function editDetailAccount(account: Account) {
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="23 4 23 10 17 10"/>
               <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button
+            class="btn-toolbar-icon proxy-refresh"
+            :disabled="codexProxyBusy || proxyAccountCandidates.length === 0"
+            title="重写 Codex 代理配置"
+            @click="reinstallCodexProxyConfig"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+              <path d="M3 21v-5h5"/>
+              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+              <path d="M16 8h5V3"/>
             </svg>
           </button>
           <button

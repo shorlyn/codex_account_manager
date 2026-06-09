@@ -4,7 +4,7 @@
 
 ## 环境要求
 
-- [Node.js](https://nodejs.org/) >= 18
+- [Node.js](https://nodejs.org/) >= 20.19 或 >= 22.12
 - [Rust](https://www.rust-lang.org/tools/install) >= 1.77
 - macOS 或 Windows
 
